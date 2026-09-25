@@ -341,7 +341,11 @@ async fn assert_activity_claim_lock_order(batch: bool) {
             worker.claim_one("control_external").await
         }
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Claims only SKIP LOCKED, so the claimant finishes while the workflow lock is held;
+    // one that blocked on the workflow row would time out here.
+    let claim = tokio::time::timeout(Duration::from_secs(10), claim)
+        .await
+        .expect("claimant must not block on the locked workflow");
 
     let activity_lock = tokio::time::timeout(
         Duration::from_secs(1),
@@ -362,7 +366,6 @@ async fn assert_activity_claim_lock_order(batch: bool) {
         "an operator holding the workflow lock must be able to lock the activity without deadlocking against a claimant"
     );
     let claim = claim
-        .await
         .expect("claim task")
         .expect("claim")
         .expect("claimant must continue past the locked workflow");

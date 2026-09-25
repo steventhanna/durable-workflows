@@ -206,23 +206,28 @@ async fn timeout_cleanup_renews_lease_until_handler_finishes_before_allowing_ret
 
 #[tokio::test]
 async fn heartbeat_failure_limits_cleanup_to_the_last_confirmed_lease() {
+    // Every renewal and the test's own checkout must finish well inside these budgets;
+    // a 180ms lease with a 40ms checkout lapsed on slow CI runners before cleanup began.
+    const LEASE_MILLIS: i64 = 720;
     for (healthy_millis, checkout_millis, release_millis, should_clean, block_release) in [
-        (0, 40, 350, false, false),
-        (0, 250, 350, false, false),
-        (0, 1_000, 350, false, false),
-        (250, 40, 100, true, false),
-        (0, 1_000, 350, false, true),
+        (0, 160, 1_400, false, false),
+        (0, 1_000, 1_400, false, false),
+        (0, 4_000, 1_400, false, false),
+        (1_000, 100, 300, true, false),
+        (0, 4_000, 1_400, false, true),
     ] {
         let Some(pool) = support::fresh_pool().await else {
             return;
         };
-        let (_, activity_id) = schedule_activity(&pool, "capture", 3, 60, 180).await;
+        let (_, activity_id) = schedule_activity(&pool, "capture", 3, 60, LEASE_MILLIS).await;
         let mut connection = pool.get().await.expect("connection");
         diesel::update(durable_activity::table.find(activity_id))
             .set((
                 durable_activity::kind.eq(LeasedCleanupActivity::KIND),
                 durable_activity::payload_json
                     .eq(serde_json::to_string(&LeasedCleanupActivity).expect("payload")),
+                // The fixture stamps host time; a database clock behind it would hide the row.
+                durable_activity::available_at.eq(0),
             ))
             .execute(&mut connection)
             .await
@@ -243,15 +248,27 @@ async fn heartbeat_failure_limits_cleanup_to_the_last_confirmed_lease() {
             .expect("short-checkout worker pool");
         let context = Arc::new(LeasedCleanupContext::default());
         let source = leased_cleanup_worker(limited_pool.clone(), context.clone(), "source");
-        let run = tokio::spawn(async move { source.run_one("capture").await });
-        tokio::time::timeout(Duration::from_secs(2), context.cleanup_started.notified())
-            .await
-            .expect("timeout starts cleanup");
+        let mut run = tokio::spawn(async move { source.run_one("capture").await });
+        tokio::select! {
+            () = context.cleanup_started.notified() => {}
+            finished = &mut run => panic!(
+                "run_one finished before cleanup started (checkout={checkout_millis}): {finished:?}"
+            ),
+            () = tokio::time::sleep(Duration::from_secs(2)) => panic!(
+                "timeout starts cleanup (checkout={checkout_millis})"
+            ),
+        }
         tokio::time::sleep(Duration::from_millis(healthy_millis)).await;
-        let held = limited_pool
-            .get()
-            .await
-            .expect("hold the only worker connection");
+        // A renewal in flight can outlast one short checkout; the lease is still healthy then.
+        let held = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(held) = limited_pool.get().await {
+                    break held;
+                }
+            }
+        })
+        .await
+        .expect("hold the only worker connection");
         if block_release {
             // Make the handler and expired lease ready together on this current-thread runtime.
             std::thread::sleep(Duration::from_millis(release_millis));
