@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [mysql, postgres]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint-${{ matrix.backend }}
+      - run: cargo fmt --all --check
+      # The mysql and postgres features are mutually exclusive, so every
+      # build names its backend explicitly.
+      - run: >-
+          cargo clippy --workspace --all-targets --no-default-features
+          --features durable-workflows/${{ matrix.backend }},durable-workflows/fake-clock
+      - run: >-
+          cargo doc --workspace --no-deps --no-default-features
+          --features durable-workflows/${{ matrix.backend }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test-mysql:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["8.0", "8.4"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: durable
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pdurable"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DURABLE_WORKFLOWS_TEST_DATABASE_URL: mysql://root:durable@127.0.0.1:3306/mysql
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-mysql
+      - run: >-
+          cargo test --workspace --all-targets --no-fail-fast --no-default-features
+          --features durable-workflows/mysql,durable-workflows/fake-clock
+
+  test-postgres:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "17"]
+    env:
+      DURABLE_WORKFLOWS_TEST_DATABASE_URL: postgres://postgres:durable@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      # Service containers cannot pass server arguments, and the suite needs
+      # more than the default 100 connections, so Postgres runs from a step.
+      # The health check uses TCP: during initdb the image's temporary server
+      # listens only on the Unix socket, so a socket probe would pass early.
+      - name: Start Postgres ${{ matrix.postgres }}
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_PASSWORD=durable -p 5432:5432 \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            postgres:${{ matrix.postgres }} -c max_connections=300
+          for _ in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' postgres)" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs postgres
+          exit 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-postgres
+      - run: >-
+          cargo test --workspace --all-targets --no-fail-fast --no-default-features
+          --features durable-workflows/postgres,durable-workflows/fake-clock
+
+  # Records the in-scope suites with the trace-model recorder and replays every
+  # trace through the Quint model (docs/TRACE_CHECKING.md). The counts must not
+  # fall below spec/traces/expected.json.
+  trace-check:
+    needs: [test-mysql, test-postgres]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: mysql
+            url: mysql://root:durable@127.0.0.1:3306/mysql
+          - backend: postgres
+            url: postgres://postgres:durable@127.0.0.1:5432/postgres
+    env:
+      DURABLE_WORKFLOWS_TEST_DATABASE_URL: ${{ matrix.url }}
+    steps:
+      - uses: actions/checkout@v4
+      # Both servers start from steps (a service container cannot be chosen per
+      # matrix entry, and Postgres needs max_connections). Health checks use TCP.
+      - name: Start MySQL 8.4
+        if: matrix.backend == 'mysql'
+        run: |
+          docker run -d --name db \
+            -e MYSQL_ROOT_PASSWORD=durable -p 3306:3306 \
+            --health-cmd "mysqladmin ping -h 127.0.0.1 -pdurable" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            mysql:8.4
+      - name: Start Postgres 17
+        if: matrix.backend == 'postgres'
+        run: |
+          docker run -d --name db \
+            -e POSTGRES_PASSWORD=durable -p 5432:5432 \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            postgres:17 -c max_connections=300
+      - name: Wait for the database
+        run: |
+          for _ in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' db)" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs db
+          exit 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: trace-check-${{ matrix.backend }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: spec/package-lock.json
+      - run: npm ci
+        working-directory: spec
+      - run: scripts/trace-pipeline.sh ${{ matrix.backend }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traces-${{ matrix.backend }}
+          path: |
+            target/traces-${{ matrix.backend }}
+            target/trace-pipeline-${{ matrix.backend }}
+            spec/traces/
+          if-no-files-found: ignore

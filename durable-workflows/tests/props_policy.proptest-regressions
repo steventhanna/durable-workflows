@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f02d01d7e23f99f225dd05b51e224f6d663a8bb962d818761e31e45602cb6563 # shrinks to (initial, max, jitter) = (15175457804490987531, 16821761876444967734, 21), attempt = 2, percentile = 73
+cc 6e5f597c64e53bd7322a003f6ff3bf4502fc900bfa6d1dd74a2a2bcf4bd25916 # shrinks to (initial, max, jitter) = (2, 10825554033867107757, 80), attempt = 64, percentile = 94
+cc f41a06095cf63f23d180900e5fc6fb9847bcbf7b5eb0e64a8e65825327dfb210 # shrinks to (initial, max, jitter) = (15246106633038190, 13894805719877637554, 42), attempt = 1, step = 10, percentile = 89

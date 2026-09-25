@@ -1,0 +1,22 @@
+[package]
+name = "durable-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Dumps durable-workflows test traces and replays them through the Quint model (docs/design/trace-checking.md)."
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+diesel = "2.3"
+diesel-async = "0.9"
+durable-workflows = { path = "../../durable-workflows", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[features]
+default = ["postgres"]
+mysql = ["durable-workflows/mysql"]
+postgres = ["durable-workflows/postgres"]

@@ -1,0 +1,9 @@
+DROP TABLE durable_progress_event;
+DROP TABLE durable_activity_attempt;
+DROP TABLE durable_activity;
+DROP TABLE durable_approval;
+DROP TABLE durable_workflow_event;
+DROP TABLE durable_schedule_run;
+DROP TABLE durable_schedule_state;
+DROP TABLE durable_topic_lock;
+DROP TABLE durable_workflow;

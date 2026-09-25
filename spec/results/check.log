@@ -1,0 +1,58 @@
+typecheck ok
+    ok g7ClosedUnderRcTest passed 1 test(s)
+    ok g7RcHeartbeatBlockedTest passed 1 test(s)
+    ok tw1ReplayDetectsCapTest passed 1 test(s)
+    ok reconcileReplayDelayTest passed 1 test(s)
+    ok reconcileReplayEarlyRejectedTest passed 1 test(s)
+    ok n2CancelFreesSlotTest passed 1 test(s)
+    ok g2StrandedParentTest passed 1 test(s)
+    ok n1WrongLineageTest passed 1 test(s)
+    ok g11CancelTest passed 1 test(s)
+    ok staleCoordinatorTest passed 1 test(s)
+    ok activitySuccessTest passed 1 test(s)
+    ok startSemanticsTest passed 1 test(s)
+    ok startBothKeysRejectedTest passed 1 test(s)
+    ok n3LiveSourceTest passed 1 test(s)
+    ok tx2ConflictTest passed 1 test(s)
+  15 passing (1738ms)
+    ok g7CapExceededTest passed 1 test(s)
+    ok g7NeedsSnapshotTest passed 1 test(s)
+  2 passing (257ms)
+    ok driftTwoHandlersTest passed 1 test(s)
+  1 passing (131ms)
+    ok g10InvalidBoundsTest passed 1 test(s)
+    ok g10InvalidRowNotClaimedTest passed 1 test(s)
+    ok g10WrongReasonTest passed 1 test(s)
+    ok g10ReplayTest passed 1 test(s)
+  4 passing (480ms)
+durable_mc         safety                           expect=hold      got=No violation found   trace_len=41  (31062ms at 644 traces/second) 33s
+durable_mc         safetyRc                         expect=hold      got=No violation found   trace_len=41  (36521ms at 548 traces/second) 39s
+durable_mc         inv_S24_exceptTX2                expect=hold      got=No violation found   trace_len=41  (29814ms at 671 traces/second) 33s
+durable_mc_act     safetyRc                         expect=hold      got=No violation found   trace_len=41  (335087ms at 60 traces/second) 337s
+durable_mc         inv_G10_noClaimAbort             expect=hold      got=No violation found   trace_len=41  (26634ms at 751 traces/second) 30s
+durable_mc_env     safety                           expect=hold      got=No violation found   trace_len=41  (43244ms at 462 traces/second) 46s
+durable_mc_rr      safety                           expect=hold      got=No violation found   trace_len=41  (30090ms at 665 traces/second) 32s
+durable_mc_rr      inv_S17_capAlways                expect=violate   got=No violation found   trace_len=41  (26007ms at 769 traces/second) 29s
+durable_mc_act_rr  inv_S17_capAlways                expect=violate   got=No violation found   trace_len=41  (349924ms at 57 traces/second) 352s
+durable_mc_act_rr  inv_S17_capAtClaim               expect=violate   got=No violation found   trace_len=41  (320214ms at 62 traces/second) 323s
+durable_mc         inv_S24_parentWakes              expect=violate   got=No violation found   trace_len=41  (20551ms at 973 traces/second) 23s
+durable_mc         inv_G11_cancelReachesChildren    expect=violate   got=Found an issue       trace_len=8   (181ms at 497 traces/second) 2s
+durable_mc_env     inv_G10_noClaimAbort             expect=violate   got=Found an issue       trace_len=17  (1046ms at 898 traces/second) 4s
+durable_mc         inv_N1_tx2OwnLineage             expect=violate   got=Found an issue       trace_len=27  (18504ms at 946 traces/second) 20s
+durable_mc         inv_S13_topicConcurrency         expect=violate   got=No violation found   trace_len=41  (24520ms at 816 traces/second) 27s
+durable_mc_act     inv_S13_topicConcurrency         expect=violate   got=No violation found   trace_len=41  (271899ms at 74 traces/second) 275s
+durable_mc         inv_S19_sourceTerminal           expect=violate   got=Found an issue       trace_len=4   (87ms at 230 traces/second) 2s
+durable_mc_drift   inv_S13_oneHandler               expect=violate   got=No violation found   trace_len=41  (17665ms at 1132 traces/second) 20s
+durable_mc         wit_S3_concurrentStep            expect=violate   got=Found an issue       trace_len=17  (9008ms at 232 traces/second) 12s
+durable_mc         wit_blocked                      expect=violate   got=Found an issue       trace_len=26  (17725ms at 1039 traces/second) 20s
+durable_mc         wit_childSucceeded               expect=violate   got=Found an issue       trace_len=10  (966ms at 364 traces/second) 3s
+durable_mc         wit_activitySucceeded            expect=violate   got=Found an issue       trace_len=33  (21987ms at 794 traces/second) 25s
+durable_mc         wit_revivedLease                 expect=violate   got=No violation found   trace_len=41  (27872ms at 718 traces/second) 30s
+durable_mc         wit_coordFenceMiss               expect=violate   got=Found an issue       trace_len=12  (243ms at 379 traces/second) 3s
+durable_mc         wit_reconciled                   expect=violate   got=Found an issue       trace_len=25  (15721ms at 934 traces/second) 18s
+durable_mc         wit_tw1Interleaved               expect=violate   got=Found an issue       trace_len=7   (96ms at 146 traces/second) 3s
+durable_mc_drift   inv_S13_oneHandler               expect=violate   got=No violation found   trace_len=81  (156485ms at 128 traces/second) 159s
+durable_mc         inv_S13_topicConcurrency         expect=violate   got=No violation found   trace_len=81  (163198ms at 123 traces/second) 165s
+durable_mc         wit_revivedLease                 expect=violate   got=No violation found   trace_len=81  (202605ms at 99 traces/second) 206s
+durable_mc         inv_S24_parentWakes              expect=violate   got=No violation found   trace_len=81  (196540ms at 102 traces/second) 199s
+CHECK_DONE

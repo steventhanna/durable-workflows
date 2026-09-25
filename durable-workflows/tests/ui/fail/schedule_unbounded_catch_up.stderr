@@ -1,0 +1,5 @@
+error: CatchUp requires catch_up_limit from 1 through 100
+ --> tests/ui/fail/schedule_unbounded_catch_up.rs:7:15
+  |
+7 |     misfire = CatchUp,
+  |               ^^^^^^^

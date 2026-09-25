@@ -1,0 +1,12 @@
+# Gap tests (durable-workflows/tests/gaps.rs, run with --include-ignored) and the
+# invariant each one violates. `durable-trace gen --expect-violation` reads this;
+# trace-check.sh requires the final state of each matching trace to violate it.
+# Keys are globs over the test name (or its last `::` segment). The first match wins.
+g1_*: inv_G1_noSelfCancelFromOperator
+g2_*: inv_S24_parentWakes
+g10_*: inv_G10_noClaimAbort
+g11_*: inv_G11_cancelReachesChildren
+# Both N1 variants: supersession of a blocked sibling, and TX2_ReturnLatest of an unrelated one.
+n1_*: inv_N1_tx2OwnLineage
+# N2 via application cancel (T-X3) and via operator pause (T-A2).
+n2_*: inv_S13_topicConcurrency

@@ -1,0 +1,11 @@
+error: activity lease_secs must be greater than timeout_secs
+  --> tests/ui/fail/activity_invalid_policy.rs:7:1
+   |
+ 7 | / #[activity(
+ 8 | |     kind = "invalid_activity",
+ 9 | |     version = 1,
+10 | |     topic = Topics::Fax,
+...  |
+15 | | )]
+16 | | struct InvalidActivityPolicy;
+   | |_____________________________^

@@ -1,0 +1,6 @@
+node_modules/
+_apalache-out/
+results/*__*.txt
+results/tmp*.txt
+results/apalache_*.txt
+!results/apalache_summary.txt

@@ -1,0 +1,5 @@
+error: activity topic must be a qualified enum variant such as Topics::ExternalApi
+ --> tests/ui/fail/activity_unqualified_topic.rs:5:13
+  |
+5 |     topic = Fax,
+  |             ^^^

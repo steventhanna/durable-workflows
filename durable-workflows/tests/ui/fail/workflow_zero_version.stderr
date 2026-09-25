@@ -1,0 +1,6 @@
+error: workflow version must be greater than zero
+ --> tests/ui/fail/workflow_zero_version.rs:2:1
+  |
+2 | / #[workflow(kind = "zero_version", version = 0)]
+3 | | struct ZeroVersion;
+  | |___________________^

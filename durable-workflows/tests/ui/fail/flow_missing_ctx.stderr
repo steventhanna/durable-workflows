@@ -1,0 +1,13 @@
+error: a durable flow's first parameter must be `ctx: &mut WfCtx<'_, Context>`
+ --> tests/ui/fail/flow_missing_ctx.rs:4:30
+  |
+4 | async fn ctxless_flow(value: i64) -> Result<i64, WfError> {
+  |                              ^^^
+
+warning: unused import: `WfError`
+ --> tests/ui/fail/flow_missing_ctx.rs:1:39
+  |
+1 | use durable_workflows::{durable_flow, WfError};
+  |                                       ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

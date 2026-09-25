@@ -1,0 +1,52 @@
+[package]
+name = "durable-workflows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Durable workflows, activities, and schedules for Rust, persisted in your own SQL database via Diesel."
+readme = "../README.md"
+keywords = ["workflow", "durable", "diesel", "job-queue", "scheduler"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.17"
+diesel = { version = "2.3", features = ["chrono"] }
+diesel-async = { version = "0.9", features = ["async-connection-wrapper", "bb8"] }
+diesel_migrations = "2.3"
+durable-workflows-macros = { version = "0.1.0", path = "../durable-workflows-macros" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+utoipa = { version = "5", features = ["chrono"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[features]
+default = ["postgres"]
+mysql = ["diesel/mysql", "diesel-async/mysql"]
+postgres = ["diesel/postgres", "diesel-async/postgres"]
+# Test-only database clock override. Never enable in production.
+fake-clock = []
+# Test-only trace recorder for checking runs against the Quint model
+# (docs/design/trace-checking.md). Never enable in production.
+trace-model = []
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["postgres"]
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.18", features = ["fmt"] }
+trybuild = "1"

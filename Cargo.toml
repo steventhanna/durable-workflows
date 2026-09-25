@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["durable-workflows", "durable-workflows-macros", "tools/durable-trace"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Steven Hanna"]
+repository = "https://github.com/steventhanna/durable-workers"
+homepage = "https://github.com/steventhanna/durable-workers"

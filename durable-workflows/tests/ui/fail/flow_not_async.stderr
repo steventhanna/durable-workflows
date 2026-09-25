@@ -1,0 +1,13 @@
+error: a durable flow must be an `async fn`
+ --> tests/ui/fail/flow_not_async.rs:4:1
+  |
+4 | fn sync_flow(_ctx: &mut WfCtx<'_, ()>) -> Result<(), WfError> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `WfCtx` and `WfError`
+ --> tests/ui/fail/flow_not_async.rs:1:39
+  |
+1 | use durable_workflows::{durable_flow, WfCtx, WfError};
+  |                                       ^^^^^  ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

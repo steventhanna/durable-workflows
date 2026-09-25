@@ -1,0 +1,14 @@
+{
+  "name": "durable-workflows-spec",
+  "private": true,
+  "description": "Quint specification of the durable-workflows core protocol",
+  "scripts": {
+    "typecheck": "quint typecheck durable_mc.qnt",
+    "test": "quint test durable_tests.qnt --main durable_tests && quint test durable_tests.qnt --main durable_tests_rr",
+    "check": "./check.sh 20000 40",
+    "verify": "./verify.sh"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "*"
+  }
+}
