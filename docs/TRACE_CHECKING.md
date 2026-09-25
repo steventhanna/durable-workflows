@@ -167,6 +167,51 @@ scripts/trace-pipeline.sh postgres --update-baseline
 
 `--update-baseline` refuses to write while any trace FAILs.
 
+## The workload
+
+`durable-workflows/tests/trace_workload.rs` is a concurrent, seeded
+workload (design §9(b)). Each seed runs 2 or 3 real runtimes on one pool with
+short leases (workflow 2 s; activity lease 3 s, timeout 1 s, heartbeat
+500 ms) and two topics (caps 1 and 2). A driver loop, every 200–800 ms,
+starts a workflow (some with a deduplication key), cancels one, pauses or
+resumes one through `AdminControlService`, or crashes a runtime that holds a
+lease: it drops the `RuntimeHandle` without a graceful shutdown, records
+`Crash` for that runtime, and starts a replacement with a new runtime id.
+Workflow steps (Continue, RunActivity, RunChild with an automatic or one of
+two domain keys, Complete; children nest two deep) are drawn from the seed
+keyed by (workflow id, command sequence), so a replay after a crash takes
+the same step. Activity outcomes (success, retryable, permanent, a hang past
+the timeout, a slow success that heartbeats) are keyed by (activity id,
+attempt). Some steps outlast the workflow lease once, so another runtime
+recovers the workflow and the first misses its fence. The database clock is
+real time (no `fake-clock` freeze).
+
+A seed runs `DURABLE_TRACE_WORKLOAD_SECS` seconds (default 20) and stops
+starting work at 320 trace records (ends at 380). Each of the four seed
+tests asserts that its trace holds a `Crash`, a `TC1_Claim` that recovered a
+workflow lease, a `TW1_Claim` that reconciled an activity lease and a fence
+miss (`TW3_FenceMiss`, `TW2_FenceMiss` or `CoordFenceMiss`); the driver aims
+crashes at lease holders and cancels and pauses at workflows whose activity
+is running, so each seed covers all four. `DURABLE_TRACE_WORKLOAD_SEEDS=N`
+adds seeds 5..=N (`workload_extra_seeds`, four at a time, traces named
+`workload_seed_<n>`); those assert only a crash.
+
+```sh
+scripts/trace-pipeline.sh mysql --workload                 # in-scope suites + 4 seeds
+DURABLE_TRACE_WORKLOAD_SEEDS=20 scripts/trace-pipeline.sh postgres --workload
+scripts/trace-pipeline.sh mysql --suites trace_workload    # the workload alone
+```
+
+The workload is not in the default run or its baseline. With `--workload`
+the baseline check still runs, so a workload trace that is not `pass` raises
+an exclusion count or FAILs. The nightly workflow
+(`.github/workflows/nightly-trace.yml`) runs 20 seeds on MySQL 8.4 and
+Postgres 17. Workload steps are often `concurrent`: read the reads of a
+failing step before blaming the model or the code. A crash of a runtime that
+held nothing process-local is replayed as a stutter (`crashLoses` in the
+model). A failing trace longer than `LOCALIZE_ALL_MAX` steps (default 60) is
+localized by binary search over `step_k`.
+
 ## Adding a directed trace
 
 1. Add a `#[tokio::test]` to `durable-workflows/tests/trace_model.rs` (the

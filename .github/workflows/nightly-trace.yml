@@ -1,0 +1,84 @@
+name: nightly-trace
+
+# The trace-checking pipeline with the concurrent seeded workload
+# (docs/TRACE_CHECKING.md, "The workload"): every in-scope suite plus
+# DURABLE_TRACE_WORKLOAD_SEEDS seeds of tests/trace_workload.rs, replayed
+# against the Quint model with the baseline check.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Workload seeds
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  trace-workload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: mysql
+            url: mysql://root:durable@127.0.0.1:3306/mysql
+          - backend: postgres
+            url: postgres://postgres:durable@127.0.0.1:5432/postgres
+    env:
+      DURABLE_WORKFLOWS_TEST_DATABASE_URL: ${{ matrix.url }}
+      DURABLE_TRACE_WORKLOAD_SEEDS: ${{ github.event.inputs.seeds || '20' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start MySQL 8.4
+        if: matrix.backend == 'mysql'
+        run: |
+          docker run -d --name db \
+            -e MYSQL_ROOT_PASSWORD=durable -p 3306:3306 \
+            --health-cmd "mysqladmin ping -h 127.0.0.1 -pdurable" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            mysql:8.4 --max-connections=400
+      - name: Start Postgres 17
+        if: matrix.backend == 'postgres'
+        run: |
+          docker run -d --name db \
+            -e POSTGRES_PASSWORD=durable -p 5432:5432 \
+            --health-cmd "pg_isready -h 127.0.0.1 -U postgres" \
+            --health-interval 2s --health-timeout 5s --health-retries 30 \
+            postgres:17 -c max_connections=400
+      - name: Wait for the database
+        run: |
+          for _ in $(seq 1 60); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' db)" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs db
+          exit 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: trace-check-${{ matrix.backend }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: spec/package-lock.json
+      - run: npm ci
+        working-directory: spec
+      - run: scripts/trace-pipeline.sh ${{ matrix.backend }} --workload
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-traces-${{ matrix.backend }}
+          path: |
+            target/traces-${{ matrix.backend }}
+            target/trace-pipeline-${{ matrix.backend }}
+            spec/traces/
+          if-no-files-found: ignore

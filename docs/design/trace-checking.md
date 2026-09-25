@@ -312,6 +312,9 @@ and cap-2 topics, seeded random flows (Continue / RunActivity / RunChild /
 Complete) and handlers (success / retryable / permanent / hang), random
 starts, cancels, and runtime crashes; 20 s per seed; 4 seeds in CI, 20
 nightly. Optional shared fake clock via a bb8 connection customizer.
+Implemented without the fake clock: real DB time keeps lease expiry, the
+heartbeat and the local lease deadline on one timeline. See
+`docs/TRACE_CHECKING.md`, "The workload".
 
 (c) `tests/gaps.rs` G2, G11, N1, N2, G10 as the checker self-test.
 

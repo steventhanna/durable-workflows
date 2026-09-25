@@ -7,12 +7,17 @@
 #   4. dumps every recorded trace, generates the Quint runs, and
 #   5. replays them with spec/trace-check.sh --baseline <backend>.
 #
-# Usage: scripts/trace-pipeline.sh <mysql|postgres> [--suites a,b,...] [--update-baseline]
+# Usage: scripts/trace-pipeline.sh <mysql|postgres> [--suites a,b,...] [--workload] [--update-baseline]
 #   --suites           test binaries to record (default: every in-scope suite, incl. gaps);
 #                      a subset is replayed without the baseline check
+#   --workload         also record the concurrent seeded workload (tests/trace_workload.rs);
+#                      its traces add to the counts, so a workload trace that is not `pass`
+#                      fails the baseline check (not with --update-baseline)
 #   --update-baseline  rewrite spec/traces/expected.json[<backend>] from this run
 # Env: DURABLE_WORKFLOWS_TEST_DATABASE_URL (default: the local docker servers of
-#      CONTRIBUTING.md), JOBS (trace-check parallelism).
+#      CONTRIBUTING.md), JOBS (trace-check parallelism), DURABLE_TRACE_WORKLOAD_SEEDS
+#      and DURABLE_TRACE_WORKLOAD_SECS (workload seeds, default 4; seconds per seed,
+#      default 20).
 # Needs: cargo, jq, node + `npm ci` in spec/, and the mysql or psql client.
 # A failing non-gap test binary is retried once (known timing flakes); a second
 # failure fails the pipeline.
@@ -24,20 +29,29 @@ backend=${1:-}
 case "$backend" in
   mysql) default_url=mysql://root:durable@127.0.0.1:33306/mysql ;;
   postgres) default_url=postgres://postgres:durable@127.0.0.1:55432/postgres ;;
-  *) echo "usage: $0 <mysql|postgres> [--suites a,b,...] [--update-baseline]" >&2; exit 2 ;;
+  *) echo "usage: $0 <mysql|postgres> [--suites a,b,...] [--workload] [--update-baseline]" >&2; exit 2 ;;
 esac
 shift
 suites=(activity_execution workflow_activation child_workflow application_cancellation
   continuation_priority workflow_start runtime_shutdown trace_model gaps)
 subset=0
 update=0
+workload=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --suites) IFS=, read -r -a suites <<<"${2:?--suites needs a list}"; subset=1; shift 2 ;;
+    --workload) workload=1; shift ;;
     --update-baseline) update=1; shift ;;
     *) echo "trace-pipeline: unknown argument $1" >&2; exit 2 ;;
   esac
 done
+if [ "$workload" = 1 ]; then
+  if [ "$update" = 1 ]; then
+    echo "trace-pipeline: the baseline does not count the workload; drop --workload" >&2
+    exit 2
+  fi
+  suites+=(trace_workload)
+fi
 # The baseline counts the full in-scope run, so a subset is checked without it.
 check_args=()
 if [ "$subset" = 0 ]; then

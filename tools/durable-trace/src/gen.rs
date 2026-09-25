@@ -1041,7 +1041,11 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
         }
         "Crash" => {
             let r = runtime(ctx, actor, seq)?;
-            (format!("Crash({r})"), "Crash")
+            // A runtime that held nothing process-local loses nothing: a stutter.
+            (
+                format!("if (crashLoses({r})) Crash({r}) else commit(db, proc, ghost, \"Crash\")"),
+                "Crash",
+            )
         }
         other => return Err(format!("unsupported_action:{other}")),
     };
@@ -1181,7 +1185,16 @@ fn post_expectations(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Vec<Stri
             } else {
                 recorded
             };
-            let cmd = event["cmd"].as_i64().unwrap_or(0);
+            // `started` and `continued` rows store no command_sequence; the model
+            // stamps the workflow's command sequence at append time, which is the
+            // post-image's (neither transition changes it).
+            let cmd = match (typ, event["cmd"].as_i64()) {
+                ("started" | "continued", None | Some(0)) => post["wf"][event["wf"].to_string()]
+                    ["command_sequence"]
+                    .as_i64()
+                    .unwrap_or(0),
+                (_, cmd) => cmd.unwrap_or(0),
+            };
             let reference = match typ {
                 "started" | "continued" => 0,
                 t if t.starts_with("activity_") => ctx.act.id(int(params, "activity_id", seq)?),

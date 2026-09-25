@@ -194,6 +194,10 @@ Changes in v4 (from v3):
   otherwise `availableAt >= tnow`.
 - `TX2_ReturnLatest` sets `ghost.tx2OutsideLineage` when the returned row is
   not on the keyed row's restart chain (N1, second variant).
+- `crashLoses(r)`: `Crash(r)`'s guard (the runtime holds a claim, an
+  execution or an in-flight T-W1). A trace checker replays the recorded crash
+  of an idle runtime as a stutter, `commit(db, proc, ghost, "Crash")`: it
+  loses nothing, and a crashed runtime id never acts again.
 - New constant `MAX_TASK_RESTARTS` (`RuntimeConfig.max_task_restarts`;
   `durable-trace gen` writes the default 8, the recorder does not see the
   runtime config). New ghost fields `coordErrors`, `dispErrors` (restart

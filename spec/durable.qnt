@@ -1042,10 +1042,15 @@ module durable {
   //-------------------------------------------------------------- environment
   // process crash: in-memory state lost, rows remain; an in-flight T-W1 rolls back and
   // releases its locks; heartbeat COMMITs already sent may still land (hbs are kept)
+  // Crash(r) changes the state only when r holds process-local state; the crash of an
+  // idle runtime is a stutter (a trace checker replays it as one).
+  def crashLoses(r: int): bool =
+    proc.claims.get(r).active or proc.execs.exists(e => e.rt == r) or proc.tw1.get(r).phase != "idle"
+
   action Crash(r: int): bool = all {
     ENABLE_CRASH,
     RUNTIMES.contains(r),
-    proc.claims.get(r).active or proc.execs.exists(e => e.rt == r) or proc.tw1.get(r).phase != "idle",
+    crashLoses(r),
     commit(db, proc.with("claims", proc.claims.set(r, noClaim))
                    .with("execs", proc.execs.filter(e => e.rt != r))
                    .with("tw1", proc.tw1.set(r, idleTw1))

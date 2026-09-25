@@ -14,7 +14,9 @@
 #   --update-baseline   rewrite traces/expected.json[B] from this run (needs no FAIL)
 # Env: JOBS (default: CPU count), QUINT (default: node_modules/.bin/quint),
 #      DURABLE_TRACE (the durable-trace binary for field diffs; default
-#      ../target/debug/durable-trace when built).
+#      ../target/debug/durable-trace when built), LOCALIZE_ALL_MAX (default 60:
+#      a failing trace with more steps is localized by binary search over
+#      step_k instead of running every step).
 # Needs jq and `npm ci` in spec/. See docs/TRACE_CHECKING.md.
 # Exit: 0 all expected verdicts (and baseline held), 1 any FAIL or baseline
 # regression, 2 setup error.
@@ -31,7 +33,8 @@ fi
 # The per-step runs of a long trace (hundreds of records) need more than
 # Node's default heap.
 NODE_OPTIONS=${NODE_OPTIONS:---max-old-space-size=12288}
-export QUINT DURABLE_TRACE NODE_OPTIONS
+LOCALIZE_ALL_MAX=${LOCALIZE_ALL_MAX:-60}
+export QUINT DURABLE_TRACE NODE_OPTIONS LOCALIZE_ALL_MAX
 
 # ---------------------------------------------------------------------------
 # Worker: checks trace number $2 of $TRACE_DIR/index.json and writes
@@ -53,8 +56,21 @@ if [ "${1:-}" = --worker ]; then
   # Names the first failing step and writes a FAIL row, or an excluded row
   # when an external step breaks an invariant by itself.
   analyse_failure() {
-    local prefix=$1 step seq class action broken
-    qtest '^step_' "$logs.steps.log" || true
+    local prefix=$1 step seq class action broken steps lo hi mid
+    steps=$(jq ".traces[$n].step_seqs | length" "$index")
+    if [ "$steps" -gt "$LOCALIZE_ALL_MAX" ]; then
+      # A long trace: each per-step run replays its whole prefix, so running
+      # them all is quadratic. step_k extends step_(k-1), so step_k fails iff
+      # some step up to k does: binary search for the first failing one.
+      lo=1 hi=$steps
+      while [ "$lo" -lt "$hi" ]; do
+        mid=$(((lo + hi) / 2))
+        if qtest "^step_${mid}\$" "$logs.search.log"; then lo=$((mid + 1)); else hi=$mid; fi
+      done
+      qtest "^step_${lo}\$" "$logs.steps.log" || true
+    else
+      qtest '^step_' "$logs.steps.log" || true
+    fi
     step=$(grep -E 'step_[0-9]+ failed' "$logs.steps.log" \
       | sed -E 's/.*step_([0-9]+) failed.*/\1/' | sort -n | head -n 1 || true)
     # Long traces can crash Quint in the per-step runs (one run per prefix);
@@ -166,7 +182,12 @@ trap 'rm -rf "$out"' EXIT
 count=$(jq '.traces | length' "$index")
 start=$(date +%s)
 if [ "$count" -gt 0 ]; then
-  seq 0 $((count - 1)) | TRACE_DIR=$dir TRACE_OUT=$out xargs -P "$jobs" -I{} "$self" --worker {}
+  # Quint installs its evaluator into ~/.quint on first use; parallel first
+  # runs race on that install (tar fails, or the half-written binary aborts).
+  TRACE_DIR=$dir TRACE_OUT=$out "$self" --worker 0
+  if [ "$count" -gt 1 ]; then
+    seq 1 $((count - 1)) | TRACE_DIR=$dir TRACE_OUT=$out xargs -P "$jobs" -I{} "$self" --worker {}
+  fi
 fi
 
 # A worker that died without a row is a FAIL.
