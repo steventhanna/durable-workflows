@@ -92,7 +92,7 @@ Actions, one per committed transaction (T-W1: one per statement group):
 | `TC2_Continue`, `TC2_Complete`, `TC2_RunActivity`, `TC2_RunChild` | T-C2 | fence `status=running ∧ leaseToken`; Continue, Complete (+ parent wake), RunActivity, RunChild (new, attach, attach-to-terminal + wake) |
 | `TC3_ActivationFailure` | T-C3 | fence; retry with backoff or fail when exhausted (+ parent wake) |
 | `CoordFenceMiss` | T-C2/T-C3 rollback | logged by `activate_one`; not a task error (G1 fixed) |
-| `TW1_*` | T-W1 | simulation form: see the next table; replay form `TW1_Claim`; `TW1_Error` (G10) |
+| `TW1_*` | T-W1 | simulation form: see the next table; replay form `TW1_Claim`; an invalid row is quarantined (`TW1_QuarantineRow`, G10 fixed) |
 | `TW2_Send` / `TW2_Commit` / `TW2_FenceMiss` / `TW2_Drop` | T-W2 | `now` sampled at send; commit fenced on `status, attemptCount, leaseToken` and open attempt, no expiry check; blocks on T-W1's row lock |
 | `HandlerReturn`, `LocalDeadline` | L-W | handler returns only before the local deadline; passing the deadline ends the execution without T-W3 |
 | `TW3_Finish` / `TW3_FenceMiss` | T-W3 | fence on `status, attemptCount, leaseToken`; success needs the workflow wait; dead-letter blocks the workflow; blocks on T-W1's row locks |
@@ -117,6 +117,7 @@ transaction that would lock it (those actions are disabled until the commit).
 | `TW1_ReconcileRow(r, a)` | workflow `FOR UPDATE`; activity `FOR UPDATE` with the filters; the updates; history; block | locking | yes |
 | `TW1_Count(r)` | `in_flight` count; if `wanted > 0`, the candidate join | plain, plain | yes |
 | `TW1_ClaimRow(r, a, tok)` / `TW1_SkipRow(r, a)` | workflow and activity `FOR UPDATE SKIP LOCKED` with the filters; update; attempt insert | locking | yes |
+| `TW1_QuarantineRow(r, a)` | same locks; the row is past its attempt cap or has invalid bounds: dead-letter it, block its workflow (G10 fixed) | locking | yes |
 | `TW1_Commit(r)` | `COMMIT` | | yes |
 
 Two merges keep the model small. (1) Statements inside `TW1_ReconcileRow` and
@@ -164,13 +165,36 @@ concurrent insert falls back to `DeduplicationConflict` and a locking reload).
 
 ## Trace-checking interface
 
-`pure val TRACE_IFACE_VERSION = 4` (in `durable.qnt`) versions the action
+`pure val TRACE_IFACE_VERSION = 5` (in `durable.qnt`) versions the action
 names, parameters and views below. Every action takes all its choices as
 parameters; there is no `nondet` inside an action (only in `step`). A trace
 checker calls `all { keepPrev, Action(args) }` once per record, in commit
 order. After each call `lastAction` names the branch taken (for example
 `TX1_StartConflict`, `TX2_ReturnLatest`, `TC2_RunChild_AttachTerminal`,
 `TW3_DeadLetter`); a checker compares it with the outcome in the record.
+
+Changes in v5 (from v4):
+
+- G10 fixed: `claim_locked_candidate` no longer aborts the T-W1 on an
+  invalid row. `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen,
+  quarantined, claimed)`: new `quarantined: List[{a, reason}]`, replayed
+  after `reconciled` and before `claimed`. Each entry needs row `a`
+  claimable at `tnow` and `reason` = `"attempt_cap"` (`attemptCount + 1 >
+  maxAttempts`, checked first) or `"invalid_bounds"`; it writes `a` →
+  `dead_lettered` and its workflow → `blocked` (`quarantineWrite`). The
+  recorder's `TW1_Claim` record has a `quarantined` list of
+  `{activity_id, reason}`, and a T-W1 that only quarantined still declares
+  `TW1_Claim`.
+- New simulation action `TW1_QuarantineRow(r, a)`, next to
+  `TW1_ClaimRow`/`TW1_SkipRow`: a candidate the claim loop reaches with
+  `quarantineReason != "none"` is quarantined in the in-flight T-W1 (row and
+  workflow locked, no token).
+- Removed: `TW1_Error`, `ghost.claimAborted`, `inv_G10_noClaimAbort`.
+  `durable-trace gen` no longer inserts an `EnvCorruptActivityBounds(a)`
+  before a `TW1_Error`; the raw-SQL bounds edit reaches the model as its
+  trigger-captured `EnvSetAct`. New witness `wit_quarantined`.
+- `missing_definition` is a skip (`Ok(None)`), not a record; it stays
+  unmodeled (F3).
 
 Changes in v4 (from v3):
 
@@ -284,9 +308,7 @@ Rules:
   the trace with `external_write:<table>:<detail>`. `safety` is checked
   after every step; when an external step itself breaks an invariant,
   `trace-check.sh` reports the trace as excluded
-  (`external_invariant:<inv>`), not as a failure. A `TW1_Error{invalid_bounds}`
-  naming an activity whose last image had valid bounds still gets an
-  `EnvCorruptActivityBounds(a)` before it (a write that no trigger saw).
+  (`external_invariant:<inv>`), not as a failure.
 - **Expected violations.** `durable-trace gen --expect-violation
   traces/gaps.yaml` maps test-name globs to the gap invariant each test
   reproduces. For such a trace every step checks `safety` (without that
@@ -305,7 +327,7 @@ Rules:
 - **Stable invariant names:** `safety`, `safetyRc`, `inv_S17_capAtClaim`,
   `inv_S17_capAlways`, `inv_S24_parentWakes`, `inv_G11_cancelReachesChildren`,
   `inv_N1_tx2OwnLineage`, `inv_S13_topicConcurrency`,
-  `inv_G10_noClaimAbort`, `inv_S19_sourceTerminal`, `inv_G1_noSelfCancelFromOperator`.
+  `inv_S19_sourceTerminal`, `inv_G1_noSelfCancelFromOperator`.
 
 Views for state comparison (`durable.qnt`):
 
@@ -332,11 +354,10 @@ in-flight simulation T-W1, which block the action):
 | `TC2_RunActivity(r, w, tok, aNew, topic, maxAttempts, invalidBounds, prio, availableAt, tnow)` — `prio`: `availableAt == CONTINUATION_READY_AT` | `commit_wait_transition` → `commit_activity` | same, `db.nextAct` | `db.act[aNew]`, `db.nextAct`, `db.wf[w]`, `proc.claims[r]`, `now` |
 | `TC2_RunChild(r, w, tok, kind, key, existing, cNew, tnow)` — `existing` = row with `(kind, key)` (0 = insert `cNew`) | `commit_wait_transition` → `commit_child` → `store.rs:insert_child` | same, `db.wf[existing]`, `db.nextWf`, locks | `db.wf[w, cNew]`, `db.events[cNew]`, `db.nextWf`; attach to terminal: `db.wf[w]` woken, `db.events[w]`; `proc.claims[r]`, `now` |
 | `TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)` | `coordinator.rs:record_activation_failure` | `proc.claims[r]`, `db.wf[w]` | `db.wf[w]`, parents, `db.events`, `proc.claims[r]`, `now` |
-| `TW1_Claim(r, tnow, localAvail: str->int, reconciled: List[{a, exhausted, availableAt}], inFlightSeen: str->int, claimed: List[{a, tok, leaseExp}])` | `runtime/activity_worker.rs:claim_batch` / `claim_one` (`reconcile_expired`, `claim_locked_candidate`), one commit | `db.act`, `db.att`, `db.wf`, `db.nextToken`, `proc.topicHolder` | `db.act`, `db.att`, `db.wf` (blocked), `db.nextToken`, `proc.execs`, `ghost.capExceededAtClaim`, `ghost.lastIssuedAct`, `now` |
-| `TW1_Error(r, a, reason)` — `reason` = `"attempt_cap"` (checked first) or `"invalid_bounds"`, on claimable row `a` (G10) | `claim_locked_candidate` error → rollback of the whole T-W1 | `db.act`, `db.wf`, `proc.tw1[r]` | `proc.tw1[r]`, `proc.topicHolder`, `ghost.claimAborted`, `ghost.taskErrors` |
-| `EnvCorruptActivityBounds(a)` — needs `ENABLE_ENV_EDITS`; blocks while a T-W1 holds `a` | external write (raw SQL; the G10 gap test) | `db.act[a]`, locks | `db.act[a].invalidBounds` |
+| `TW1_Claim(r, tnow, localAvail: str->int, reconciled: List[{a, exhausted, availableAt}], inFlightSeen: str->int, quarantined: List[{a, reason}], claimed: List[{a, tok, leaseExp}])` — `reason` = `"attempt_cap"` (checked first) or `"invalid_bounds"` | `runtime/activity_worker.rs:claim_batch` / `claim_one` (`reconcile_expired`, `claim_locked_candidate`, `quarantine_candidate`), one commit | `db.act`, `db.att`, `db.wf`, `db.nextToken`, `proc.topicHolder` | `db.act`, `db.att`, `db.wf` (blocked), `db.nextToken`, `proc.execs`, `ghost.capExceededAtClaim`, `ghost.lastIssuedAct`, `now` |
+| `EnvCorruptActivityBounds(a)` — needs `ENABLE_ENV_EDITS`; blocks while a T-W1 holds `a` | external write (raw SQL; simulation of the G10 gap test's edit) | `db.act[a]`, locks | `db.act[a].invalidBounds` |
 | `EnvSetWf(w, row)`, `EnvSetAct(a, row)`, `EnvSetAtt(a, n, row)`, `EnvAppendEvent(w, ev)` — trace replay only; need `ENABLE_ENV_EDITS`; block while a T-W1 holds the row | recorded external write (trigger-captured `External` record) | locks | the row / `db.events[w]`; `db.nextWf`, `db.nextAct`, `db.nextToken`; `ghost.lastIssuedWf` / `lastIssuedAct` |
-| `TW1_BeginBatch(r)`, `TW1_BeginOne(r, t, tnow)`, `TW1_ReconcileScan(r, t)`, `TW1_ReconcileRow(r, a, availableAt)`, `TW1_Count(r)`, `TW1_ClaimRow(r, a, tok)`, `TW1_SkipRow(r, a)`, `TW1_Commit(r)` (simulation) | `claim_batch` / `claim_one` statement groups (table above) | `db`, `proc.tw1[r]`, `proc.topicHolder`, `proc.execs` | `proc.tw1[r]`, `proc.topicHolder`; `TW1_ClaimRow`: `db.nextToken`; `TW1_Commit`: `db.act`, `db.att`, `db.wf`, `proc.execs`, ghost |
+| `TW1_BeginBatch(r)`, `TW1_BeginOne(r, t, tnow)`, `TW1_ReconcileScan(r, t)`, `TW1_ReconcileRow(r, a, availableAt)`, `TW1_Count(r)`, `TW1_ClaimRow(r, a, tok)`, `TW1_QuarantineRow(r, a)`, `TW1_SkipRow(r, a)`, `TW1_Commit(r)` (simulation) | `claim_batch` / `claim_one` statement groups (table above) | `db`, `proc.tw1[r]`, `proc.topicHolder`, `proc.execs` | `proc.tw1[r]`, `proc.topicHolder`; `TW1_ClaimRow`: `db.nextToken`; `TW1_Commit`: `db.act`, `db.att`, `db.wf`, `proc.execs`, ghost |
 | `HandlerReturn(r, a, tok, outcome)` | `activity_worker.rs:execute_claim` (dispatch result) | `proc.execs`, `now` | `proc.execs` |
 | `LocalDeadline(r, a, tok)` | `execute_claim`, `wait_for_lease_deadline` | `proc.execs`, `now` | `proc.execs` |
 | `TW2_Send(r, a, tok, hb)` | `activity_worker.rs:heartbeat_loop` → `heartbeat_once` starts | `proc.execs`, `proc.hbs`, `ghost.nextHb` | `proc.hbs`, `ghost.nextHb` |
@@ -376,7 +397,7 @@ All 39 pass (`durable_tests` 32, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `g7NeedsSnapshotTest` | RR (historical) | Same schedule with the heartbeat before the snapshot: no violation. |
 | `driftTwoHandlersTest` | DRIFT=2 | S13 fails when the process clock lags DB time. |
 | `reconcileReplayDelayTest`, `reconcileReplayEarlyRejectedTest` | RC | A replayed reconcile returns the row to pending at `availableAt` (the retry delay); an `availableAt` before `tnow` is rejected. |
-| `g10InvalidBoundsTest` | RC, `ENABLE_ENV_EDITS` | An external write gives a1 (topic t) invalid bounds; one `claim_batch` claims a2 on topic u, then `TW1_Error(2, 1, "invalid_bounds")` rolls it back: a2 stays pending, no execution, task error. `inv_G10_noClaimAbort` fails; `safety` holds. |
+| `g10InvalidBoundsTest` | RC, `ENABLE_ENV_EDITS` | G10 (fixed): an external write gives a1 (topic t) invalid bounds; one `claim_batch` claims a2 on topic u, then `TW1_QuarantineRow(2, 1)` quarantines a1 and the T-W1 goes on; at commit a1 is `dead_lettered`, w1 `blocked`, a2 running, no task error; `safety` holds. |
 | `pauseResumeTest`, `pauseTwiceRejectedTest`, `resumeNotPausedRejectedTest` | RC | T-A2/T-A3: pausing a claimed row clears its lease; the coordinator's commit misses the fence, which is not a task error (`inv_G1_noSelfCancelFromOperator` holds); resume → `ready` at `tnow`. Pausing a paused row and resuming a non-paused row are not steps. |
 | `g1NoSelfCancelTest`, `g1RuntimeStillClaimsTest`, `g1AppCancelFenceMissTest` | RC, `MAX_TASK_RESTARTS = 1` | G1 (fixed): two operator pauses during claims leave runtime 1 up, and it claims again; an application cancel's fence miss is not a task error either. |
 | `n2PauseFreesSlotTest`, `pausedActivityNotClaimedTest` | RC | S36 + N2: pausing during a running activity sets it `pending` with `maxAttempts + 1` and closes the attempt; the paused handler still executes while r2 claims the cap-1 slot (`inv_S13_topicConcurrency` fails); its finish misses the fence; resume → `waiting_activity`. A paused workflow's activity is not claimable. |
@@ -384,7 +405,7 @@ All 39 pass (`durable_tests` 32, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `g11AdminCancelTest`, `adminCancelPausedTest` | RC | G11 through the operator cancel; admin cancel of a paused workflow cancels its pending activity. |
 | `continuationPriorityTest`, `continuationPriorityNowRejectedTest`, `noPriorityEarlyRejectedTest` | RC | A continuation-priority activity is inserted at `CONTINUATION_READY_AT` (0 < `tnow`) and claimed; `prio` with `availableAt = now`, or no `prio` with `availableAt < tnow`, is not a step. |
 | `n1ReturnLatestTest`, `n1ReturnOwnRowTest` | RC | N1, second variant: T-X2 on the child key returns a newer live sibling (`TX2_ReturnLatest` flags it); returning the keyed row itself does not. |
-| `g10InvalidRowNotClaimedTest`, `g10WrongReasonTest`, `g10ReplayTest` | RC, `ENABLE_ENV_EDITS` | The invalid row cannot be claimed; the `attempt_cap` reason does not match it; the replay form (no T-W1 in flight) takes the same error. |
+| `g10InvalidRowNotClaimedTest`, `g10WrongReasonTest`, `g10ReplayTest` | RC, `ENABLE_ENV_EDITS` | The invalid row cannot be claimed; a replayed quarantine with the `attempt_cap` reason does not match it; the replay form quarantines a1 and claims a2 in one `TW1_Claim`. |
 
 ### Random simulation (`quint run`, 20,000 samples, 40 steps; 80 steps where noted)
 
@@ -401,9 +422,8 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 | `durable_mc_act` | `safetyRc` | hold | no violation |
 | `durable_mc_rr` | `safety` | hold | no violation |
 | `durable_mc_rr`, `durable_mc_act_rr` | `inv_S17_capAlways`, `inv_S17_capAtClaim` (G7, historical) | violate | not found at this budget; found by `g7CapExceededTest` |
-| `durable_mc` | `inv_G10_noClaimAbort` | hold | no violation (no invalid row without external writes) |
 | `durable_mc_env` | `safety` (external writes and invalid-bounds commands on) | hold | no violation |
-| `durable_mc_env` | `inv_G10_noClaimAbort` (G10) | violate | violated (17 states) |
+| `durable_mc_env` | `wit_quarantined` (G10 fixed; non-vacuity) | violate | see `results/summary.txt` |
 | `durable_mc` | `inv_G11_cancelReachesChildren` | violate | violated (11 states) |
 | `durable_mc` | `inv_N1_tx2OwnLineage` (N1) | violate | violated (24 states; first time found by simulation) |
 | `durable_mc` | `inv_S19_sourceTerminal` (N3) | violate | violated (3 states) |
@@ -449,7 +469,7 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 | G2 (T-X2 strands the parent) | Reproduces, unchanged | `g2StrandedParentTest` |
 | G4 (stale `sequence`) | Not modeled; closed for library transactions by READ COMMITTED per INVARIANTS.md | — |
 | G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 4; `g7CapExceededTest` (RR) |
-| G10 (one invalid row aborts every topic's claims) | Reproduces with external writes (`ENABLE_ENV_EDITS`): a claimable row with invalid bounds makes `TW1_Error(r, a, "invalid_bounds")` roll back the whole T-W1. Holds without them (the attempt-cap error has no reachable row) | `g10InvalidBoundsTest`, `g10ReplayTest`; `durable_mc_env` / `durable_mc` simulation; the recorded G10 gap test trace |
+| G10 (one invalid row aborts every topic's claims) | **Fixed** (interface v5): a claimable row past its attempt cap or with invalid bounds is quarantined (`TW1_QuarantineRow`; `quarantined` in `TW1_Claim`): dead-lettered, its workflow blocked, and the T-W1 goes on. `TW1_Error` and `inv_G10_noClaimAbort` are gone | `g10InvalidBoundsTest`, `g10ReplayTest`, `g10WrongReasonTest`; `durable_mc_env` `safety` and `wit_quarantined`; the G10 gap tests' traces pass |
 | G11 (cancel does not reach children) | Reproduces through T-X3 and the operator cancel (T-A4) | `g11CancelTest`, `g11AdminCancelTest`, simulation, the recorded G11 gap test |
 | N1 (T-X2 lineage on a child key) | Reproduces in both variants: supersession of a blocked sibling, and `TX2_ReturnLatest` of a live one | `n1WrongLineageTest`, `n1ReturnLatestTest`, simulation, both recorded N1 gap tests |
 | N2 (revoke frees the slot, cap exceeded in execution) | Reproduces through application cancel and operator pause | `n2CancelFreesSlotTest`, `n2PauseFreesSlotTest`, both recorded N2 gap tests |

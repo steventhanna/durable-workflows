@@ -16,9 +16,9 @@ use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use durable_workflows::{
     admin::{AdminControlService, Operator},
-    persistence::{database_now_millis, find_workflow_by_id, WorkflowRow},
+    persistence::{database_now_millis, find_activity_by_id, find_workflow_by_id, WorkflowRow},
     schema::{durable_activity, durable_workflow},
-    ActivityContext, ActivityError, ActivityHandler, ActivityRegistry, ActivityTopic,
+    ActivityContext, ActivityError, ActivityHandler, ActivityId, ActivityRegistry, ActivityTopic,
     ActivityWorker, CoordinatorConfig, DurableActivity, DurableError, DurableFlow, DurablePool,
     DurableRuntime, DurableStore, DurableWorkflow, RetryPolicy, RuntimeConfig, StartOptions,
     TopicRegistry, WfCtx, WfError, WorkerConfig, WorkflowCoordinator, WorkflowId, WorkflowRegistry,
@@ -1068,7 +1068,6 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "confirms G10: one row with leaseDuration <= timeout makes claim_batch return Err and claim nothing on any topic"]
 async fn g10_invalid_activity_row_does_not_stop_other_claims() {
     let Some(pool) = support::fresh_pool().await else {
         return;
@@ -1129,6 +1128,80 @@ async fn g10_invalid_activity_row_does_not_stop_other_claims() {
 // ---------------------------------------------------------------------------
 // G3
 // ---------------------------------------------------------------------------
+
+/// G10 (fixed): the claim quarantines a row with invalid bounds (dead-letters
+/// it and blocks its workflow) instead of claiming it. The operator retry that
+/// recovers it is in `admin_controls.rs` (the trace model does not model
+/// `retry_activity`).
+#[tokio::test]
+async fn g10_quarantined_row_is_dead_lettered_and_blocks_its_workflow() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let store = DurableStore::new(pool.clone());
+    let workflow = store
+        .start(&G10Flow { topic_b: false }, StartOptions::default())
+        .await
+        .expect("topic A workflow starts")
+        .workflow_id;
+    coordinator(&pool, context.clone(), CoordinatorConfig::default())
+        .activate_one()
+        .await
+        .expect("activation")
+        .expect("claim");
+    let bad_activity = load(&pool, workflow)
+        .await
+        .wait_reference_id
+        .expect("topic A activity");
+
+    let mut connection = pool.get().await.expect("test connection");
+    diesel::update(durable_activity::table.find(bad_activity))
+        .set(durable_activity::lease_duration_millis.eq(durable_activity::timeout_millis))
+        .execute(&mut connection)
+        .await
+        .expect("corrupt the topic A row");
+    drop(connection);
+
+    let capacity = HashMap::from([("gap_g10_a".to_string(), 1), ("gap_g10_b".to_string(), 1)]);
+    let claims = worker(&pool, context)
+        .claim_batch(4, &capacity)
+        .await
+        .expect("claim_batch quarantines the row instead of failing");
+    assert!(claims.is_empty(), "the invalid row was claimed");
+
+    let mut connection = pool.get().await.expect("test connection");
+    let activity = find_activity_by_id(
+        &mut connection,
+        ActivityId::new(bad_activity).expect("activity id"),
+    )
+    .await
+    .expect("activity row");
+    assert_eq!(activity.status.as_str(), "dead_lettered");
+    assert_eq!(activity.attempt_count, 0);
+    assert_eq!(activity.last_error_category.as_deref(), Some("invalid_row"));
+    assert!(activity
+        .last_error_message
+        .as_deref()
+        .is_some_and(|message| message.starts_with("invalid_bounds")));
+    assert!(activity.completed_at.is_some());
+    let history = durable_workflows::schema::durable_workflow_event::table
+        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(workflow.get()))
+        .order(durable_workflows::schema::durable_workflow_event::sequence.asc())
+        .select(durable_workflows::schema::durable_workflow_event::event_type)
+        .load::<String>(&mut connection)
+        .await
+        .expect("history");
+    drop(connection);
+    assert!(
+        history.iter().any(|event| event == "activity_quarantined"),
+        "history: {history:?}"
+    );
+    let blocked = load(&pool, workflow).await;
+    assert_eq!(blocked.status.as_str(), "blocked");
+    assert_eq!(blocked.error_category.as_deref(), Some("invalid_row"));
+    assert_eq!(blocked.wait_reference_id, Some(bad_activity));
+}
 
 #[tokio::test]
 #[ignore = "confirms G3: a panicking step never counts an activation attempt; after lease recovery it panics again forever"]

@@ -51,6 +51,8 @@ production on MySQL since August 2026.
 - `RuntimeConfig::restart_window` (default 10 minutes; must be non-zero):
   `max_task_restarts` now counts restarts of one task within this window,
   not over the process lifetime.
+- `MAX_RETRY_DELAY_SECS` (`i64::MAX / 2_000` seconds): the largest retry
+  delay `RetryPolicy::fixed` and `RetryPolicy::exponential` accept.
 
 ### Changed
 
@@ -74,6 +76,14 @@ Compared with the production-internal version it was extracted from:
   return every error and must not continue after a failed statement
   (Postgres aborts the transaction); use `connection.transaction(..)` for a
   savepoint.
+- `RetryPolicy::fixed` rejects a `delay_secs`, and
+  `RetryPolicy::exponential` a `max_secs`, above `MAX_RETRY_DELAY_SECS`
+  with `InvalidDefinition`, so a delay with +100% jitter fits the database's
+  millisecond range. `#[derive(DurableActivity)]` rejects the same values at
+  compile time.
+- The trace-checking interface is version 5 (`spec/README.md`, "Changes in
+  v5"): `TW1_Claim` records the rows the claim quarantined, and `TW1_Error`
+  is gone.
 
 ### Removed
 
@@ -99,10 +109,22 @@ Compared with the production-internal version it was extracted from:
 - N4: a stale coordinator committing `RunActivity` or `WaitForApproval` for
   a workflow another runtime already recovered and advanced now gets
   `FencedWrite` instead of a duplicate-key database error.
+- G10: one activity row the claim cannot run no longer makes
+  `claim_batch`/`claim_one` fail on every topic and end the dispatcher. A
+  row without a local definition is skipped; a pending row past its attempt
+  cap or with invalid timeout/lease bounds is quarantined in the same
+  transaction: dead-lettered with `last_error_category = "invalid_row"`,
+  history `activity_quarantined`, and its workflow blocked. An operator
+  `retry_activity` replaces it with a row built from the registered
+  definition.
+- Retry jitter no longer wraps: a jittered delay above `u64::MAX` seconds
+  (reachable through a stored or `from_validated` policy) saturates at
+  `u64::MAX` instead of wrapping to a short delay, so delays stay within the
+  jitter bounds and never shrink as attempts grow.
 
 ### Known issues
 
-The confirmed protocol gaps G2, G6, G8, G10, G11, N1 and N2 have
+The confirmed protocol gaps G2, G6, G8, G11, N1 and N2 have
 ignored reproduction tests in `durable-workflows/tests/gaps.rs` and reproduce
 on both backends. See the "Known issues" section of the README and
 `docs/INVARIANTS.md` §6.

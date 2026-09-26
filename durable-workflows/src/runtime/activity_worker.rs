@@ -31,6 +31,8 @@ macro_rules! fenced_activity {
 }
 
 const CLAIM_CANDIDATE_SCAN_LIMIT: i64 = 32;
+/// `last_error_category` of a row the claim quarantined (G10).
+const INVALID_ROW_CATEGORY: &str = "invalid_row";
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerConfig {
@@ -184,107 +186,108 @@ where
         let worker_id = self.worker_id.clone();
         let mut connection = self.pool.get().await?;
         self.topics.seed_locks(&mut connection).await?;
-        let (result, rolled_back) = crate::trace::capture_rollback(crate::dialect::transaction(
-            &mut connection,
-            async move |connection| {
-                crate::trace::actor(&worker_id);
-                let topics = std::slice::from_ref(&topic);
-                let lease_sample_started = tokio::time::Instant::now();
-                let now = persistence::database_now_millis(connection).await?;
-                let max_concurrency = durable_topic_lock::table
-                    .find(&topic)
-                    .for_update()
-                    .select(durable_topic_lock::max_concurrency)
-                    .first::<i32>(connection)
-                    .await?;
-                let max_concurrency = i64::from(max_concurrency);
+        crate::dialect::transaction(&mut connection, async move |connection| {
+            crate::trace::actor(&worker_id);
+            let topics = std::slice::from_ref(&topic);
+            let lease_sample_started = tokio::time::Instant::now();
+            let now = persistence::database_now_millis(connection).await?;
+            let max_concurrency = durable_topic_lock::table
+                .find(&topic)
+                .for_update()
+                .select(durable_topic_lock::max_concurrency)
+                .first::<i32>(connection)
+                .await?;
+            let max_concurrency = i64::from(max_concurrency);
 
-                let reconciled = reconcile_expired(connection, &topic, now).await?;
+            let reconciled = reconcile_expired(connection, &topic, now).await?;
 
-                let in_flight = durable_activity::table
-                    .filter(durable_activity::topic.eq(&topic))
-                    .filter(durable_activity::status.eq(ActivityStatus::Running))
-                    .filter(durable_activity::lease_expires_at.gt(now))
-                    .count()
-                    .get_result::<i64>(connection)
-                    .await?;
-                crate::trace::note("in_flight_seen", || topic_value(&topic, in_flight.into()));
-                crate::trace::note("local_avail", || topic_value(&topic, 1.into()));
-                if in_flight >= max_concurrency {
-                    declare_activity_claims(topics, &reconciled, &[]);
-                    return Ok(None);
-                }
+            let in_flight = durable_activity::table
+                .filter(durable_activity::topic.eq(&topic))
+                .filter(durable_activity::status.eq(ActivityStatus::Running))
+                .filter(durable_activity::lease_expires_at.gt(now))
+                .count()
+                .get_result::<i64>(connection)
+                .await?;
+            crate::trace::note("in_flight_seen", || topic_value(&topic, in_flight.into()));
+            crate::trace::note("local_avail", || topic_value(&topic, 1.into()));
+            if in_flight >= max_concurrency {
+                declare_activity_claims(topics, &reconciled, &[], &[]);
+                return Ok(None);
+            }
 
-                let mut pending = durable_activity::table
-                    .inner_join(
-                        durable_workflow::table
-                            .on(durable_workflow::id.eq(durable_activity::workflow_id)),
-                    )
-                    .into_boxed::<crate::Db>();
-                let mut definitions = local_definitions.into_iter();
-                let Some((kind, version)) = definitions.next() else {
-                    declare_activity_claims(topics, &reconciled, &[]);
-                    return Ok(None);
-                };
-                pending = pending.filter(
+            let mut pending = durable_activity::table
+                .inner_join(
+                    durable_workflow::table
+                        .on(durable_workflow::id.eq(durable_activity::workflow_id)),
+                )
+                .into_boxed::<crate::Db>();
+            let mut definitions = local_definitions.into_iter();
+            let Some((kind, version)) = definitions.next() else {
+                declare_activity_claims(topics, &reconciled, &[], &[]);
+                return Ok(None);
+            };
+            pending = pending.filter(
+                durable_activity::kind
+                    .eq(kind)
+                    .and(durable_activity::version.eq(version)),
+            );
+            for (kind, version) in definitions {
+                pending = pending.or_filter(
                     durable_activity::kind
                         .eq(kind)
                         .and(durable_activity::version.eq(version)),
                 );
-                for (kind, version) in definitions {
-                    pending = pending.or_filter(
-                        durable_activity::kind
-                            .eq(kind)
-                            .and(durable_activity::version.eq(version)),
+            }
+            // A stable workflow tie-break lets finite scans finish; FIFO among pages can
+            // repeatedly expire every cursor when the continuation backlog is large.
+            let candidates = pending
+                .filter(durable_activity::topic.eq(&topic))
+                .filter(durable_activity::status.eq(ActivityStatus::Pending))
+                .filter(durable_activity::available_at.le(now))
+                .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
+                .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+                .order((
+                    durable_activity::available_at.asc(),
+                    diesel::dsl::case_when(
+                        durable_activity::available_at
+                            .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
+                        durable_activity::workflow_id,
+                    )
+                    .otherwise(durable_activity::id)
+                    .asc(),
+                    durable_activity::id.asc(),
+                ))
+                .select((durable_activity::id, durable_activity::workflow_id))
+                .limit(CLAIM_CANDIDATE_SCAN_LIMIT)
+                .load::<(i64, i64)>(connection)
+                .await?;
+            let mut quarantined = Vec::new();
+            for (candidate_id, workflow_id) in candidates {
+                if let Some(claim) = self
+                    .claim_locked_candidate(
+                        connection,
+                        candidate_id,
+                        workflow_id,
+                        now,
+                        lease_sample_started,
+                        &worker_id,
+                        &mut quarantined,
+                    )
+                    .await?
+                {
+                    declare_activity_claims(
+                        topics,
+                        &reconciled,
+                        &quarantined,
+                        std::slice::from_ref(&claim),
                     );
+                    return Ok(Some(claim));
                 }
-                // A stable workflow tie-break lets finite scans finish; FIFO among pages can
-                // repeatedly expire every cursor when the continuation backlog is large.
-                let candidates = pending
-                    .filter(durable_activity::topic.eq(&topic))
-                    .filter(durable_activity::status.eq(ActivityStatus::Pending))
-                    .filter(durable_activity::available_at.le(now))
-                    .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-                    .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
-                    .order((
-                        durable_activity::available_at.asc(),
-                        diesel::dsl::case_when(
-                            durable_activity::available_at
-                                .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
-                            durable_activity::workflow_id,
-                        )
-                        .otherwise(durable_activity::id)
-                        .asc(),
-                        durable_activity::id.asc(),
-                    ))
-                    .select((durable_activity::id, durable_activity::workflow_id))
-                    .limit(CLAIM_CANDIDATE_SCAN_LIMIT)
-                    .load::<(i64, i64)>(connection)
-                    .await?;
-                for (candidate_id, workflow_id) in candidates {
-                    if let Some(claim) = self
-                        .claim_locked_candidate(
-                            connection,
-                            candidate_id,
-                            workflow_id,
-                            now,
-                            lease_sample_started,
-                            &worker_id,
-                        )
-                        .await?
-                    {
-                        declare_activity_claims(topics, &reconciled, std::slice::from_ref(&claim));
-                        return Ok(Some(claim));
-                    }
-                }
-                declare_activity_claims(topics, &reconciled, &[]);
-                Ok(None)
-            },
-        ))
-        .await;
-        drop(connection);
-        self.record_claim_error(rolled_back).await;
-        result
+            }
+            declare_activity_claims(topics, &reconciled, &quarantined, &[]);
+            Ok(None)
+        })
+        .await
     }
 
     /// Claims a bounded cross-topic batch under one short global dispatch
@@ -307,151 +310,143 @@ where
         let worker_id = self.worker_id.clone();
         let mut connection = self.pool.get().await?;
         self.topics.seed_locks(&mut connection).await?;
-        let (result, rolled_back) = crate::trace::capture_rollback(crate::dialect::transaction(
-            &mut connection,
-            async move |connection| {
-                let locked_topics = durable_topic_lock::table
-                    .filter(durable_topic_lock::topic.eq_any(&registered_topics))
-                    .order(durable_topic_lock::topic.asc())
-                    .for_update()
-                    .skip_locked()
-                    .select((
-                        durable_topic_lock::topic,
-                        durable_topic_lock::max_concurrency,
-                    ))
-                    .load::<(String, i32)>(connection)
-                    .await?;
-                if locked_topics.len() != registered_topics.len() {
-                    return Ok(Vec::<ActivityClaim>::new());
-                }
-                crate::trace::actor(&worker_id);
+        crate::dialect::transaction(&mut connection, async move |connection| {
+            let locked_topics = durable_topic_lock::table
+                .filter(durable_topic_lock::topic.eq_any(&registered_topics))
+                .order(durable_topic_lock::topic.asc())
+                .for_update()
+                .skip_locked()
+                .select((
+                    durable_topic_lock::topic,
+                    durable_topic_lock::max_concurrency,
+                ))
+                .load::<(String, i32)>(connection)
+                .await?;
+            if locked_topics.len() != registered_topics.len() {
+                return Ok(Vec::<ActivityClaim>::new());
+            }
+            crate::trace::actor(&worker_id);
 
-                let lease_sample_started = tokio::time::Instant::now();
-                let now = persistence::database_now_millis(connection).await?;
-                let mut claims: Vec<ActivityClaim> = Vec::with_capacity(limit);
-                let mut reconciled = Vec::new();
-                for (topic, persisted_limit) in locked_topics {
-                    reconciled.extend(reconcile_expired(connection, &topic, now).await?);
-                    let in_flight = durable_activity::table
-                        .filter(durable_activity::topic.eq(&topic))
-                        .filter(durable_activity::status.eq(ActivityStatus::Running))
-                        .filter(durable_activity::lease_expires_at.gt(now))
-                        .count()
-                        .get_result::<i64>(connection)
-                        .await?;
-                    let global_available =
-                        i64::from(persisted_limit).saturating_sub(in_flight).max(0) as usize;
-                    let wanted = global_available
-                        .min(
-                            local_topic_capacity
-                                .get(&topic)
-                                .copied()
-                                .unwrap_or_default(),
-                        )
-                        .min(limit.saturating_sub(claims.len()));
-                    crate::trace::note("in_flight_seen", || topic_value(&topic, in_flight.into()));
-                    crate::trace::note("wanted", || topic_value(&topic, wanted.into()));
-                    crate::trace::note("local_avail", || {
-                        let local = local_topic_capacity
+            let lease_sample_started = tokio::time::Instant::now();
+            let now = persistence::database_now_millis(connection).await?;
+            let mut claims: Vec<ActivityClaim> = Vec::with_capacity(limit);
+            let mut reconciled = Vec::new();
+            let mut quarantined = Vec::new();
+            for (topic, persisted_limit) in locked_topics {
+                reconciled.extend(reconcile_expired(connection, &topic, now).await?);
+                let in_flight = durable_activity::table
+                    .filter(durable_activity::topic.eq(&topic))
+                    .filter(durable_activity::status.eq(ActivityStatus::Running))
+                    .filter(durable_activity::lease_expires_at.gt(now))
+                    .count()
+                    .get_result::<i64>(connection)
+                    .await?;
+                let global_available =
+                    i64::from(persisted_limit).saturating_sub(in_flight).max(0) as usize;
+                let wanted = global_available
+                    .min(
+                        local_topic_capacity
                             .get(&topic)
                             .copied()
-                            .unwrap_or_default()
-                            .min(limit.saturating_sub(claims.len()));
-                        topic_value(&topic, local.into())
-                    });
-                    if wanted == 0 {
-                        continue;
-                    }
+                            .unwrap_or_default(),
+                    )
+                    .min(limit.saturating_sub(claims.len()));
+                crate::trace::note("in_flight_seen", || topic_value(&topic, in_flight.into()));
+                crate::trace::note("wanted", || topic_value(&topic, wanted.into()));
+                crate::trace::note("local_avail", || {
+                    let local = local_topic_capacity
+                        .get(&topic)
+                        .copied()
+                        .unwrap_or_default()
+                        .min(limit.saturating_sub(claims.len()));
+                    topic_value(&topic, local.into())
+                });
+                if wanted == 0 {
+                    continue;
+                }
 
-                    let mut pending = durable_activity::table
-                        .inner_join(
-                            durable_workflow::table
-                                .on(durable_workflow::id.eq(durable_activity::workflow_id)),
-                        )
-                        .into_boxed::<crate::Db>();
-                    let mut definitions = local_definitions.iter();
-                    let Some((kind, version)) = definitions.next() else {
-                        declare_activity_claims(&registered_topics, &reconciled, &claims);
-                        return Ok(claims);
-                    };
-                    pending = pending.filter(
+                let mut pending = durable_activity::table
+                    .inner_join(
+                        durable_workflow::table
+                            .on(durable_workflow::id.eq(durable_activity::workflow_id)),
+                    )
+                    .into_boxed::<crate::Db>();
+                let mut definitions = local_definitions.iter();
+                let Some((kind, version)) = definitions.next() else {
+                    declare_activity_claims(&registered_topics, &reconciled, &quarantined, &claims);
+                    return Ok(claims);
+                };
+                pending = pending.filter(
+                    durable_activity::kind
+                        .eq(kind)
+                        .and(durable_activity::version.eq(version)),
+                );
+                for (kind, version) in definitions {
+                    pending = pending.or_filter(
                         durable_activity::kind
                             .eq(kind)
                             .and(durable_activity::version.eq(version)),
                     );
-                    for (kind, version) in definitions {
-                        pending = pending.or_filter(
-                            durable_activity::kind
-                                .eq(kind)
-                                .and(durable_activity::version.eq(version)),
-                        );
-                    }
-                    let candidates = pending
-                        .filter(durable_activity::topic.eq(&topic))
-                        .filter(durable_activity::status.eq(ActivityStatus::Pending))
-                        .filter(durable_activity::available_at.le(now))
-                        .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-                        .filter(
-                            durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()),
+                }
+                let candidates = pending
+                    .filter(durable_activity::topic.eq(&topic))
+                    .filter(durable_activity::status.eq(ActivityStatus::Pending))
+                    .filter(durable_activity::available_at.le(now))
+                    .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
+                    .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+                    .order((
+                        durable_activity::available_at.asc(),
+                        diesel::dsl::case_when(
+                            durable_activity::available_at
+                                .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
+                            durable_activity::workflow_id,
                         )
-                        .order((
-                            durable_activity::available_at.asc(),
-                            diesel::dsl::case_when(
-                                durable_activity::available_at
-                                    .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
-                                durable_activity::workflow_id,
-                            )
-                            .otherwise(durable_activity::id)
-                            .asc(),
-                            durable_activity::id.asc(),
-                        ))
-                        .select((durable_activity::id, durable_activity::workflow_id))
-                        .limit(CLAIM_CANDIDATE_SCAN_LIMIT)
-                        .load::<(i64, i64)>(connection)
-                        .await?;
-                    for (candidate_id, workflow_id) in candidates {
-                        if claims.len() >= limit
-                            || claims
-                                .iter()
-                                .filter(|claim| claim.row.topic == topic)
-                                .count()
-                                >= wanted
-                        {
-                            break;
-                        }
-                        if let Some(claim) = self
-                            .claim_locked_candidate(
-                                connection,
-                                candidate_id,
-                                workflow_id,
-                                now,
-                                lease_sample_started,
-                                &worker_id,
-                            )
-                            .await?
-                        {
-                            claims.push(claim);
-                        }
+                        .otherwise(durable_activity::id)
+                        .asc(),
+                        durable_activity::id.asc(),
+                    ))
+                    .select((durable_activity::id, durable_activity::workflow_id))
+                    .limit(CLAIM_CANDIDATE_SCAN_LIMIT)
+                    .load::<(i64, i64)>(connection)
+                    .await?;
+                for (candidate_id, workflow_id) in candidates {
+                    if claims.len() >= limit
+                        || claims
+                            .iter()
+                            .filter(|claim| claim.row.topic == topic)
+                            .count()
+                            >= wanted
+                    {
+                        break;
+                    }
+                    if let Some(claim) = self
+                        .claim_locked_candidate(
+                            connection,
+                            candidate_id,
+                            workflow_id,
+                            now,
+                            lease_sample_started,
+                            &worker_id,
+                            &mut quarantined,
+                        )
+                        .await?
+                    {
+                        claims.push(claim);
                     }
                 }
-                declare_activity_claims(&registered_topics, &reconciled, &claims);
-                Ok(claims)
-            },
-        ))
-        .await;
-        drop(connection);
-        self.record_claim_error(rolled_back).await;
-        result
+            }
+            declare_activity_claims(&registered_topics, &reconciled, &quarantined, &claims);
+            Ok(claims)
+        })
+        .await
     }
 
-    /// Records a T-W1 that `claim_locked_candidate` aborted (`TW1_Error`, G10)
-    /// once the transaction has rolled back and its connection is released.
-    async fn record_claim_error(&self, rolled_back: Option<crate::trace::Action>) {
-        if let Some(action) = rolled_back {
-            crate::trace::record_local(&self.pool, &self.worker_id, action).await;
-        }
-    }
-
+    /// Locks and claims one candidate. A row this runtime cannot run returns
+    /// `Ok(None)` so the rest of the T-W1 goes on (G10): a missing definition
+    /// is skipped; a row past its attempt cap or with invalid timeout/lease
+    /// bounds is quarantined (dead-lettered, its workflow blocked) and pushed
+    /// to `quarantined` for the trace.
+    #[allow(clippy::too_many_arguments)]
     async fn claim_locked_candidate(
         &self,
         connection: &mut crate::DurableConnection,
@@ -460,6 +455,7 @@ where
         now: i64,
         lease_sample_started: tokio::time::Instant,
         worker_id: &str,
+        quarantined: &mut Vec<serde_json::Value>,
     ) -> Result<Option<ActivityClaim>, DurableError> {
         let locked_workflow = durable_workflow::table
             .find(workflow_id)
@@ -489,30 +485,40 @@ where
             return Ok(None);
         };
         if !self.activities.contains(&row.kind, row.version) {
-            declare_claim_error("missing_definition", row.id);
-            return Err(DurableError::MissingDefinition {
-                kind: row.kind,
-                version: row.version,
-            });
+            tracing::debug!(
+                activity_id = row.id,
+                kind = %row.kind,
+                version = row.version,
+                "skipping a pending activity without a local definition"
+            );
+            return Ok(None);
+        }
+        if row.attempt_count >= row.max_attempts {
+            let message = format!("pending activity {} has exhausted its attempt cap", row.id);
+            quarantine_candidate(connection, &row, "attempt_cap", &message, now).await?;
+            if crate::trace::ENABLED {
+                quarantined.push(serde_json::json!({
+                    "activity_id": row.id,
+                    "reason": "attempt_cap",
+                }));
+            }
+            return Ok(None);
+        }
+        if row.timeout_millis <= 0 || row.lease_duration_millis <= row.timeout_millis {
+            let message = format!("activity {} has invalid timeout or lease bounds", row.id);
+            quarantine_candidate(connection, &row, "invalid_bounds", &message, now).await?;
+            if crate::trace::ENABLED {
+                quarantined.push(serde_json::json!({
+                    "activity_id": row.id,
+                    "reason": "invalid_bounds",
+                }));
+            }
+            return Ok(None);
         }
         let attempt_number = row
             .attempt_count
             .checked_add(1)
             .ok_or_else(|| DurableError::InvalidState("activity attempt overflow".to_string()))?;
-        if attempt_number > row.max_attempts {
-            declare_claim_error("attempt_cap", row.id);
-            return Err(DurableError::InvalidState(format!(
-                "pending activity {} has exhausted its attempt cap",
-                row.id
-            )));
-        }
-        if row.timeout_millis <= 0 || row.lease_duration_millis <= row.timeout_millis {
-            declare_claim_error("invalid_bounds", row.id);
-            return Err(DurableError::InvalidState(format!(
-                "activity {} has invalid timeout or lease bounds",
-                row.id
-            )));
-        }
         let lease_token = uuid::Uuid::new_v4().to_string();
         let lease_expires_at = now.checked_add(row.lease_duration_millis).ok_or_else(|| {
             DurableError::InvalidState("activity lease timestamp overflow".to_string())
@@ -1137,6 +1143,53 @@ async fn reconcile_expired(
     Ok(reconciled)
 }
 
+/// Dead-letters a pending row the claim cannot run (G10) and blocks its
+/// workflow, which the caller already holds `FOR UPDATE`. An operator
+/// `retry_activity` replaces the row from the registered definition.
+async fn quarantine_candidate(
+    connection: &mut crate::DurableConnection,
+    row: &ActivityRow,
+    reason: &str,
+    message: &str,
+    now: i64,
+) -> Result<(), DurableError> {
+    tracing::warn!(
+        activity_id = row.id,
+        workflow_id = row.workflow_id,
+        reason,
+        "quarantining an activity row the claim cannot run"
+    );
+    let message = format!("{reason}: {message}");
+    let changed = diesel::update(
+        durable_activity::table
+            .find(row.id)
+            .filter(durable_activity::status.eq(ActivityStatus::Pending))
+            .filter(durable_activity::attempt_count.eq(row.attempt_count)),
+    )
+    .set((
+        durable_activity::status.eq(ActivityStatus::DeadLettered),
+        durable_activity::last_error_category.eq(Some(INVALID_ROW_CATEGORY.to_string())),
+        durable_activity::last_error_message.eq(Some(message.clone())),
+        durable_activity::updated_at.eq(now),
+        durable_activity::completed_at.eq(Some(now)),
+    ))
+    .execute(connection)
+    .await?;
+    ensure_fenced(changed)?;
+    append_activity_history(
+        connection,
+        row,
+        "activity_quarantined",
+        Some(message.clone()),
+        now,
+    )
+    .await?;
+    block_workflow(connection, row, INVALID_ROW_CATEGORY, &message, now).await?;
+    crate::trace::touch_act(row.id);
+    crate::trace::touch_wf(row.workflow_id);
+    Ok(())
+}
+
 async fn append_activity_history(
     connection: &mut crate::DurableConnection,
     row: &ActivityRow,
@@ -1450,13 +1503,15 @@ fn topic_value(topic: &str, value: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::from_iter([(topic.to_string(), value)]))
 }
 
-/// Declares `TW1_Claim` when the transaction reconciled or claimed a row.
+/// Declares `TW1_Claim` when the transaction reconciled, quarantined or
+/// claimed a row.
 fn declare_activity_claims(
     topics: &[String],
     reconciled: &[serde_json::Value],
+    quarantined: &[serde_json::Value],
     claims: &[ActivityClaim],
 ) {
-    if claims.is_empty() && reconciled.is_empty() {
+    if claims.is_empty() && reconciled.is_empty() && quarantined.is_empty() {
         return;
     }
     crate::trace::declare(|| {
@@ -1465,6 +1520,7 @@ fn declare_activity_claims(
             serde_json::json!({
                 "topics": topics,
                 "reconciled": reconciled,
+                "quarantined": quarantined,
                 "claimed": claims
                     .iter()
                     .map(|claim| serde_json::json!({
@@ -1476,16 +1532,6 @@ fn declare_activity_claims(
                     }))
                     .collect::<Vec<_>>(),
             }),
-        )
-    });
-}
-
-/// `TW1_Error`: `claim_locked_candidate` aborts the whole T-W1 (G10).
-fn declare_claim_error(reason: &'static str, activity_id: i64) {
-    crate::trace::declare_rollback(|| {
-        crate::trace::Action::new(
-            "TW1_Error",
-            serde_json::json!({ "reason": reason, "activity_id": activity_id }),
         )
     });
 }

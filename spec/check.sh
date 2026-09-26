@@ -30,7 +30,6 @@ run durable_mc safety hold
 run durable_mc safetyRc hold                      # safety + S17 at claim and between commits (G7 closed)
 run durable_mc inv_S24_exceptTX2 hold
 run durable_mc_act safetyRc hold                  # activity-only instance: more T-W1 interleavings per sample
-run durable_mc inv_G10_noClaimAbort hold          # G10 needs an invalid row: none without external writes
 run durable_mc_env safety hold                    # external writes (invalid bounds) break no other invariant
 # historical REPEATABLE READ T-W1 (pre-P4)
 run durable_mc_rr safety hold
@@ -40,12 +39,12 @@ run durable_mc_act_rr inv_S17_capAtClaim violate  # G7
 # suspected gaps (expected to be violated)
 run durable_mc inv_S24_parentWakes violate        # G2
 run durable_mc inv_G11_cancelReachesChildren violate
-run durable_mc_env inv_G10_noClaimAbort violate   # G10: one invalid row aborts every topic's claims
 run durable_mc inv_N1_tx2OwnLineage violate       # N1
 run durable_mc inv_S13_topicConcurrency violate   # N2
 run durable_mc_act inv_S13_topicConcurrency violate
 run durable_mc inv_S19_sourceTerminal violate     # N3
 run durable_mc_drift inv_S13_oneHandler violate   # S13 clock assumption
+run durable_mc_env wit_quarantined violate        # G10 fixed: an invalid row is quarantined (non-vacuity)
 # witnesses (non-vacuity; expected to be violated)
 for w in wit_S3_concurrentStep wit_blocked wit_childSucceeded wit_activitySucceeded wit_revivedLease \
          wit_coordFenceMiss wit_reconciled wit_tw1Interleaved wit_pausedActivity; do

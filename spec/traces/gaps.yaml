@@ -3,7 +3,6 @@
 # trace-check.sh requires the final state of each matching trace to violate it.
 # Keys are globs over the test name (or its last `::` segment). The first match wins.
 g2_*: inv_S24_parentWakes
-g10_*: inv_G10_noClaimAbort
 g11_*: inv_G11_cancelReachesChildren
 # Both N1 variants: supersession of a blocked sibling, and TX2_ReturnLatest of an unrelated one.
 n1_*: inv_N1_tx2OwnLineage

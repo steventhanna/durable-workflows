@@ -225,8 +225,6 @@ are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
   a child of a different definition version; the parent then fails on replay.
 - **G8** — `child_with_key` can resolve to the calling workflow (or an
   ancestor), which then waits on itself forever.
-- **G10** — One invalid activity row (for example a lease no longer than its
-  timeout) makes the activity claim fail on every topic, not only its own.
 - **G11** — Cancelling a parent workflow does not cancel its children; they
   keep running.
 - **N1** — A recoverable start on a child key can cancel and restart a

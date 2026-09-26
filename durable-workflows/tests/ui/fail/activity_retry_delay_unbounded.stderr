@@ -1,0 +1,5 @@
+error: fixed backoff delay_secs cannot exceed 4611686018427387 seconds
+  --> tests/ui/fail/activity_retry_delay_unbounded.rs:14:15
+   |
+14 |     backoff = fixed(delay_secs = 18446744073709551615),
+   |               ^^^^^

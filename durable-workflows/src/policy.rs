@@ -14,6 +14,11 @@ pub fn deterministic_jitter_percentile(seed: impl AsRef<[u8]>) -> u8 {
     value as u8
 }
 
+/// The largest delay, in seconds, that [`RetryPolicy::fixed`] and
+/// [`RetryPolicy::exponential`] accept. A delay at this bound with +100%
+/// jitter still fits the database's millisecond range (`i64`).
+pub const MAX_RETRY_DELAY_SECS: u64 = (i64::MAX / 2_000) as u64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackoffPolicy {
     Fixed {
@@ -43,6 +48,11 @@ impl RetryPolicy {
                 "fixed retry delay must be greater than zero".to_string(),
             ));
         }
+        if delay_secs > MAX_RETRY_DELAY_SECS {
+            return Err(DurableError::InvalidDefinition(format!(
+                "fixed retry delay cannot exceed {MAX_RETRY_DELAY_SECS} seconds"
+            )));
+        }
         Ok(Self {
             backoff: BackoffPolicy::Fixed { delay_secs },
         })
@@ -62,6 +72,11 @@ impl RetryPolicy {
             return Err(DurableError::InvalidDefinition(
                 "exponential max delay must be at least the initial delay".to_string(),
             ));
+        }
+        if max_secs > MAX_RETRY_DELAY_SECS {
+            return Err(DurableError::InvalidDefinition(format!(
+                "exponential max delay cannot exceed {MAX_RETRY_DELAY_SECS} seconds"
+            )));
         }
         if jitter_percent > 100 {
             return Err(DurableError::InvalidDefinition(
@@ -119,7 +134,7 @@ fn apply_jitter(base: u64, jitter_percent: u8, percentile: u8) -> u64 {
     let spread = (u128::from(base) * u128::from(jitter_percent) / 100) as i128;
     let centered_percentile = i128::from(percentile) * 2 - 100;
     let delta = spread * centered_percentile / 100;
-    (i128::from(base) + delta).max(0) as u64
+    (i128::from(base) + delta).clamp(0, i128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

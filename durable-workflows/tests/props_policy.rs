@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use durable_workflows::{
-    deterministic_jitter_percentile, BackoffPolicy, DurableError, RetryPolicy,
+    deterministic_jitter_percentile, BackoffPolicy, DurableError, RetryPolicy, MAX_RETRY_DELAY_SECS,
 };
 use proptest::prelude::*;
 
@@ -31,12 +31,13 @@ fn expected_base(initial: u64, max: u64, attempt: u32) -> u64 {
 }
 
 fn valid_exponential() -> impl Strategy<Value = (u64, u64, u8)> {
-    // Mix uniform u64 with powers of two so doubling boundaries near u64::MAX
-    // are reachable.
+    // Mix uniform seconds with powers of two and the bound itself so doubling
+    // boundaries up to MAX_RETRY_DELAY_SECS are reachable.
     let seconds = || {
         prop_oneof![
-            1_u64..=u64::MAX,
-            (0_u32..64).prop_map(|shift| 1_u64 << shift)
+            1_u64..=MAX_RETRY_DELAY_SECS,
+            (0_u32..=52).prop_map(|shift| 1_u64 << shift),
+            Just(MAX_RETRY_DELAY_SECS),
         ]
     };
     (seconds(), seconds(), 0_u8..=100).prop_map(|(a, b, jitter)| (a.min(b), a.max(b), jitter))
@@ -59,7 +60,7 @@ proptest! {
     #[test]
     fn fixed_constructor_accepts_iff_positive(delay in any::<u64>()) {
         let result = RetryPolicy::fixed(delay);
-        prop_assert_eq!(result.is_ok(), delay > 0);
+        prop_assert_eq!(result.is_ok(), delay > 0 && delay <= MAX_RETRY_DELAY_SECS);
         if let Ok(policy) = result {
             prop_assert_eq!(policy.backoff(), BackoffPolicy::Fixed { delay_secs: delay });
         } else {
@@ -74,7 +75,7 @@ proptest! {
         jitter in any::<u8>(),
     ) {
         let result = RetryPolicy::exponential(initial, max, jitter);
-        let valid = initial > 0 && max >= initial && jitter <= 100;
+        let valid = initial > 0 && max >= initial && max <= MAX_RETRY_DELAY_SECS && jitter <= 100;
         prop_assert_eq!(result.is_ok(), valid);
         if let Ok(policy) = result {
             prop_assert_eq!(
@@ -88,7 +89,7 @@ proptest! {
 
     #[test]
     fn fixed_delay_ignores_attempt_and_jitter(
-        delay in 1_u64..=u64::MAX,
+        delay in 1_u64..=MAX_RETRY_DELAY_SECS,
         attempt in attempts(),
         percentile in 0_u8..=100,
     ) {
@@ -139,9 +140,8 @@ proptest! {
         }
     }
 
-    /// Same bounds, for every valid policy including seconds near u64::MAX.
+    /// Same bounds, for every valid policy up to MAX_RETRY_DELAY_SECS.
     #[test]
-    #[ignore = "finding: apply_jitter wraps i128->u64 when base*(1+jitter%) exceeds u64::MAX (src/policy.rs:122)"]
     fn any_exponential_delay_within_jitter_bounds(
         (initial, max, jitter) in valid_exponential(),
         attempt in attempts(),
@@ -174,7 +174,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "finding: apply_jitter wraps i128->u64 near u64::MAX, so a later attempt can be shorter (src/policy.rs:122)"]
     fn any_exponential_is_monotone_in_attempt(
         (initial, max, jitter) in valid_exponential(),
         attempt in attempts(),
@@ -221,14 +220,23 @@ proptest! {
     }
 }
 
-/// Minimal counterexample for the wrap-around finding, kept as a plain test.
+/// Minimal counterexample for the former wrap-around finding: 2^63 s at +100%
+/// jitter returned 0 s. The constructors now reject it; a policy that skips
+/// them (a stored `retry_policy_json` or `from_validated`) saturates instead.
 #[test]
-#[ignore = "finding: apply_jitter wraps i128->u64 (src/policy.rs:122); 2^63 s at +100% jitter returns 0 s"]
 fn jitter_overflow_minimal_counterexample() {
     let base = 1_u64 << 63;
-    let policy = RetryPolicy::exponential(base, base, 100).unwrap();
+    assert!(matches!(
+        RetryPolicy::exponential(base, base, 100),
+        Err(DurableError::InvalidDefinition(_))
+    ));
+    let policy = RetryPolicy::from_validated(BackoffPolicy::Exponential {
+        initial_secs: base,
+        max_secs: base,
+        jitter_percent: 100,
+    });
     let delay = policy.delay_for_attempt(1, 100).unwrap();
-    assert!(delay.as_secs() >= base, "got {delay:?}");
+    assert_eq!(delay.as_secs(), u64::MAX, "got {delay:?}");
 }
 
 #[test]

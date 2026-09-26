@@ -939,6 +939,80 @@ async fn retry_creates_immutable_lineage_and_correction_changes_version_and_oper
     );
 }
 
+/// G10 (fixed): a pending row with invalid timeout/lease bounds is quarantined
+/// by the claim (dead-lettered, its workflow blocked), and `retry_activity`
+/// recovers the workflow with a replacement built from the registered
+/// definition, which the next claim takes.
+#[tokio::test]
+async fn retry_recovers_a_workflow_blocked_by_a_quarantined_activity() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let workflow_id = start_workflow(&pool).await;
+    let activity_id = insert_activity(&pool, workflow_id, "pending").await;
+    set_waiting_activity(&pool, workflow_id, activity_id, "waiting_activity").await;
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set(durable_activity::lease_duration_millis.eq(durable_activity::timeout_millis))
+        .execute(&mut connection)
+        .await
+        .expect("corrupt the activity bounds");
+    drop(connection);
+    let (workflows, activities, topics) = registries();
+    let activities = Arc::new(activities);
+    let worker = ActivityWorker::new(
+        pool.clone(),
+        Arc::new(()),
+        activities.clone(),
+        Arc::new(topics),
+        "worker-1",
+        WorkerConfig::default(),
+    )
+    .expect("worker");
+    assert!(worker
+        .claim_one("control_external")
+        .await
+        .expect("the claim quarantines instead of failing")
+        .is_none());
+
+    let mut connection = pool.get().await.expect("connection");
+    let quarantined = durable_activity::table
+        .find(activity_id)
+        .select(ActivityRow::as_select())
+        .first::<ActivityRow>(&mut connection)
+        .await
+        .expect("activity");
+    let workflow = durable_workflow::table
+        .find(workflow_id.get())
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(&mut connection)
+        .await
+        .expect("workflow");
+    drop(connection);
+    assert_eq!(quarantined.status.as_str(), "dead_lettered");
+    assert_eq!(
+        quarantined.last_error_category.as_deref(),
+        Some("invalid_row")
+    );
+    assert_eq!(workflow.status.as_str(), "blocked");
+    assert_eq!(workflow.wait_reference_id, Some(activity_id));
+
+    let service = AdminControlService::new(pool.clone(), Arc::new(workflows), activities);
+    let retried = service
+        .retry_activity(
+            durable_workflows::ActivityId::new(activity_id).expect("activity ID"),
+            &operator("replace the quarantined row"),
+        )
+        .await
+        .expect("retry");
+    let claim = worker
+        .claim_one("control_external")
+        .await
+        .expect("claim")
+        .expect("the replacement is claimable");
+    assert_eq!(claim.activity_id().expect("id"), retried.activity_id);
+}
+
 #[tokio::test]
 async fn recoverable_start_fences_dead_letter_retry_and_races_to_one_live_generation() {
     let Some(pool) = support::fresh_pool().await else {

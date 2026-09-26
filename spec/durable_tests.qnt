@@ -43,7 +43,7 @@ module durable_tests {
       .then(all { keepPrev, TW1_Commit(r) })
   // replay form: one committed T-W1 that saw inFlight live leases and claimed a
   action tw1Replay(r: int, a: int, inFlight: int): bool =
-    all { keepPrev, TW1_Claim(r, now, Map("t" -> 1), [], Map("t" -> inFlight), [{ a: a, tok: db.nextToken, leaseExp: now + LEASE_A }]) }
+    all { keepPrev, TW1_Claim(r, now, Map("t" -> 1), [], Map("t" -> inFlight), [], [{ a: a, tok: db.nextToken, leaseExp: now + LEASE_A }]) }
 
   // r1 claims a1 (token 3) at t=0, sends heartbeat 1 at t=1, gives up locally at t=3;
   // r2 starts T-W1 at t=3 and its reconcile scan sees a1 expired (3 <= 3)
@@ -104,11 +104,11 @@ module durable_tests {
     init.then(startAndRunActivity(1)).then(tw1Replay(1, 1, 0)).then(tick).then(tick).then(tick)   // a1 lease 3, t=3
   run reconcileReplayDelayTest =
     expiredA1
-      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 5 }], Map("t" -> 0), []) })
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 5 }], Map("t" -> 0), [], []) })
       .expect(db.act.get(1).status == "pending" and db.act.get(1).availableAt == 5 and safety)
   run reconcileReplayEarlyRejectedTest =
     expiredA1
-      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 2 }], Map("t" -> 0), []) })
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 2 }], Map("t" -> 0), [], []) })
       .fail()
 
   // N2: cancel frees the topic slot while the cancelled handler still executes
@@ -435,14 +435,15 @@ module durable_tests_drift {
       .then(all { keepPrev, TX1_Start(1, "P", NO_KEY, 0, true, 0) })
       .then(all { keepPrev, TC1_Claim(1, 0, 1, 1, 3, 0) })
       .then(all { keepPrev, TC2_RunActivity(1, 1, 1, 1, "t", MAX_ATTEMPTS, false, false, 0, 0) })
-      .then(all { keepPrev, TW1_Claim(1, 0, Map("t" -> 1), [], Map("t" -> 0), [{ a: 1, tok: 2, leaseExp: 3 }]) })
+      .then(all { keepPrev, TW1_Claim(1, 0, Map("t" -> 1), [], Map("t" -> 0), [], [{ a: 1, tok: 2, leaseExp: 3 }]) })
       .then(tick).then(tick).then(tick)                                // t=3: DB lease expired, local deadline 4
-      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 3 }], Map("t" -> 0), [{ a: 1, tok: 3, leaseExp: 6 }]) })
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 3 }], Map("t" -> 0), [], [{ a: 1, tok: 3, leaseExp: 6 }]) })
       .expect(not(inv_S13_oneHandler) and inv_S17_capAtClaim)
 }
 
-// G10: an external write leaves a1 with invalid timeout/lease bounds; one claim_batch over
-// both topics claims a2 on "u", then hits a1 on "t" and rolls back everything
+// G10 (fixed): an external write leaves a1 with invalid timeout/lease bounds; one claim_batch
+// over both topics claims a2 on "u", then quarantines a1 on "t" (dead-lettered, w1 blocked)
+// and commits a2's claim
 module durable_tests_env {
   import durable(
     RUNTIMES = Set(1, 2), MAX_WF = 2, MAX_ACT = 2, TOPICS = Set("t", "u"), TOPIC_CAP = Map("t" -> 1, "u" -> 1),
@@ -460,7 +461,7 @@ module durable_tests_env {
       .then(startAndRunActivity(1, "t"))                               // a1 on t
       .then(startAndRunActivity(1, "u"))                               // a2 on u
       .then(all { keepPrev, EnvCorruptActivityBounds(1) })
-      .expect(db.act.get(1).invalidBounds and inv_G10_noClaimAbort and safety)
+      .expect(db.act.get(1).invalidBounds and safety)
       .then(all { keepPrev, TW1_BeginBatch(2) })
       .then(all { keepPrev, TW1_ReconcileScan(2, "u") })
       .then(all { keepPrev, TW1_Count(2) })
@@ -471,22 +472,40 @@ module durable_tests_env {
 
   run g10InvalidBoundsTest =
     prefix
-      .then(all { keepPrev, TW1_Error(2, 1, "invalid_bounds") })
+      .then(all { keepPrev, TW1_QuarantineRow(2, 1) })
       .expect(and {
-        lastAction == "TW1_Error", not(inv_G10_noClaimAbort), safety, inv_S17_capAtClaim,
-        db.act.get(2).status == "pending", proc.execs == Set(), proc.topicHolder == 0,   // a2's claim rolled back
-        ghost.taskErrors.get(2) == 1,
+        lastAction == "TW1_QuarantineRow", safety, inv_S17_capAtClaim,
+        proc.tw1.get(2).cands == Set(), proc.topicHolder == 2,                    // the T-W1 goes on
+        db.act.get(1).status == "pending", db.wf.get(1).status == "waiting_activity",  // uncommitted
+      })
+      .then(all { keepPrev, TW1_Commit(2) })
+      .expect(and {
+        safety, inv_S17_capAtClaim, ghost.taskErrors.get(2) == 0, proc.topicHolder == 0,
+        db.act.get(1).status == "dead_lettered", db.wf.get(1).status == "blocked",
+        db.act.get(2).status == "running", proc.execs.exists(e => e.rt == 2 and e.act == 2),   // a2's claim committed
       })
 
-  // the invalid row is never claimed, and the attempt-cap reason does not match it
+  // the invalid row is never claimed, and a quarantine must name the row's reason (invalid
+  // bounds, not the attempt cap)
   run g10InvalidRowNotClaimedTest = prefix.then(all { keepPrev, TW1_ClaimRow(2, 1, db.nextToken) }).fail()
-  run g10WrongReasonTest = prefix.then(all { keepPrev, TW1_Error(2, 1, "attempt_cap") }).fail()
-
-  // replay form: no T-W1 in flight, the recorded error names a1
-  run g10ReplayTest =
+  run g10WrongReasonTest =
     init
       .then(startAndRunActivity(1, "t"))
       .then(all { keepPrev, EnvCorruptActivityBounds(1) })
-      .then(all { keepPrev, TW1_Error(2, 1, "invalid_bounds") })
-      .expect(not(inv_G10_noClaimAbort) and safety and db.act.get(1).status == "pending")
+      .then(all { keepPrev, TW1_Claim(2, now, Map("t" -> 1, "u" -> 1), [], Map("t" -> 0, "u" -> 0),
+                                      [{ a: 1, reason: "attempt_cap" }], []) })
+      .fail()
+
+  // replay form: one committed T-W1 quarantines a1 with the recorded reason
+  run g10ReplayTest =
+    init
+      .then(startAndRunActivity(1, "t"))
+      .then(startAndRunActivity(1, "u"))
+      .then(all { keepPrev, EnvCorruptActivityBounds(1) })
+      .then(all { keepPrev, TW1_Claim(2, now, Map("t" -> 1, "u" -> 1), [], Map("t" -> 0, "u" -> 0),
+                                      [{ a: 1, reason: "invalid_bounds" }], [{ a: 2, tok: db.nextToken, leaseExp: now + LEASE_A }]) })
+      .expect(and {
+        safety, inv_S17_capAtClaim,
+        db.act.get(1).status == "dead_lettered", db.wf.get(1).status == "blocked", db.act.get(2).status == "running",
+      })
 }

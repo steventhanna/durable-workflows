@@ -65,7 +65,9 @@ pub use async_trait;
 pub use error::{ActivityError, DurableError, WorkflowError};
 pub use flow::{DurableFlow, FlowJournal, JournalEntry, WfCtx, WfError};
 pub use ids::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
-pub use policy::{deterministic_jitter_percentile, BackoffPolicy, RetryPolicy};
+pub use policy::{
+    deterministic_jitter_percentile, BackoffPolicy, RetryPolicy, MAX_RETRY_DELAY_SECS,
+};
 pub use progress::{
     ProgressEvent, ProgressReportOutcome, ProgressReporter, ProgressSeverity,
     MAX_PROGRESS_DESCRIPTION_BYTES, MAX_PROGRESS_EVENTS_PER_ATTEMPT,

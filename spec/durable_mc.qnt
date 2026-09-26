@@ -1,7 +1,7 @@
 // Model-checking instances of the durable protocol.
 //   durable_mc        : the code as written (4866070): READ COMMITTED T-W1, children, crashes, DRIFT=0
 //   durable_mc_drift  : same, local clock lags DB time by 2 ticks (violates S13's clock assumption)
-//   durable_mc_env    : durable_mc plus external writes (EnvCorruptActivityBounds, invalid-bounds commands): G10
+//   durable_mc_env    : durable_mc plus external writes (EnvCorruptActivityBounds, invalid-bounds commands): G10 quarantine
 //   durable_mc_act    : activity-only (no children, no crashes, 2 workflows, 2 activities), READ COMMITTED
 //   durable_mc_rr     : HISTORICAL (pre-P4, 0085691): T-W1 plain reads use a REPEATABLE READ snapshot
 //   durable_mc_act_rr : HISTORICAL activity-only instance with the RR snapshot

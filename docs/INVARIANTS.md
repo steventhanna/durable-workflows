@@ -76,7 +76,7 @@ Transitions:
 | running | waiting_activity | `RunActivity` commit | coordinator | `src/runtime/coordinator.rs:705-781` |
 | running | waiting_child | `RunChild` commit | coordinator | `src/runtime/coordinator.rs:783-875` |
 | waiting_activity | ready | activity success wake | activity worker | `src/runtime/activity_worker.rs:1160-1218` |
-| waiting_activity | blocked | activity dead-letter | activity worker (finish or reconcile) | `src/runtime/activity_worker.rs:1220-1259` |
+| waiting_activity | blocked | activity dead-letter | activity worker (finish, reconcile, or claim quarantine) | `src/runtime/activity_worker.rs:1220-1259` |
 | waiting_child | ready | child terminal wake | whoever makes the child terminal | `src/persistence/workflows.rs:183-274` |
 | sleeping | ready | timer fired | timer materializer | `src/runtime/temporal.rs:31-59` |
 | waiting_approval | ready | approval resolved | admin | `src/admin/control.rs:630-650` |
@@ -109,6 +109,7 @@ Statuses (`src/persistence/mod.rs:144-150`): `pending`, `running`,
 | running | pending | pause of the waiting workflow; `maxAttempts+1` | admin | `src/admin/control.rs:888-938` |
 | running | dead_lettered | permanent failure, or retryable on last attempt | activity worker | `src/runtime/activity_worker.rs:1099-1131` |
 | running | dead_lettered | expired lease on last attempt | activity worker (claim txn) | `src/runtime/activity_worker.rs:898-937` |
+| pending | dead_lettered | quarantine at claim: attempt cap reached or invalid timeout/lease bounds (`invalid_row`, G10) | activity worker (claim txn) | `src/runtime/activity_worker.rs` `quarantine_candidate` |
 | pending, running | cancelled | workflow cancel / restart | app, admin | `src/store.rs:578-614` |
 | dead_lettered | cancelled | recoverable start of a blocked/failed lineage | app | `src/store.rs:241-255` |
 
@@ -341,10 +342,15 @@ transaction:
       `workflow.status=waiting_activity AND workflow.waitReferenceId=activity.id`,
       `activity.status=pending`, `availableAt <= now`, local `(kind, version)`,
       ≤32, ordered `(availableAt, continuation tie-break, id)`.
-   e. `claim_locked_candidate` (`415-524`): workflow `FOR UPDATE SKIP LOCKED`
+   e. `claim_locked_candidate`: workflow `FOR UPDATE SKIP LOCKED`
       with the wait recheck; activity `FOR UPDATE SKIP LOCKED` with recheck;
-      error (aborts the whole T-W1) if the definition is missing, the attempt
-      cap is exceeded, or `leaseDuration <= timeout`; fenced
+      skip (`Ok(None)`) if the definition is missing; quarantine
+      (`quarantine_candidate`, then `Ok(None)`; G10, fixed) if the attempt
+      cap is reached (`attemptCount >= maxAttempts`) or `timeout <= 0` or
+      `leaseDuration <= timeout`: fenced `UPDATE WHERE status=pending AND
+      attemptCount=k` → `dead_lettered`, `lastErrorCategory=invalid_row`,
+      `completedAt=now`; history `activity_quarantined`; block the workflow
+      (history `activity_dead_lettered`). Otherwise fenced
       `UPDATE WHERE status=pending AND attemptCount=k` → `running`,
       `attemptCount=k+1`, `leaseToken=uuid4`, `leaseExpiresAt=now+leaseDuration`;
       INSERT attempt `k+1`.
@@ -592,8 +598,9 @@ attempt `(id, attemptCount)` exists with `finishedAt IS NULL` and the same
 from 1, and `attemptCount ≤ maxAttempts`. `maxAttempts` only increases (by 1
 per operator pause of a running attempt). **ENFORCED**
 (`src/runtime/activity_worker.rs:457-466`, `898`, `1045`;
-`src/admin/control.rs:915-930`). A pending row at the cap would make T-W1 fail
-rather than skip it (G10); no traced path creates one. Retries create new rows
+`src/admin/control.rs:915-930`). No traced path creates a pending row at the
+cap; if one exists (a manual edit), T-W1 quarantines it: dead-lettered with
+`invalid_row`, its workflow blocked (G10, fixed). Retries create new rows
 with `attemptCount=0` (`src/admin/control.rs:450`).
 
 **S13. At most one handler executes per activity at any instant.**
@@ -753,7 +760,13 @@ progress ≤ 100 events per attempt and description ≤ 2 KiB (`src/progress.rs:
 `activity_succeeded`/`child_succeeded` metadata (up to 64 KiB output plus
 envelope, which exceeds the 16 KiB metadata constant). `ActivityCommand` and
 `ChildWorkflowCommand` implement `Deserialize`, so a serde-built command skips
-constructor checks; the coordinator does not re-check them (G10).
+constructor checks; the coordinator does not re-check them. An activity row
+with invalid timeout/lease bounds is quarantined at claim (G10, fixed). The
+same holds for `RetryPolicy`: its constructors bound every delay by
+`MAX_RETRY_DELAY_SECS` (`i64::MAX / 2_000` s), so a delay with +100% jitter
+fits the millisecond range; a deserialized (stored) or `from_validated`
+policy skips that bound, and `delay_for_attempt` then saturates at
+`u64::MAX` seconds instead of wrapping (the jitter overflow, fixed).
 
 **S36. Operator pause fences in-flight work.** Pausing a running workflow
 invalidates the coordinator's token; pausing while an activity runs closes its
@@ -805,7 +818,10 @@ yielding (the timeout cannot preempt it) or a `panic = "abort"` build.
 Needs F1–F3, `availableAt ≤ now`, free topic capacity, and a T-W1 sweep that
 acquires every registered topic row (all-or-nothing,
 `src/runtime/activity_worker.rs:310-312`). System-wide progress holds because a
-sweep that skips a lock implies another sweep holds it. **ENFORCED**.
+sweep that skips a lock implies another sweep holds it. **ENFORCED** for valid
+rows. A row past its attempt cap or with invalid timeout/lease bounds is not
+claimed but quarantined (dead-lettered, its workflow blocked for an operator);
+it no longer stops the claims of other rows and topics (G10, fixed).
 
 **L5. An expired activity lease is eventually reconciled.** Needs a dispatcher
 for that topic with local capacity > 0 (T-W1 returns early otherwise,
@@ -946,9 +962,9 @@ non-terminating child are stable states that need an operator.
 ## 6. Suspected gaps
 
 Status: G4 is closed for library transactions (P4, READ COMMITTED).
-G1, G3 and G9 are fixed, and N4 (found by the concurrent trace workload) is
-found and fixed; their tests in `tests/gaps.rs` run un-ignored. G2, G6, G8,
-G10 and G11, and the model findings N1 and N2 (`spec/README.md`), are
+G1, G3, G9 and G10 are fixed, and N4 (found by the concurrent trace workload) is
+found and fixed; their tests in `tests/gaps.rs` run un-ignored. G2, G6, G8
+and G11, and the model findings N1 and N2 (`spec/README.md`), are
 confirmed by ignored tests in `tests/gaps.rs`.
 
 Each item below was traced from the code; the status line above records
@@ -1090,7 +1106,20 @@ overrun, or `leaseDuration <= timeout` (`src/runtime/activity_worker.rs:451-472`
 The error aborts the whole T-W1 across all topics and ends the dispatcher
 task (G1); the same row is selected again next sweep. No traced engine path
 creates such a row, but a `Deserialize`-built `ActivityCommand` or a manual
-edit can.
+edit can. **Fixed**: a missing definition is a skip (`Ok(None)`, debug log;
+the candidate query already filters on local definitions). An attempt-cap
+overrun (`attemptCount >= maxAttempts`) or invalid bounds quarantines the row
+in the same T-W1 (`quarantine_candidate`): fenced on `status=pending AND
+attemptCount=k`, the row becomes `dead_lettered` with
+`lastErrorCategory=invalid_row`, `lastErrorMessage="<reason>: <detail>"` and
+`completedAt=now`; history `activity_quarantined`; the workflow (already
+locked) is blocked with `errorCategory=invalid_row`. The claim goes on with
+the next candidate and topic. `retry_activity` recovers the workflow with a
+replacement row built from the registered definition. The trace records the
+row in `TW1_Claim.quarantined` (interface v5). Tests:
+`g10_invalid_activity_row_does_not_stop_other_claims`,
+`g10_quarantined_row_is_dead_lettered_and_blocks_its_workflow`, and
+`admin_controls.rs` `retry_recovers_a_workflow_blocked_by_a_quarantined_activity`.
 
 **G11. Parent cancellation does not reach descendants** (specification gap).
 See the rejected candidate in §3. Child workflows and their external side

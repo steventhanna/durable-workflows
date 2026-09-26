@@ -16,7 +16,7 @@ use std::{
 use serde_json::{json, Map, Value};
 
 /// `TRACE_IFACE_VERSION` in `spec/durable.qnt` this generator targets.
-const IFACE_VERSION: i64 = 4;
+const IFACE_VERSION: i64 = 5;
 
 /// Invariants checked after every step.
 const STEP_INVARIANTS: &[&str] = &["safety", "inv_S17_capAtClaim"];
@@ -308,8 +308,6 @@ struct Ctx {
     hb: Interner<i64>,
     /// Heartbeats whose `TW2_Commit` is in the trace: their `TW2_Drop` is void.
     committed_hbs: BTreeSet<i64>,
-    /// Activities (real ids) the model holds with invalid timeout/lease bounds.
-    invalid_bounds: BTreeSet<i64>,
     /// The trace needs `ENABLE_ENV_EDITS` (an external step or an invalid-bounds insert).
     env_edits: bool,
     /// Invariants every step checks.
@@ -356,15 +354,11 @@ fn generate(
             .filter(|record| record["action"] == "TW2_Commit")
             .filter_map(|record| record["params"]["hb"].as_i64())
             .collect(),
-        invalid_bounds: BTreeSet::new(),
         env_edits: false,
         invariants: invariants.to_vec(),
     };
     let mut steps = Vec::new();
     for record in records {
-        if let Some(step) = external_step(&mut ctx, record)? {
-            steps.push(step);
-        }
         if let Some(step) = translate(&mut ctx, record)? {
             steps.push(step);
         }
@@ -511,37 +505,6 @@ fn generate(
     })
 }
 
-/// The environment step an unrecorded external write implies, placed just
-/// before the record that exposes it: a `TW1_Error{invalid_bounds}` naming an
-/// activity the model still holds with valid bounds was preceded by a write the
-/// recorder does not see (the G10 gap test edits the row with raw SQL).
-fn external_step(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
-    let params = &record["params"];
-    if record["action"] != "TW1_Error" || params["reason"] != "invalid_bounds" {
-        return Ok(None);
-    }
-    let seq = record["seq"].as_i64().ok_or("malformed:seq")?;
-    let id = int(params, "activity_id", seq)?;
-    if !ctx.invalid_bounds.insert(id) {
-        return Ok(None);
-    }
-    ctx.env_edits = true;
-    let a = ctx.act.id(id);
-    let mut expect = vec![format!(
-        "lastAction == {}",
-        quote("EnvCorruptActivityBounds")
-    )];
-    expect.extend(ctx.invariants.iter().cloned());
-    expect.push(format!("viewAct(db, {a}).invalidBounds"));
-    Ok(Some(Step {
-        seq,
-        class: "external",
-        label: format!("external EnvCorruptActivityBounds (unrecorded write to activity {id})"),
-        call: format!("EnvCorruptActivityBounds({a})"),
-        expect,
-    }))
-}
-
 /// A recorded external write (an `External` record: one row a trigger
 /// captured outside any traced transaction) as its environment action.
 fn env_step(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Step, Excluded> {
@@ -573,7 +536,7 @@ fn env_step(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Step, Excluded> {
         let view = if row.is_null() {
             "emptyAct".to_string()
         } else {
-            act_row(ctx, real, &row, seq)?
+            act_row(ctx, &row, seq)?
         };
         (
             format!("EnvSetAct({a}, {view})"),
@@ -995,19 +958,6 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
             let tok = token(ctx, &params["token"]);
             (format!("{action}({r}, {a}, {tok})"), action)
         }
-        "TW1_Error" => {
-            let r = runtime(ctx, actor, seq)?;
-            let a = ctx.act.id(int(params, "activity_id", seq)?);
-            match text(params, "reason", seq)? {
-                reason @ ("attempt_cap" | "invalid_bounds") => (
-                    format!("TW1_Error({r}, {a}, {})", quote(reason)),
-                    "TW1_Error",
-                ),
-                // Every runtime has every definition in the model (F3).
-                "missing_definition" => return Err("unmodeled:missing_definition".into()),
-                other => return Err(format!("unsupported:tw1_error_{other}")),
-            }
-        }
         "TW2_Send" => {
             let r = runtime(ctx, actor, seq)?;
             let a = ctx.act.id(int(params, "activity_id", seq)?);
@@ -1069,7 +1019,7 @@ fn sent_hb(ctx: &Ctx, params: &Value, seq: i64) -> Result<Option<i64>, Excluded>
     Ok(ctx.hb.ids.get(&hb).copied())
 }
 
-/// `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, claimed)`.
+/// `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, quarantined, claimed)`.
 /// The maps cover every topic; a topic the transaction did not visit gets a
 /// value that cannot constrain (no claims there).
 fn tw1_claim(
@@ -1109,6 +1059,14 @@ fn tw1_claim(
             ));
         }
     }
+    let mut quarantined = Vec::new();
+    if let Some(rows) = params["quarantined"].as_array() {
+        for row in rows {
+            let a = ctx.act.id(int(row, "activity_id", seq)?);
+            let reason = text(row, "reason", seq)?;
+            quarantined.push(format!("{{ a: {a}, reason: {} }}", quote(reason)));
+        }
+    }
     let mut local = Vec::new();
     let mut in_flight = Vec::new();
     for topic in &ctx.topics {
@@ -1120,10 +1078,11 @@ fn tw1_claim(
         in_flight.push(format!("{} -> {seen}", quote(topic)));
     }
     Ok(format!(
-        "TW1_Claim({r}, {tnow}, Map({}), [{}], Map({}), [{}])",
+        "TW1_Claim({r}, {tnow}, Map({}), [{}], Map({}), [{}], [{}])",
         local.join(", "),
         reconciled.join(", "),
         in_flight.join(", "),
+        quarantined.join(", "),
         claimed.join(", ")
     ))
 }
@@ -1151,7 +1110,7 @@ fn post_expectations(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Vec<Stri
             clauses.push(if row.is_null() {
                 format!("viewAct(db, {a}).status == \"none\"")
             } else {
-                format!("viewAct(db, {a}) == {}", act_row(ctx, real, row, seq)?)
+                format!("viewAct(db, {a}) == {}", act_row(ctx, row, seq)?)
             });
         }
     }
@@ -1248,17 +1207,12 @@ fn wf_row(ctx: &mut Ctx, row: &Value, seq: i64) -> Result<String, Excluded> {
 }
 
 /// `ActRow` literal: the §5 abstraction of a recorded activity row.
-fn act_row(ctx: &mut Ctx, id: i64, row: &Value, seq: i64) -> Result<String, Excluded> {
+fn act_row(ctx: &mut Ctx, row: &Value, seq: i64) -> Result<String, Excluded> {
     let wf = ctx.wf.id(int(row, "workflow_id", seq)?);
     let max_attempts = int(row, "max_attempts", seq)?;
     ctx.max_attempts = ctx.max_attempts.max(max_attempts);
     let tok = token(ctx, &row["lease_token"]);
     let invalid = invalid_bounds(row);
-    if invalid {
-        ctx.invalid_bounds.insert(id);
-    } else {
-        ctx.invalid_bounds.remove(&id);
-    }
     Ok(format!(
         "{{ status: {}, wf: {wf}, topic: {}, attemptCount: {}, maxAttempts: {max_attempts}, \
          availableAt: {}, token: {tok}, leaseExp: {}, invalidBounds: {invalid} }}",
