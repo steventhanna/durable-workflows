@@ -219,15 +219,8 @@ These gaps are confirmed by ignored tests in
 are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
 [`spec/README.md`](spec/README.md).
 
-- **G1** — A benign race (such as an operator pausing a workflow during its
-  step) makes the coordinator return `FencedWrite`, which uses up the
-  runtime's restart budget. The budget never resets, so repeated races stop
-  the runtime.
 - **G2** — A recoverable start on a blocked keyed child cancels that child
   but does not wake its parent, which stays `waiting_child` forever.
-- **G3** — A `step` that panics never counts an activation attempt; after
-  lease recovery it panics again, without limit, in every runtime that
-  claims it.
 - **G6** — Under a concurrent child deduplication race, a parent can wait on
   a child of a different definition version; the parent then fails on replay.
 - **G8** — `child_with_key` can resolve to the calling workflow (or an

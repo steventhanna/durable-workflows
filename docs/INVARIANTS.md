@@ -234,16 +234,21 @@ One runtime spawns these tasks (`728-789`): activity-execution collector,
 coordinator (one sequential loop), health (read-only), timer, approval-expiry,
 one task per schedule key, and the activity dispatcher. Any task that returns
 `Err` or panics is restarted after `restart_backoff` (`881-910`). The restart
-counter per task kind is **cumulative for the process lifetime**; when it
-exceeds `max_task_restarts` (default 8, `55`), the whole runtime cancels
-itself (`853-866`). A collector failure cancels immediately (`849-852`).
+counter per task kind counts restarts within `restart_window` (default 10
+minutes; the count starts again once the window since its first counted
+restart has passed); when it exceeds `max_task_restarts` (default 8, `55`) in
+one window, the whole runtime cancels itself (`RestartBudget`). A collector failure cancels immediately (`849-852`).
 Startup checks readiness and topic caps before any claim (`174-198`).
 
 ### 2.2 Coordinator (`run_task` Coordinator, `src/runtime/supervisor.rs:922-939`)
 
-Per iteration: `activate_one` (`src/runtime/coordinator.rs:111-118`). If no
-claim, sleep `idle_delay` (2 s). Any error returned by T-C2 or T-C3 other than
-the handled definition errors ends the task (G1).
+Per iteration: `activate_one` (`src/runtime/coordinator.rs`). If no
+claim, sleep `idle_delay` (2 s). A lost fence (`FencedWrite`) or a transient
+database error (deadlock, serialization failure, lock wait timeout;
+`dialect::is_transient_error`) from T-C2 or T-C3 is logged and the loop goes
+on: an operator action or lease recovery already moved the row on, or the
+rolled-back row stays `running` until lease recovery (L2). `activate_claim`
+itself still returns the error. Any other error ends the task (G1, fixed).
 
 **T-C1 claim** (`src/runtime/coordinator.rs:228-393`), one transaction:
 1. `now` ← DB.
@@ -266,13 +271,20 @@ There is no workflow lease renewal anywhere in the code.
 **L-C1 activation (no transaction, no lock)** (`136-204`): read the lowest
 deliverable event with `deliverySequence > deliveredEventSequence`
 (`src/persistence/events.rs:10-23`); error if none. Run
-`WorkflowRegistry::step_stored(input, state, event)` (user code, no timeout).
+`WorkflowRegistry::step_stored(input, state, event)` (user code) under an
+unwind boundary and `CoordinatorConfig::step_timeout` (default 30 s): a panic
+or a timeout is an activation failure (T-C3; G3, fixed). A build with
+`panic = "abort"` still aborts the process on a panic.
 Validate that a `RunChild`/`RunActivity` target is registered locally and the
 activity topic matches.
 
 **T-C2 commit** (`src/runtime/coordinator.rs:395-408`, `499-875`), one
 transaction. `now` ← DB. Every branch includes the fenced update
-`WHERE id AND status=running AND leaseToken=claim` (`19-26`), which sets
+`WHERE id AND status=running AND leaseToken=claim` (`19-26`); `RunActivity`
+and `WaitForApproval` first lock the row under the same fence
+(`SELECT ... FOR UPDATE`, `lock_fence`) before they insert their command row,
+so a stale claim gets `FencedWrite` rather than a unique-key error (N4). The
+update sets
 `deliveredEventSequence = consumed event`, the new `stateJson`,
 `stateVersion+1`, clears the lease, resets `activationAttempts`:
 - `Continue`: → `ready`; append deliverable `continued` with
@@ -281,13 +293,17 @@ transaction. `now` ← DB. Every branch includes the fenced update
 - `Complete`: → `succeeded`, `resultJson`; history; wake parents (child-terminal
   scan `FOR UPDATE`) (`561-591`).
 - `SleepUntil`: `commandSequence+1`; → `sleeping`, wait `timer`, `availableAt=wakeAt` (`608-635`).
-- `WaitForApproval`: INSERT approval (pending); `commandSequence+1`; → `waiting_approval` (`636-683`).
-- `RunActivity`: INSERT activity (pending) **before** the fenced update;
-  `commandSequence+1`; → `waiting_activity` (`705-781`).
-- `RunChild`: dedup lookup (consistent read) and upsert child row; fenced
-  parent update → `waiting_child`; history; if the child already existed,
-  lock it `FOR UPDATE` (current read) and, if terminal, wake waiting parents
-  in the same transaction (`783-875`).
+- `WaitForApproval`: fence lock; INSERT approval (pending); `commandSequence+1`;
+  → `waiting_approval`.
+- `RunActivity`: fence lock; INSERT activity (pending) before the fenced
+  update; `commandSequence+1`; → `waiting_activity`.
+- `RunChild`: dedup lookup (consistent read) and upsert child row; if the
+  child already existed, lock it `FOR UPDATE` (current read) **before** the
+  fenced parent update (G9, fixed); fenced parent update → `waiting_child`;
+  history; if the locked child is terminal, wake waiting parents in the same
+  transaction. It takes no fence lock first: that would lock the parent
+  before the child, and `insert_child` resolves a duplicate key to the
+  existing row, so a stale claim still ends in `FencedWrite` at the update.
 A fence miss rolls back the whole transaction, including the inserts.
 
 **T-C3 activation failure** (`410-496`), one transaction: lock the row with
@@ -295,8 +311,9 @@ the claim fence (`FOR UPDATE`); `attempt = activationAttempts+1`; exhausted iff
 `attempt >= min(maxActivationAttempts, config.max_activation_attempts)`;
 fenced update → `failed` (+`completedAt`, wake parents) or `ready` with
 `availableAt = now + backoff(attempt)`. The deliverable event is not consumed.
-Used for handler errors, unregistered child/activity, topic mismatch, and
-`DefinitionMismatch`/`InvalidDefinition` from T-C2 (`166-223`).
+Used for handler errors, a `step` panic or `step_timeout`, unregistered
+child/activity, topic mismatch, and `DefinitionMismatch`/`InvalidDefinition`
+from T-C2.
 
 ### 2.3 Activity dispatcher and executions (`src/runtime/supervisor.rs:1033-1132`)
 
@@ -476,13 +493,13 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
 - Claims: topic row(s) → workflow → activity → attempt insert.
 - Finish, reconcile, pause, cancel, retry: workflow → activity → attempt;
   approvals after the workflow.
-- `RunActivity`/`WaitForApproval` commit: INSERT new child row → workflow
-  (new rows are invisible to others, so no cycle).
+- `RunActivity`/`WaitForApproval` commit: workflow (fence lock) → INSERT new
+  row (new rows are invisible to others, so no cycle).
 - Child terminal: child → every waiting parent (locking scan on
   `waitKind, waitReferenceId, status`; there is no index on
   `waitReferenceId`, so the scan can lock many rows; UNCLEAR how many).
-- `RunChild` commit attaching to an existing child: parent → child. This
-  inverts the previous line (G9).
+- `RunChild` commit attaching to an existing child: child → parent, the same
+  order as the previous line (G9, fixed; it was parent → child).
 - Progress: activity only. Schedules: state → run rows → new workflow rows.
 
 ---
@@ -544,8 +561,10 @@ T-A5 keep stale wait fields (`src/store.rs:262-269`,
 **S8. Activation attempts are bounded for handler errors.** Each T-C3
 increments `activationAttempts`; at `min(maxActivationAttempts, config)` the
 workflow fails; any successful commit resets it to 0. **ENFORCED**
-(`src/runtime/coordinator.rs:431-434`, `533`). Lease recovery does not
-increment it (`296-321`), so crashes and hangs are unbounded (G3).
+(`record_activation_failure`). A `step` panic and a `step` that exceeds
+`step_timeout` are T-C3 failures too (G3, fixed). Lease recovery does not
+increment it, by design: a runtime crash is not the workflow's fault, so
+repeated crashes while a workflow is claimed stay unbounded.
 
 ### Activities
 
@@ -760,8 +779,10 @@ attempt, returns it to `pending`, and invalidates the worker token, with
 
 Global fairness assumptions used below:
 - **F1** The DB is eventually available, and DB time advances.
-- **F2** At least one runtime stays up and has not self-cancelled (G1, G3
-  threaten this).
+- **F2** At least one runtime stays up and has not self-cancelled. Operator
+  actions, lease-recovery races (including stale commits, N4), transient
+  database errors, step panics and hung steps no longer cost restart budget
+  (G1, G3, fixed); the budget counts within `restart_window`.
 - **F3** The runtime serving an entity has its exact `(kind, version)` and
   topic registered (claims filter on local definitions).
 - **F4** Handlers and `step` return, or yield to cancellation, in finite time.
@@ -775,8 +796,10 @@ continuation streaks yield after 16 (`src/runtime/coordinator.rs:513-520`).
 coordinator that polls (recovery runs before the definition filter,
 `src/runtime/coordinator.rs:242-327`). **ENFORCED**.
 
-**L3. A claimed workflow eventually leaves `running`.** Needs F4 for `step`,
-or L2 after the lease expires. **ASSUMED** (G3: no timeout around `step`).
+**L3. A claimed workflow eventually leaves `running`.** `step` is bounded by
+`step_timeout` and an unwind boundary, or L2 recovers the row after the lease
+expires. **ENFORCED**, except for a `step` that blocks its thread without
+yielding (the timeout cannot preempt it) or a `panic = "abort"` build.
 
 **L4. A pending activity whose workflow waits on it is eventually claimed.**
 Needs F1–F3, `availableAt ≤ now`, free topic capacity, and a T-W1 sweep that
@@ -923,8 +946,10 @@ non-terminating child are stable states that need an operator.
 ## 6. Suspected gaps
 
 Status: G4 is closed for library transactions (P4, READ COMMITTED).
-G1, G2, G3, G6, G8, G10 and G11, and the model findings N1 and N2
-(`spec/README.md`), are confirmed by ignored tests in `tests/gaps.rs`.
+G1, G3 and G9 are fixed, and N4 (found by the concurrent trace workload) is
+found and fixed; their tests in `tests/gaps.rs` run un-ignored. G2, G6, G8,
+G10 and G11, and the model findings N1 and N2 (`spec/README.md`), are
+confirmed by ignored tests in `tests/gaps.rs`.
 
 Each item below was traced from the code; the status line above records
 which ones a test has since confirmed or closed.
@@ -943,6 +968,30 @@ deadlocks (G9), duplicate-key aborts (G4), and claim-batch errors in the
 dispatcher (`src/runtime/supervisor.rs:1104-1106`). The test
 `pause_fences_a_workflow_transition_claimed_before_the_operator_action`
 confirms that `activate_claim` returns `Err(FencedWrite)`.
+**Fixed**: `activate_one` logs a `FencedWrite` or a transient database error
+(`dialect::is_transient_error`) from T-C2/T-C3 and returns the claimed id;
+`activate_claim` still returns the error to a direct caller. The restart
+budget counts within `RuntimeConfig::restart_window` (default 10 minutes).
+The dispatcher logs a transient `claim_batch` error and backs off as after an
+empty sweep. Tests: `g1_pause_during_step_is_not_a_coordinator_error`,
+`g1_repeated_operator_pauses_do_not_stop_the_runtime`,
+`g1_activation_failure_after_operator_cancel_is_not_a_coordinator_error`, and
+the `RestartBudget` unit test.
+
+**N4. A stale RunActivity commit reported a duplicate key, not a fence miss**
+(found by the concurrent workload, `tests/trace_workload.rs`). A coordinator
+whose lease expired while its `step` ran, and whose workflow another runtime
+recovered and advanced to the same `RunActivity`, inserted the activity row
+before its fenced workflow update. `uq_durable_activity_command` (workflow,
+command sequence, replacement) was already taken, so the transaction failed
+with a duplicate-key database error: no `CoordFenceMiss`, a coordinator task
+error (G1), and a restart. `WaitForApproval` had the same shape
+(`uq_durable_approval_command`). `RunChild` did not: `insert_child` resolves
+the key to the recovering commit's child. **Fixed**: both paths lock the
+workflow row under the claim fence before the insert (`lock_fence`), so the
+stale commit gets `FencedWrite`. Tests: `n4_stale_run_activity_commit_is_a_fence_miss`,
+`n4_stale_run_child_commit_is_a_fence_miss`; the workload's slow steps may
+now outlast the lease on every transition.
 
 **G2. Recoverable start strands parents of a superseded blocked child.**
 T-X2 moves a `blocked` newest generation to `cancelled` without calling
@@ -962,7 +1011,15 @@ again, and panics again; each runtime that claims it uses up its restart
 budget. A `step` that never returns blocks that runtime's only coordinator
 loop (`src/runtime/supervisor.rs:931-938`; no timeout around
 `src/runtime/coordinator.rs:152-164`), and after lease expiry the next
-runtime that claims it also blocks.
+runtime that claims it also blocks. **Fixed**: `step` runs under an unwind
+boundary and `CoordinatorConfig::step_timeout` (default 30 s, the default
+lease); a panic (`step panicked: <message>`) or a timeout (`step exceeded
+step_timeout`) is a T-C3 activation failure, so the workflow fails after
+`min(max_activation_attempts, 8)` attempts. Lease recovery still does not
+count an attempt (intended; S8). A `panic = "abort"` build still aborts, and a
+`step` that blocks its thread without yielding cannot be timed out. Tests:
+`g3_panicking_step_fails_at_the_activation_cap`,
+`g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts`.
 
 **G4. Stale snapshot for `sequence` causes spurious aborts.** **Closed** for
 library transactions by READ COMMITTED (§5.1): `next_event_sequence` after the
@@ -1022,6 +1079,10 @@ parent's `RunChild` commit on an existing child locks the parent, then the
 child (`src/runtime/coordinator.rs:807-840`). With a domain-keyed child that
 completes while a parent attaches, InnoDB can deadlock and abort one side →
 G1, and the aborted step runs again after lease expiry. Safety holds.
+**Fixed**: `commit_child` locks an existing child before the fenced parent
+update, so both sides lock child → parent. Any remaining deadlock (for
+example between two parents' wake scans) is a transient error, which G1's fix
+makes benign.
 
 **G10. One invalid row stops all activity claims.** `claim_locked_candidate`
 returns an error, not a skip, for a missing definition, an attempt cap

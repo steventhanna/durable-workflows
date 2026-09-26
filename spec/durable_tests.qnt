@@ -180,7 +180,7 @@ module durable_tests {
       .then(all { keepPrev, TC1_Claim(2, 1, 1, 2, now + LEASE_W, now) }) // r2 recovers and re-claims w1
       .expect(not(wit_S3_concurrentStep))
       .then(all { keepPrev, CoordFenceMiss(1, 1, 1) })                 // r1's T-C2 loses the fence
-      .expect(ghost.taskErrors.get(1) == 1 and safety)
+      .expect(ghost.taskErrors.get(1) == 0 and safety)
       .then(complete(2))
       .expect(db.wf.get(1).status == "succeeded" and safety)
 
@@ -244,7 +244,7 @@ module durable_tests {
   action startAndRunActivity1(r: int): bool = start(NO_KEY).then(claim(r, db.nextWf - 1)).then(runAct1(r))
 
   // T-A2/T-A3: pausing a running row revokes the claim; the coordinator's commit misses the
-  // fence (G1: operator-caused task error); resume derives ready from the empty wait
+  // fence, which is not a task error (G1 fixed); resume derives ready from the empty wait
   run pauseResumeTest =
     init
       .then(start(NO_KEY))
@@ -252,27 +252,28 @@ module durable_tests {
       .then(pause(1))
       .expect(lastAction == "AdminPause" and db.wf.get(1).status == "paused" and db.wf.get(1).token == 0 and safety)
       .then(all { keepPrev, CoordFenceMiss(1, 1, 1) })
-      .expect(ghost.opTaskErrors.get(1) == 1 and not(inv_G1_noSelfCancelFromOperator) and safety)
+      .expect(ghost.taskErrors.get(1) == 0 and inv_G1_noSelfCancelFromOperator and safety)
       .then(tick)
       .then(resume(1))
       .expect(lastAction == "AdminResume" and db.wf.get(1).status == "ready" and db.wf.get(1).availableAt == 1 and safety)
   run pauseTwiceRejectedTest = init.then(start(NO_KEY)).then(pause(1)).then(pause(1)).fail()
   run resumeNotPausedRejectedTest = init.then(start(NO_KEY)).then(resume(1)).fail()
 
-  // G1: with MAX_TASK_RESTARTS = 1, two operator pauses during claims stop runtime 1
+  // G1 (fixed): with MAX_TASK_RESTARTS = 1, two operator pauses during claims leave runtime 1 up
   action g1TwoPauses: bool =
     init
       .then(start(NO_KEY)).then(start(NO_KEY)).then(start(NO_KEY))
       .then(claim(1, 1)).then(pause(1)).then(all { keepPrev, CoordFenceMiss(1, 1, 1) })
       .then(claim(1, 2)).then(pause(2)).then(all { keepPrev, CoordFenceMiss(1, 2, 2) })
-  run g1SelfCancelTest =
-    g1TwoPauses.expect(not(wit_selfCancelled) and ghost.opTaskErrors.get(1) == 2 and not(inv_G1_noSelfCancelFromOperator) and safety)
-  run g1StoppedRuntimeClaimsNothingTest = g1TwoPauses.then(claim(1, 3)).fail()
-  // an application cancel (T-X3) is not operator-caused
-  run g1AppCancelNotOperatorTest =
+  run g1NoSelfCancelTest =
+    g1TwoPauses.expect(not(stoppedRt(ghost, 1)) and ghost.taskErrors.get(1) == 0 and inv_G1_noSelfCancelFromOperator and safety)
+  run g1RuntimeStillClaimsTest =
+    g1TwoPauses.then(claim(1, 3)).expect(db.wf.get(3).status == "running" and safety)
+  // an application cancel (T-X3) during a claim is not a task error either
+  run g1AppCancelFenceMissTest =
     init.then(start(NO_KEY)).then(claim(1, 1)).then(all { keepPrev, TX3_Cancel(1, now) })
       .then(all { keepPrev, CoordFenceMiss(1, 1, 1) })
-      .expect(ghost.taskErrors.get(1) == 1 and inv_G1_noSelfCancelFromOperator)
+      .expect(ghost.taskErrors.get(1) == 0 and inv_G1_noSelfCancelFromOperator and safety)
 
   // S36 + N2: pausing a workflow whose activity runs sets the activity pending with
   // maxAttempts + 1 and closes the attempt; the paused handler still executes while another

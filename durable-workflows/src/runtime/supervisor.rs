@@ -33,7 +33,12 @@ pub struct RuntimeConfig {
     pub idle_delay: Duration,
     pub restart_backoff: Duration,
     pub forced_shutdown_timeout: Duration,
+    /// Restarts of one task allowed within `restart_window`; one more cancels
+    /// the runtime.
     pub max_task_restarts: u32,
+    /// The window `max_task_restarts` counts over. A task's count starts again
+    /// once its first counted restart is older than this.
+    pub restart_window: Duration,
     pub max_workers_per_topic: u32,
     pub health_scan_interval: Duration,
     pub health_stale_after: Duration,
@@ -52,6 +57,7 @@ impl Default for RuntimeConfig {
             restart_backoff: Duration::from_secs(1),
             forced_shutdown_timeout: Duration::from_secs(5),
             max_task_restarts: 8,
+            restart_window: Duration::from_secs(10 * 60),
             max_workers_per_topic: 4,
             health_scan_interval: Duration::from_secs(60),
             health_stale_after: Duration::from_secs(5 * 60),
@@ -113,6 +119,7 @@ where
             || config.restart_backoff.is_zero()
             || config.forced_shutdown_timeout.is_zero()
             || config.max_task_restarts == 0
+            || config.restart_window.is_zero()
             || config.max_workers_per_topic == 0
             || config.health_scan_interval.is_zero()
             || config.health_stale_after.is_zero()
@@ -789,7 +796,7 @@ where
     );
 
     let mut errors = Vec::new();
-    let mut restarts = HashMap::<TaskSpec, u32>::new();
+    let mut restarts = HashMap::<TaskSpec, RestartBudget>::new();
     while let Some(joined) = tasks.join_next_with_id().await {
         let (task_id, result) = match joined {
             Ok((task_id, result)) => (task_id, Ok(result)),
@@ -850,9 +857,15 @@ where
             parts.cancellation.cancel();
             continue;
         }
-        let restart_count = restarts.entry(spec.clone()).or_default();
-        *restart_count = restart_count.saturating_add(1);
-        if *restart_count > parts.config.max_task_restarts {
+        let within_budget = restarts
+            .entry(spec.clone())
+            .or_insert_with(|| RestartBudget::new(tokio::time::Instant::now()))
+            .record(
+                tokio::time::Instant::now(),
+                parts.config.restart_window,
+                parts.config.max_task_restarts,
+            );
+        if !within_budget {
             parts.cancellation.cancel();
             if spec == TaskSpec::ActivityDispatcher {
                 if let Err(error) = parts.activity_executions.shutdown().await {
@@ -868,6 +881,34 @@ where
         }
     }
     errors
+}
+
+/// Restarts of one task counted within a window that starts at the first
+/// restart after the previous window ended.
+#[derive(Debug)]
+struct RestartBudget {
+    count: u32,
+    window_started: tokio::time::Instant,
+}
+
+impl RestartBudget {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            count: 0,
+            window_started: now,
+        }
+    }
+
+    /// Counts one restart at `now`; false once the window holds more than
+    /// `max_restarts`.
+    fn record(&mut self, now: tokio::time::Instant, window: Duration, max_restarts: u32) -> bool {
+        if now.saturating_duration_since(self.window_started) > window {
+            self.count = 0;
+            self.window_started = now;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count <= max_restarts
+    }
 }
 
 struct CompletionGuard(CancellationToken);
@@ -1101,9 +1142,20 @@ where
                         (topic.key, configured.saturating_sub(active))
                     })
                     .collect();
-                let claims = activity_worker
+                let claims = match activity_worker
                     .claim_batch(available, &local_topic_capacity)
-                    .await?;
+                    .await
+                {
+                    Ok(claims) => claims,
+                    Err(error) if crate::dialect::is_transient_error(&error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "activity claim rolled back on a transient database error; retrying"
+                        );
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 if claims.is_empty() {
                     let delay = jittered_idle_delay(
                         idle_delays[empty_sweeps.min(idle_delays.len() - 1)],
@@ -1427,5 +1479,26 @@ mod tests {
         assert_eq!(local_topic_limit("rtms", 40, 4, &limits), 24);
         assert_eq!(local_topic_limit("billing", 40, 4, &limits), 4);
         assert_eq!(local_topic_limit("rtms", 12, 4, &limits), 12);
+    }
+
+    #[test]
+    fn restart_budget_counts_within_the_window_and_resets_after_it() {
+        let window = Duration::from_secs(600);
+        let start = tokio::time::Instant::now();
+        let mut budget = RestartBudget::new(start);
+        assert!(budget.record(start, window, 2));
+        assert!(budget.record(start + Duration::from_secs(300), window, 2));
+        assert!(
+            !budget.record(start + window, window, 2),
+            "a third restart inside the window exceeds a budget of 2"
+        );
+
+        let later = start + window + Duration::from_secs(1);
+        assert!(
+            budget.record(later, window, 2),
+            "a restart after the window starts a new count"
+        );
+        assert!(budget.record(later + Duration::from_secs(1), window, 2));
+        assert!(!budget.record(later + Duration::from_secs(2), window, 2));
     }
 }

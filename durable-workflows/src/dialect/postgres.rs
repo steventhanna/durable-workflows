@@ -163,3 +163,21 @@ pub(crate) async fn insert_topic_locks_if_absent(
         .await?;
     Ok(())
 }
+
+/// A serialization failure (40001), deadlock (40P01) or lock timeout (55P03):
+/// the transaction was rolled back and retrying it later is safe.
+/// diesel-async maps only 40001 to a `DatabaseErrorKind` and does not expose
+/// the SQLSTATE, so the other two are matched by the server message (the
+/// server's `lc_messages` must be English, the default).
+pub(crate) fn is_transient_error(error: &DurableError) -> bool {
+    let DurableError::Database(diesel::result::Error::DatabaseError(kind, info)) = error else {
+        return false;
+    };
+    matches!(
+        kind,
+        diesel::result::DatabaseErrorKind::SerializationFailure
+    ) || {
+        let message = info.message();
+        message == "deadlock detected" || message == "canceling statement due to lock timeout"
+    }
+}

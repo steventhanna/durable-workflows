@@ -29,7 +29,7 @@
  *   TC2_Continue / TC2_Complete / TC2_RunActivity / TC2_RunChild   T-C2 coordinator.rs commit_on_connection,
  *                                 commit_wait_transition, commit_activity, commit_child
  *   TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)  T-C3 coordinator.rs record_activation_failure
- *   CoordFenceMiss(r, w, tok)     T-C2/T-C3 fence miss -> FencedWrite -> task error (G1)
+ *   CoordFenceMiss(r, w, tok)     T-C2/T-C3 fence miss -> FencedWrite -> rollback, logged; not a task error
  *   T-W1 (activity_worker.rs claim_batch / claim_one), simulation form, one action per statement group:
  *     TW1_BeginBatch(r)           topic rows FOR UPDATE SKIP LOCKED (all or nothing), then now
  *     TW1_BeginOne(r, t, tnow)    claim_one: now sampled BEFORE the blocking topic FOR UPDATE
@@ -78,7 +78,7 @@
  *   G2  inv_S24_parentWakes (T-X2 path)          G7  inv_S17_capAlways (RR_SNAPSHOT only)
  *   G10 inv_G10_noClaimAbort (one row aborts every topic's claims) G11 inv_G11_cancelReachesChildren
  *   N1  inv_N1_tx2OwnLineage (T-X2 lineage query on a child key: supersession and ReturnLatest)
- *   G1  inv_G1_noSelfCancelFromOperator (an operator pause/cancel during a claim costs restart budget)
+ *   G1  inv_G1_noSelfCancelFromOperator (fixed; in `safety`: a coordinator never errors)
  *   N2  inv_S13_topicConcurrency (executing handlers per topic can exceed the cap after cancel)
  *   N3  inv_S19_sourceTerminal (public StartOptions.restarted_from_workflow_id accepts a live source)
  *
@@ -156,9 +156,7 @@ module durable {
     revivedExpiredLease: bool, nextHb: int,
     lastIssuedWf: int -> int, lastIssuedAct: int -> int, taskErrors: int -> int,
     // restart budget per task (supervisor.rs: cumulative per TaskSpec, in process memory)
-    coordErrors: int -> int, dispErrors: int -> int,
-    // G1: the lease token an operator action revoked per workflow; operator-caused task errors
-    opRevoked: int -> int, opTaskErrors: int -> int
+    coordErrors: int -> int, dispErrors: int -> int
   }
 
   //--------------------------------------------------------------- variables
@@ -461,17 +459,12 @@ module durable {
     }
   }
 
-  // T-C2 / T-C3 lose the fence: rollback, FencedWrite propagates, coordinator task restarts (G1).
-  // When an operator pause/cancel revoked this token, the error is operator-caused.
-  action CoordFenceMiss(r: int, w: int, tok: int): bool = {
-    val op = tok != 0 and WF_IDS.contains(w) and ghost.opRevoked.get(w) == tok
-    all {
-      holds(r, w, tok),
-      not(wfFenceOk(db, proc.claims.get(r))),
-      commit(db, proc.with("claims", proc.claims.set(r, noClaim)),
-             coordError(ghost, r).with("opTaskErrors", ghost.opTaskErrors.setBy(r, x => if (op) x + 1 else x)),
-             "CoordFenceMiss"),
-    }
+  // T-C2 / T-C3 lose the fence: rollback. activate_one logs FencedWrite and the coordinator
+  // task goes on (G1 fixed): an operator pause/cancel or a lease recovery is not a task error.
+  action CoordFenceMiss(r: int, w: int, tok: int): bool = all {
+    holds(r, w, tok),
+    not(wfFenceOk(db, proc.claims.get(r))),
+    commit(db, proc.with("claims", proc.claims.set(r, noClaim)), ghost, "CoordFenceMiss"),
   }
 
   // T-C2 common part: claim held, fence holds, the consumed event exists
@@ -967,10 +960,7 @@ module durable {
 
   //------------------------------------------------ operator (admin/control.rs)
   // Each locks the workflow FOR UPDATE first; a rejected request (Conflict) is not a step.
-  // A running row's lease is cleared: its coordinator's T-C2/T-C3 misses the fence (G1);
-  // ghost.opRevoked remembers the revoked token.
-  pure def opRevoke(g: Ghost, d: Db, w: int): Ghost =
-    if (d.wf.get(w).status == "running") g.with("opRevoked", g.opRevoked.set(w, d.wf.get(w).token)) else g
+  // A running row's lease is cleared: its coordinator's T-C2/T-C3 misses the fence (CoordFenceMiss).
 
   // pause_activity: the workflow waits on a running activity
   pure def pausesActivity(d: Db, w: int): bool = {
@@ -998,7 +988,7 @@ module durable {
       (r.waitKind == "activity" and ACT_IDS.contains(a)) implies not(actLocked(proc, a)),
       bump implies ar.maxAttempts + 1 <= MAX_ATTEMPTS,                 // sizing bound, not a code check
       commitAt(setWf(d1, w, r.with("status", "paused").with("token", 0).with("leaseExp", 0)), proc,
-               opRevoke(ghost, db, w), if (bump) "AdminPauseActivity" else "AdminPause", tnow),
+               ghost, if (bump) "AdminPauseActivity" else "AdminPause", tnow),
     }
   }
 
@@ -1036,7 +1026,7 @@ module durable {
   action AdminCancel(w: int, tnow: int): bool = all {
     cancelOk(w),
     wakeParentsOk(cancelWrite(db, w), w),
-    commitAt(wakeParents(cancelWrite(db, w), w, "child_cancelled", tnow), proc, opRevoke(ghost, db, w), "AdminCancel", tnow),
+    commitAt(wakeParents(cancelWrite(db, w), w, "child_cancelled", tnow), proc, ghost, "AdminCancel", tnow),
   }
 
   //-------------------------------------------------------------- environment
@@ -1121,7 +1111,6 @@ module durable {
       nextHb: 1,
       lastIssuedWf: WF_IDS.mapBy(w => 0), lastIssuedAct: ACT_IDS.mapBy(a => 0), taskErrors: RUNTIMES.mapBy(r => 0),
       coordErrors: RUNTIMES.mapBy(r => 0), dispErrors: RUNTIMES.mapBy(r => 0),
-      opRevoked: WF_IDS.mapBy(w => 0), opTaskErrors: RUNTIMES.mapBy(r => 0),
     },
     prevWf' = WF_IDS.mapBy(w => "none"),
     prevAct' = ACT_IDS.mapBy(a => "none"),
@@ -1380,21 +1369,21 @@ module durable {
   // N1: T-X2 supersedes or returns only a row on the keyed row's own restart chain
   val inv_N1_tx2OwnLineage = not(ghost.tx2OutsideLineage)
 
-  // G1 (spec gap): an operator action never costs a runtime its restart budget. A pause or
-  // cancel of a running row makes its coordinator's T-C2/T-C3 miss the fence; FencedWrite is a
-  // task error that counts toward MAX_TASK_RESTARTS and never resets, so enough of them
-  // self-cancel the runtime (stoppedRt). Stated in its strong form: no operator-caused task error.
-  val inv_G1_noSelfCancelFromOperator = RUNTIMES.forall(r => ghost.opTaskErrors.get(r) == 0)
+  // G1 (fixed): an operator action never costs a runtime its restart budget. A pause or cancel
+  // of a running row makes its coordinator's T-C2/T-C3 miss the fence (CoordFenceMiss), which is
+  // not a task error. Stated in its strong form: the coordinator task never errors (LC1_NoEvent,
+  // its only remaining error, is excluded by S5).
+  val inv_G1_noSelfCancelFromOperator = RUNTIMES.forall(r => ghost.coordErrors.get(r) == 0)
 
   // conjunction of the invariants expected to hold. Checked separately: S17 (G7 under the
   // historical RR snapshot), S24 unrestricted (G2), S13 per topic (N2), S19 source terminal (N3),
-  // G1, G10, G11, N1.
+  // G10, G11, N1.
   val safety = and {
     inv_S1_wfLease, inv_S2_noStaleWfCommit, inv_S5_delivery, inv_S5_noEventError, inv_S6_wfTerminalAbsorbing,
     inv_S7_waitCoupling, inv_S8_activationBounded, inv_S9_actLease, inv_S10_noStaleActCommit,
     inv_S11_openAttempt, inv_S12_attemptsBounded, inv_S13_oneHandler, inv_S14_actTerminal,
     inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor,
-    inv_S23_childOnce, inv_S24_exceptTX2, inv_S25_cancelAtomic,
+    inv_S23_childOnce, inv_S24_exceptTX2, inv_S25_cancelAtomic, inv_G1_noSelfCancelFromOperator,
   }
   // safety plus S17 (expected to hold under READ COMMITTED)
   val safetyRc = safety and inv_S17_capAtClaim and inv_S17_capAlways
@@ -1407,8 +1396,7 @@ module durable {
   val wit_childSucceeded = not(WF_IDS.exists(w => db.events.get(w).exists(e => e.typ == "child_succeeded")))
   val wit_activitySucceeded = not(WF_IDS.exists(w => db.events.get(w).exists(e => e.typ == "activity_succeeded")))
   val wit_revivedLease = not(ghost.revivedExpiredLease)
-  val wit_coordFenceMiss = RUNTIMES.forall(r => ghost.taskErrors.get(r) == 0)
-  val wit_selfCancelled = RUNTIMES.forall(r => not(stoppedRt(ghost, r)))
+  val wit_coordFenceMiss = lastAction != "CoordFenceMiss"
   val wit_pausedActivity = not(ACT_IDS.exists(a => pausedOnAct(db, db.act.get(a).wf, a) and db.act.get(a).status == "pending"))
   val wit_reconciled = lastAction != "TW1_ReconcileRow"
   val wit_tw1Interleaved = not(RUNTIMES.exists(r => proc.tw1.get(r).phase != "idle")

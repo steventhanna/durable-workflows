@@ -162,3 +162,21 @@ async fn connection_last_insert_id(
         .get_result::<i64>(connection)
         .await?)
 }
+
+/// A deadlock (1213) or lock wait timeout (1205): the transaction was rolled
+/// back and retrying it later is safe. diesel-async maps neither code to a
+/// `DatabaseErrorKind` and keeps only the server message, so the message is
+/// matched (the server's `lc_messages` must be English, the default).
+pub(crate) fn is_transient_error(error: &DurableError) -> bool {
+    let DurableError::Database(diesel::result::Error::DatabaseError(kind, info)) = error else {
+        return false;
+    };
+    matches!(
+        kind,
+        diesel::result::DatabaseErrorKind::SerializationFailure
+    ) || {
+        let message = info.message();
+        message.starts_with("Deadlock found when trying to get lock")
+            || message.starts_with("Lock wait timeout exceeded")
+    }
+}

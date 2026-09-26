@@ -115,13 +115,9 @@ struct Workload {
 impl Workload {
     /// Some steps take a while; a few outlast the coordinator lease once, so
     /// another runtime recovers the workflow and the first one misses its fence.
-    /// Only steps that insert no row (`stale_ok`: Continue, Complete) outlast
-    /// it: a stale RunActivity / RunChild commit hits the recovering commit's
-    /// unique key before its fence (a known engine issue, reported with the
-    /// workload) and ends without a `CoordFenceMiss`.
-    async fn pace_step(&self, workflow: i64, sequence: u32, stale_ok: bool) {
+    async fn pace_step(&self, workflow: i64, sequence: u32) {
         let roll = mix(self.seed, workflow as u64, u64::from(sequence), SALT_PACE) % 100;
-        let delay = if roll < 10 && stale_ok {
+        let delay = if roll < 10 {
             let first = self
                 .slowed
                 .lock()
@@ -298,8 +294,7 @@ impl WorkflowHandler for WorkloadFlow {
         let workload = context.application();
         let workflow = context.workflow_id().map_or(0, WorkflowId::get);
         let roll = mix(workload.seed, workflow as u64, u64::from(state), SALT_FLOW);
-        let stale_ok = state >= MAX_COMMANDS || roll % 100 < 18 || roll % 100 > 77;
-        workload.pace_step(workflow, state, stale_ok).await;
+        workload.pace_step(workflow, state).await;
         if state >= MAX_COMMANDS {
             return Ok(WorkflowTransition::Complete { output: () });
         }

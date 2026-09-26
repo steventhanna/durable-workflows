@@ -91,7 +91,7 @@ Actions, one per committed transaction (T-W1: one per statement group):
 | `LC1_NoEvent` | L-C1 | no deliverable event after `delivered` → task error |
 | `TC2_Continue`, `TC2_Complete`, `TC2_RunActivity`, `TC2_RunChild` | T-C2 | fence `status=running ∧ leaseToken`; Continue, Complete (+ parent wake), RunActivity, RunChild (new, attach, attach-to-terminal + wake) |
 | `TC3_ActivationFailure` | T-C3 | fence; retry with backoff or fail when exhausted (+ parent wake) |
-| `CoordFenceMiss` | T-C2/T-C3 rollback | counts a task error (G1) |
+| `CoordFenceMiss` | T-C2/T-C3 rollback | logged by `activate_one`; not a task error (G1 fixed) |
 | `TW1_*` | T-W1 | simulation form: see the next table; replay form `TW1_Claim`; `TW1_Error` (G10) |
 | `TW2_Send` / `TW2_Commit` / `TW2_FenceMiss` / `TW2_Drop` | T-W2 | `now` sampled at send; commit fenced on `status, attemptCount, leaseToken` and open attempt, no expiry check; blocks on T-W1's row lock |
 | `HandlerReturn`, `LocalDeadline` | L-W | handler returns only before the local deadline; passing the deadline ends the execution without T-W3 |
@@ -377,8 +377,8 @@ All 39 pass (`durable_tests` 32, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `driftTwoHandlersTest` | DRIFT=2 | S13 fails when the process clock lags DB time. |
 | `reconcileReplayDelayTest`, `reconcileReplayEarlyRejectedTest` | RC | A replayed reconcile returns the row to pending at `availableAt` (the retry delay); an `availableAt` before `tnow` is rejected. |
 | `g10InvalidBoundsTest` | RC, `ENABLE_ENV_EDITS` | An external write gives a1 (topic t) invalid bounds; one `claim_batch` claims a2 on topic u, then `TW1_Error(2, 1, "invalid_bounds")` rolls it back: a2 stays pending, no execution, task error. `inv_G10_noClaimAbort` fails; `safety` holds. |
-| `pauseResumeTest`, `pauseTwiceRejectedTest`, `resumeNotPausedRejectedTest` | RC | T-A2/T-A3: pausing a claimed row clears its lease; the coordinator's commit misses the fence (operator-caused, `inv_G1_noSelfCancelFromOperator` fails); resume → `ready` at `tnow`. Pausing a paused row and resuming a non-paused row are not steps. |
-| `g1SelfCancelTest`, `g1StoppedRuntimeClaimsNothingTest`, `g1AppCancelNotOperatorTest` | RC, `MAX_TASK_RESTARTS = 1` | G1: two operator pauses during claims stop runtime 1 (`wit_selfCancelled`), which then claims nothing; an application cancel's fence miss is a task error but not operator-caused. |
+| `pauseResumeTest`, `pauseTwiceRejectedTest`, `resumeNotPausedRejectedTest` | RC | T-A2/T-A3: pausing a claimed row clears its lease; the coordinator's commit misses the fence, which is not a task error (`inv_G1_noSelfCancelFromOperator` holds); resume → `ready` at `tnow`. Pausing a paused row and resuming a non-paused row are not steps. |
+| `g1NoSelfCancelTest`, `g1RuntimeStillClaimsTest`, `g1AppCancelFenceMissTest` | RC, `MAX_TASK_RESTARTS = 1` | G1 (fixed): two operator pauses during claims leave runtime 1 up, and it claims again; an application cancel's fence miss is not a task error either. |
 | `n2PauseFreesSlotTest`, `pausedActivityNotClaimedTest` | RC | S36 + N2: pausing during a running activity sets it `pending` with `maxAttempts + 1` and closes the attempt; the paused handler still executes while r2 claims the cap-1 slot (`inv_S13_topicConcurrency` fails); its finish misses the fence; resume → `waiting_activity`. A paused workflow's activity is not claimable. |
 | `pausedParentWokenTest`, `pausedParentResumesWaitingTest` | RC | A paused parent gets its child's outcome and stays paused (wait cleared), then resumes to `ready`; resumed before the child ends → `waiting_child`. |
 | `g11AdminCancelTest`, `adminCancelPausedTest` | RC | G11 through the operator cancel; admin cancel of a paused workflow cancels its pending activity. |
@@ -395,7 +395,7 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 
 | Instance | Property | Expected | Result |
 |---|---|---|---|
-| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity, S14-S16, S18, S19, S23, S24 except T-X2, S25) | hold | no violation |
+| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity, S14-S16, S18, S19, S23, S24 except T-X2, S25, G1) | hold | no violation |
 | `durable_mc` | `safetyRc` (= `safety` + S17 at claim and between commits) | hold | no violation |
 | `durable_mc` | `inv_S24_exceptTX2` | hold | no violation |
 | `durable_mc_act` | `safetyRc` | hold | no violation |
@@ -407,7 +407,6 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 | `durable_mc` | `inv_G11_cancelReachesChildren` | violate | violated (11 states) |
 | `durable_mc` | `inv_N1_tx2OwnLineage` (N1) | violate | violated (24 states; first time found by simulation) |
 | `durable_mc` | `inv_S19_sourceTerminal` (N3) | violate | violated (3 states) |
-| `durable_mc` | `inv_G1_noSelfCancelFromOperator` (G1, interface v4) | violate | violated at 2,000 samples (7 states: claim, `AdminPause`, `CoordFenceMiss`) |
 | `durable_mc` | `inv_S24_parentWakes` (G2) | violate | not found at 40 or 80 steps; found by `g2StrandedParentTest` |
 | `durable_mc`, `durable_mc_act` | `inv_S13_topicConcurrency` (N2) | violate | not found at 40 (or 80) steps; found by `n2CancelFreesSlotTest` |
 | `durable_mc_drift` | `inv_S13_oneHandler` | violate | not found at 40 or 80 steps; found by `driftTwoHandlersTest` |
@@ -446,7 +445,7 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 
 | Gap | Status in this model | Evidence |
 |---|---|---|
-| G1 (operator pause/cancel during a claim costs the restart budget) | Reproduces: the fence miss is an operator-caused task error; with `MAX_TASK_RESTARTS = 1` two of them stop the runtime | `pauseResumeTest`, `g1SelfCancelTest`, simulation; both recorded G1 gap tests (`inv_G1_noSelfCancelFromOperator`) |
+| G1 (operator pause/cancel during a claim costs the restart budget) | **Fixed**: `CoordFenceMiss` is not a task error; `inv_G1_noSelfCancelFromOperator` (the coordinator never errors) is part of `safety` | `pauseResumeTest`, `g1NoSelfCancelTest`, `g1RuntimeStillClaimsTest`, `g1AppCancelFenceMissTest`, simulation; the G1 gap tests' traces pass |
 | G2 (T-X2 strands the parent) | Reproduces, unchanged | `g2StrandedParentTest` |
 | G4 (stale `sequence`) | Not modeled; closed for library transactions by READ COMMITTED per INVARIANTS.md | — |
 | G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 4; `g7CapExceededTest` (RR) |

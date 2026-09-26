@@ -1,4 +1,12 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    future::Future,
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, NullableExpressionMethods, OptionalExtension,
@@ -32,6 +40,10 @@ pub struct CoordinatorConfig {
     pub activation_retry_policy: RetryPolicy,
     pub max_consecutive_continuations: u32,
     pub continuation_delay: Duration,
+    /// Longest a workflow `step` may run. A step that exceeds it, or panics,
+    /// is a bounded activation failure (T-C3). Defaults to the default
+    /// `lease_duration` (30 s).
+    pub step_timeout: Duration,
 }
 
 impl Default for CoordinatorConfig {
@@ -46,6 +58,7 @@ impl Default for CoordinatorConfig {
             }),
             max_consecutive_continuations: 16,
             continuation_delay: Duration::from_millis(100),
+            step_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -93,6 +106,7 @@ where
             || config.max_activation_attempts == 0
             || config.max_consecutive_continuations == 0
             || config.continuation_delay.is_zero()
+            || config.step_timeout.is_zero()
         {
             return Err(DurableError::InvalidDefinition(
                 "coordinator identity and bounds must be non-zero".to_string(),
@@ -108,15 +122,34 @@ where
         })
     }
 
+    /// Claims one workflow and activates it. A claim that lost its fence, or
+    /// a transient database error, is not an error here (see
+    /// [`Self::activate_claim`]): the activation is logged and skipped.
     pub async fn activate_one(&self) -> Result<Option<WorkflowId>, DurableError> {
         let Some(claim) = self.claim_one().await? else {
             return Ok(None);
         };
         let workflow_id = claim.workflow_id()?;
-        self.activate_claim(claim).await?;
+        match self.activate_claim(claim).await {
+            Err(error) if is_benign_activation_error(&error) => {
+                tracing::warn!(
+                    workflow_id = workflow_id.get(),
+                    error = %error,
+                    "workflow activation rolled back; the row is left to its new owner or to lease recovery"
+                );
+            }
+            result => {
+                result?;
+            }
+        }
         Ok(Some(workflow_id))
     }
 
+    /// Runs one step for `claim` and commits its transition (T-C2), or
+    /// records an activation failure (T-C3) when the step fails, panics or
+    /// exceeds `step_timeout`. Returns `FencedWrite` when the claim lost its
+    /// fence: an operator paused or cancelled the workflow, or its lease
+    /// expired and another coordinator recovered it.
     pub async fn activate_claim(&self, claim: WorkflowClaim) -> Result<WorkflowId, DurableError> {
         let workflow_id = claim.workflow_id()?;
         let lease_fingerprint = lease_fingerprint(&claim.lease_token);
@@ -161,19 +194,30 @@ where
             )));
         };
 
-        match self
-            .registry
-            .step_stored(
-                &claim.row.kind,
-                claim.row.version,
-                self.context.as_ref(),
-                Some(workflow_id),
-                &claim.row.input_json,
-                &claim.row.state_json,
-                decode_event(&event)?,
-            )
-            .await
-        {
+        let event_input = decode_event(&event)?;
+        let step = CatchUnwind(Box::pin(self.registry.step_stored(
+            &claim.row.kind,
+            claim.row.version,
+            self.context.as_ref(),
+            Some(workflow_id),
+            &claim.row.input_json,
+            &claim.row.state_json,
+            event_input,
+        )));
+        let stepped = match tokio::time::timeout(self.config.step_timeout, step).await {
+            Ok(Ok(stepped)) => stepped,
+            Ok(Err(payload)) => {
+                let message = format!("step panicked: {}", panic_message(&*payload));
+                self.record_activation_failure(&claim, &message).await?;
+                return Ok(workflow_id);
+            }
+            Err(_) => {
+                self.record_activation_failure(&claim, "step exceeded step_timeout")
+                    .await?;
+                return Ok(workflow_id);
+            }
+        };
+        match stepped {
             Ok(transition) => {
                 if let StoredTransition::RunChild { child, .. } = &transition {
                     if !self.registry.contains(child.kind(), child.version()) {
@@ -732,6 +776,7 @@ async fn commit_wait_transition(
             approval_json,
             expires_at_millis,
         } => {
+            lock_fence(connection, claim).await?;
             let approval_id = crate::dialect::insert_approval(
                 connection,
                 NewApprovalRow {
@@ -813,6 +858,7 @@ async fn commit_activity(
     } else {
         now
     };
+    lock_fence(connection, claim).await?;
     let activity_id = crate::dialect::insert_activity(
         connection,
         NewActivityRow {
@@ -915,6 +961,18 @@ async fn commit_child(
         root_workflow_id,
     )
     .await?;
+    // Lock an existing child before the parent: its terminal transaction locks
+    // the child and then its waiting parents, so the reverse order deadlocks
+    // (G9). The lock is held to commit, so the status read here stays current
+    // until the parent's wait is visible. A new child needs no lock: no other
+    // transaction sees it yet. The parent's fence is therefore not taken
+    // first here; `insert_child` never fails on the auto key's duplicate, so
+    // a stale claim still ends in `FencedWrite` below.
+    let existing = if outcome.inserted {
+        None
+    } else {
+        Some(persistence::find_workflow_by_id_for_update(connection, outcome.workflow_id).await?)
+    };
     let changed = diesel::update(fenced_workflow!(claim))
         .set((
             durable_workflow::state_json.eq(state_json),
@@ -958,12 +1016,7 @@ async fn commit_child(
         now,
     )
     .await?;
-    if !outcome.inserted {
-        // Lock + current-read the child after establishing the parent wait so a
-        // concurrent terminal commit cannot wake with no waiters while an
-        // earlier unlocked read still looks non-terminal.
-        let existing =
-            persistence::find_workflow_by_id_for_update(connection, outcome.workflow_id).await?;
+    if let Some(existing) = existing {
         let terminal_outcome = match existing.status {
             WorkflowStatus::Succeeded => Some(Ok(existing
                 .result_json
@@ -1067,6 +1120,54 @@ fn declare_workflow_claim(
             }),
         )
     });
+}
+
+/// Locks the claimed row under its fence before a T-C2 path inserts a command
+/// row. A stale claim then gets `FencedWrite`, not a unique-key error from the
+/// command the recovering claim already inserted (N4).
+async fn lock_fence(
+    connection: &mut crate::DurableConnection,
+    claim: &WorkflowClaim,
+) -> Result<(), DurableError> {
+    fenced_workflow!(claim)
+        .for_update()
+        .select(durable_workflow::id)
+        .first::<i64>(connection)
+        .await
+        .optional()?
+        .ok_or(DurableError::FencedWrite)
+        .map(|_| ())
+}
+
+/// A T-C2/T-C3 outcome that is not a coordinator error: the fence was lost
+/// (an operator action or lease recovery moved the row on), or a transient
+/// database error rolled the transaction back.
+fn is_benign_activation_error(error: &DurableError) -> bool {
+    matches!(error, DurableError::FencedWrite) || crate::dialect::is_transient_error(error)
+}
+
+/// Resolves to `Err(payload)` when polling the inner future panics.
+struct CatchUnwind<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 fn ensure_fenced(changed: usize) -> Result<(), DurableError> {

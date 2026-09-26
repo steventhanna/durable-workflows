@@ -2,7 +2,6 @@
 # invariant each one violates. `durable-trace gen --expect-violation` reads this;
 # trace-check.sh requires the final state of each matching trace to violate it.
 # Keys are globs over the test name (or its last `::` segment). The first match wins.
-g1_*: inv_G1_noSelfCancelFromOperator
 g2_*: inv_S24_parentWakes
 g10_*: inv_G10_noClaimAbort
 g11_*: inv_G11_cancelReachesChildren

@@ -19,9 +19,9 @@ use durable_workflows::{
     persistence::{database_now_millis, find_workflow_by_id, WorkflowRow},
     schema::{durable_activity, durable_workflow},
     ActivityContext, ActivityError, ActivityHandler, ActivityRegistry, ActivityTopic,
-    ActivityWorker, CoordinatorConfig, DurableActivity, DurableFlow, DurablePool, DurableRuntime,
-    DurableStore, DurableWorkflow, RetryPolicy, RuntimeConfig, StartOptions, TopicRegistry, WfCtx,
-    WfError, WorkerConfig, WorkflowCoordinator, WorkflowId, WorkflowRegistry,
+    ActivityWorker, CoordinatorConfig, DurableActivity, DurableError, DurableFlow, DurablePool,
+    DurableRuntime, DurableStore, DurableWorkflow, RetryPolicy, RuntimeConfig, StartOptions,
+    TopicRegistry, WfCtx, WfError, WorkerConfig, WorkflowCoordinator, WorkflowId, WorkflowRegistry,
 };
 use tokio::sync::Semaphore;
 
@@ -159,6 +159,17 @@ gap_flow!(G1Gated { gated: bool }, "gap_g1_gated", 1, |this, ctx| {
     Ok(())
 });
 
+gap_flow!(G1GatedPanic {}, "gap_g1_gated_panic", 1, |_this, ctx| {
+    ctx.application().entered.add_permits(1);
+    ctx.application()
+        .release
+        .acquire()
+        .await
+        .expect("release semaphore is open")
+        .forget();
+    panic!("step fails after the operator cancel");
+});
+
 gap_flow!(G2Child {}, "gap_g2_child", 1, |_this, ctx| {
     ctx.run(&G2FailingActivity).await
 });
@@ -169,6 +180,11 @@ gap_flow!(G2Parent {}, "gap_g2_parent", 1, |_this, ctx| {
 
 gap_flow!(G3Panic {}, "gap_g3_panic", 1, |_this, _ctx| {
     panic!("poison-pill step");
+});
+
+gap_flow!(G3Hang {}, "gap_g3_hang", 1, |_this, _ctx| {
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    Ok(())
 });
 
 gap_flow!(G4Child {}, "gap_g4_child", 1, |_this, _ctx| Ok(()));
@@ -200,6 +216,28 @@ gap_flow!(G10Flow { topic_b: bool }, "gap_g10_flow", 1, |this, ctx| {
     }
 });
 
+gap_flow!(N4Gated {}, "gap_n4_gated", 1, |_this, ctx| {
+    ctx.application().entered.add_permits(1);
+    ctx.application()
+        .release
+        .acquire()
+        .await
+        .expect("release semaphore is open")
+        .forget();
+    ctx.run(&G10ActivityA).await
+});
+
+gap_flow!(N4GatedChild {}, "gap_n4_gated_child", 1, |_this, ctx| {
+    ctx.application().entered.add_permits(1);
+    ctx.application()
+        .release
+        .acquire()
+        .await
+        .expect("release semaphore is open")
+        .forget();
+    ctx.child(&G4Child {}).await
+});
+
 gap_flow!(G11Child {}, "gap_g11_child", 1, |_this, ctx| {
     ctx.run(&G11UnservedActivity).await
 });
@@ -213,9 +251,11 @@ fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
         durable_workflows::register_durable_workflows!(
             GapContext;
             G1Gated,
+            G1GatedPanic,
             G2Child,
             G2Parent,
             G3Panic,
+            G3Hang,
             G4Child,
             G4Parent,
             G6ChildV1,
@@ -224,6 +264,8 @@ fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
             G6ParentOfV2,
             G8SelfKeyed,
             G10Flow,
+            N4Gated,
+            N4GatedChild,
             G11Child,
             G11Parent
         )
@@ -507,7 +549,6 @@ async fn g11_parent_cancellation_cancels_child_workflow() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "confirms G1: activate_one returns Err(FencedWrite) when an operator pauses the workflow during its step"]
 async fn g1_pause_during_step_is_not_a_coordinator_error() {
     let Some(pool) = support::fresh_pool().await else {
         return;
@@ -548,7 +589,6 @@ async fn g1_pause_during_step_is_not_a_coordinator_error() {
 }
 
 #[tokio::test]
-#[ignore = "confirms G1: two operator pauses during steps exhaust max_task_restarts=1 and the runtime stops processing"]
 async fn g1_repeated_operator_pauses_do_not_stop_the_runtime() {
     let Some(pool) = support::fresh_pool_with_max_size(8).await else {
         return;
@@ -619,6 +659,180 @@ async fn g1_repeated_operator_pauses_do_not_stop_the_runtime() {
         probe_status == "succeeded" && !stopped,
         "runtime stopped after benign operator pauses: probe status {probe_status}, \
          runtime completed {stopped}, task errors {errors:?}"
+    );
+}
+
+/// T-C3's fence miss: the step fails (here, panics) after an operator cancel.
+#[tokio::test]
+async fn g1_activation_failure_after_operator_cancel_is_not_a_coordinator_error() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let workflow_id = DurableStore::new(pool.clone())
+        .start(&G1GatedPanic {}, StartOptions::default())
+        .await
+        .expect("workflow starts")
+        .workflow_id;
+    let coordinator = Arc::new(coordinator(
+        &pool,
+        context.clone(),
+        CoordinatorConfig::default(),
+    ));
+    let activation = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.activate_one().await }
+    });
+    context
+        .entered
+        .acquire()
+        .await
+        .expect("entered semaphore")
+        .forget();
+    control(&pool)
+        .cancel_workflow(workflow_id, &operator("cancel during step"))
+        .await
+        .expect("cancel accepts a running workflow");
+    context.release.add_permits(1);
+    let outcome = activation.await.expect("activation task joins");
+    let row = load(&pool, workflow_id).await;
+    assert_eq!(row.status.as_str(), "cancelled");
+    assert_eq!(row.activation_attempts, 0);
+    assert_eq!(
+        outcome.expect("a fenced T-C3 after an operator cancel is not a coordinator error"),
+        Some(workflow_id)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N4
+// ---------------------------------------------------------------------------
+
+/// A stale coordinator's workflow is recovered and advanced by another
+/// coordinator (`wait` is the wait kind the command leaves), then the stale
+/// one commits the same command. Returns the stale commit's outcome after
+/// checking the recovering commit is intact and was not duplicated.
+async fn n4_stale_commit<W>(flow: &W, wait: &str) -> Option<Result<WorkflowId, DurableError>>
+where
+    W: durable_workflows::WorkflowHandler,
+{
+    let pool = support::fresh_pool().await?;
+    let workflow_id = DurableStore::new(pool.clone())
+        .start(flow, StartOptions::default())
+        .await
+        .expect("workflow starts")
+        .workflow_id;
+    let stale_context = Arc::new(GapContext::default());
+    let stale = Arc::new(
+        WorkflowCoordinator::new(
+            pool.clone(),
+            stale_context.clone(),
+            workflows(),
+            activities(),
+            "n4-stale-coordinator",
+            CoordinatorConfig {
+                lease_duration: Duration::from_millis(300),
+                ..CoordinatorConfig::default()
+            },
+        )
+        .expect("coordinator is valid"),
+    );
+    let claim = stale
+        .claim_one()
+        .await
+        .expect("claim succeeds")
+        .expect("workflow is claimed");
+    let activation = tokio::spawn({
+        let stale = stale.clone();
+        async move { stale.activate_claim(claim).await }
+    });
+    stale_context
+        .entered
+        .acquire()
+        .await
+        .expect("entered semaphore")
+        .forget();
+
+    wait_until("the stale claim's lease to expire", || async {
+        let row = load(&pool, workflow_id).await;
+        let mut connection = pool.get().await.expect("test connection");
+        let now = database_now_millis(&mut connection)
+            .await
+            .expect("database clock");
+        row.lease_expires_at.is_some_and(|expiry| expiry < now)
+    })
+    .await;
+    let recovering_context = Arc::new(GapContext::default());
+    recovering_context.release.add_permits(1);
+    let recovering = WorkflowCoordinator::new(
+        pool.clone(),
+        recovering_context,
+        workflows(),
+        activities(),
+        "n4-recovering-coordinator",
+        CoordinatorConfig::default(),
+    )
+    .expect("coordinator is valid");
+    assert_eq!(
+        recovering
+            .activate_one()
+            .await
+            .expect("recovering coordinator commits"),
+        Some(workflow_id)
+    );
+    let recovered = load(&pool, workflow_id).await;
+    assert_eq!(recovered.wait_kind.as_deref(), Some(wait));
+
+    stale_context.release.add_permits(1);
+    let outcome = activation.await.expect("activation task joins");
+    let row = load(&pool, workflow_id).await;
+    assert_eq!(row.status, recovered.status);
+    assert_eq!(row.wait_reference_id, recovered.wait_reference_id);
+    let mut connection = pool.get().await.expect("test connection");
+    let commands = if wait == "activity" {
+        durable_activity::table
+            .filter(durable_activity::workflow_id.eq(workflow_id.get()))
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+    } else {
+        durable_workflow::table
+            .filter(durable_workflow::parent_workflow_id.eq(workflow_id.get()))
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+    }
+    .expect("command count");
+    assert_eq!(
+        commands, 1,
+        "the stale commit duplicated the {wait} command"
+    );
+    Some(outcome)
+}
+
+/// N4: before the fix the stale RunActivity insert hit the recovering
+/// commit's `uq_durable_activity_command` (a database error, no fence miss).
+#[tokio::test]
+async fn n4_stale_run_activity_commit_is_a_fence_miss() {
+    let Some(outcome) = n4_stale_commit(&N4Gated {}, "activity").await else {
+        return;
+    };
+    assert!(
+        matches!(outcome, Err(DurableError::FencedWrite)),
+        "a stale RunActivity commit must miss its fence: {outcome:?}"
+    );
+}
+
+/// The RunChild path: `insert_child` resolves the auto key to the recovering
+/// commit's child, so the stale commit reaches its fence.
+#[tokio::test]
+async fn n4_stale_run_child_commit_is_a_fence_miss() {
+    let Some(outcome) = n4_stale_commit(&N4GatedChild {}, "child").await else {
+        return;
+    };
+    assert!(
+        matches!(outcome, Err(DurableError::FencedWrite)),
+        "a stale RunChild commit must miss its fence: {outcome:?}"
     );
 }
 
@@ -962,6 +1176,93 @@ async fn g3_panicking_step_is_bounded_by_activation_attempts() {
          activation_attempts {}",
         row.status.as_str(),
         row.activation_attempts
+    );
+}
+
+/// Activates `workflow_id` until it fails, waiting out the activation retry
+/// backoff (1 s) between attempts. Each activation must return promptly.
+async fn activate_until_failed(
+    pool: &DurablePool,
+    coordinator: &WorkflowCoordinator<GapContext>,
+    workflow_id: WorkflowId,
+) -> (usize, WorkflowRow) {
+    let started = tokio::time::Instant::now();
+    let mut activations = 0;
+    loop {
+        let row = load(pool, workflow_id).await;
+        if row.status.as_str() == "failed" {
+            return (activations, row);
+        }
+        assert!(
+            started.elapsed() < CONDITION_TIMEOUT,
+            "the step never failed its activations: status {}, activation_attempts {}",
+            row.status.as_str(),
+            row.activation_attempts
+        );
+        let activation = tokio::time::timeout(Duration::from_secs(5), coordinator.activate_one())
+            .await
+            .expect("the coordinator is not blocked by the step")
+            .expect("activation is not a coordinator error");
+        if activation.is_some() {
+            activations += 1;
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn g3_panicking_step_fails_at_the_activation_cap() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let workflow_id = DurableStore::new(pool.clone())
+        .start(&G3Panic {}, StartOptions::default())
+        .await
+        .expect("workflow starts")
+        .workflow_id;
+    let coordinator = coordinator(
+        &pool,
+        Arc::new(GapContext::default()),
+        CoordinatorConfig {
+            max_activation_attempts: 2,
+            ..CoordinatorConfig::default()
+        },
+    );
+    let (activations, row) = activate_until_failed(&pool, &coordinator, workflow_id).await;
+    assert_eq!(activations, 2);
+    assert_eq!(row.activation_attempts, 2);
+    assert_eq!(
+        row.error_message.as_deref(),
+        Some("step panicked: poison-pill step")
+    );
+}
+
+#[tokio::test]
+async fn g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let workflow_id = DurableStore::new(pool.clone())
+        .start(&G3Hang {}, StartOptions::default())
+        .await
+        .expect("workflow starts")
+        .workflow_id;
+    let coordinator = coordinator(
+        &pool,
+        Arc::new(GapContext::default()),
+        CoordinatorConfig {
+            max_activation_attempts: 2,
+            step_timeout: Duration::from_millis(100),
+            ..CoordinatorConfig::default()
+        },
+    );
+    let (activations, row) = activate_until_failed(&pool, &coordinator, workflow_id).await;
+    assert_eq!(activations, 2);
+    assert_eq!(row.activation_attempts, 2);
+    assert_eq!(
+        row.error_message.as_deref(),
+        Some("step exceeded step_timeout")
     );
 }
 

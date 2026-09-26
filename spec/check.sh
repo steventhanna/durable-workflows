@@ -45,11 +45,10 @@ run durable_mc inv_N1_tx2OwnLineage violate       # N1
 run durable_mc inv_S13_topicConcurrency violate   # N2
 run durable_mc_act inv_S13_topicConcurrency violate
 run durable_mc inv_S19_sourceTerminal violate     # N3
-run durable_mc inv_G1_noSelfCancelFromOperator violate  # G1: operator pause/cancel during a claim
 run durable_mc_drift inv_S13_oneHandler violate   # S13 clock assumption
 # witnesses (non-vacuity; expected to be violated)
 for w in wit_S3_concurrentStep wit_blocked wit_childSucceeded wit_activitySucceeded wit_revivedLease \
-         wit_coordFenceMiss wit_reconciled wit_tw1Interleaved wit_selfCancelled wit_pausedActivity; do
+         wit_coordFenceMiss wit_reconciled wit_tw1Interleaved wit_pausedActivity; do
   run durable_mc "$w" violate
 done
 # deeper runs for properties whose traces need more steps now that T-W1 takes ~5 steps

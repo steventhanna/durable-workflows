@@ -45,6 +45,12 @@ production on MySQL since August 2026.
 - `docs/INVARIANTS.md` (protocol invariants), a Quint model of the core
   protocol in `spec/`, and reproduction tests for the known gaps in
   `tests/gaps.rs`.
+- `CoordinatorConfig::step_timeout` (default 30 s, the default lease;
+  must be non-zero): the longest a workflow `step` may run before the
+  activation fails.
+- `RuntimeConfig::restart_window` (default 10 minutes; must be non-zero):
+  `max_task_restarts` now counts restarts of one task within this window,
+  not over the process lifetime.
 
 ### Changed
 
@@ -73,9 +79,30 @@ Compared with the production-internal version it was extracted from:
 
 - `persistence::connection_last_insert_id`.
 
+### Fixed
+
+- G1: a coordinator commit that loses its fence (an operator paused or
+  cancelled the workflow during its step, or another runtime recovered it)
+  or hits a transient database error (deadlock, serialization failure, lock
+  wait timeout) is logged by `activate_one` and no longer ends the
+  coordinator task or uses up the runtime's restart budget.
+  `WorkflowCoordinator::activate_claim` still returns the error. The
+  activity dispatcher retries after a transient `claim_batch` error, and the
+  restart budget counts within `RuntimeConfig::restart_window`.
+- G3: a `step` that panics or exceeds `step_timeout` is an activation
+  failure, so the workflow fails after its activation attempts instead of
+  stopping every runtime that claims it. A `panic = "abort"` build still
+  aborts.
+- G9: a parent that attaches to an existing child workflow locks the child
+  before itself, the order the child's completion uses, so the two no
+  longer deadlock.
+- N4: a stale coordinator committing `RunActivity` or `WaitForApproval` for
+  a workflow another runtime already recovered and advanced now gets
+  `FencedWrite` instead of a duplicate-key database error.
+
 ### Known issues
 
-The confirmed protocol gaps G1, G2, G3, G6, G8, G10, G11, N1 and N2 have
+The confirmed protocol gaps G2, G6, G8, G10, G11, N1 and N2 have
 ignored reproduction tests in `durable-workflows/tests/gaps.rs` and reproduce
 on both backends. See the "Known issues" section of the README and
 `docs/INVARIANTS.md` §6.
