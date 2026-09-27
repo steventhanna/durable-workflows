@@ -64,21 +64,75 @@ impl Default for CoordinatorConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct WorkflowClaim {
+struct ClaimedRow {
     row: WorkflowRow,
     lease_token: String,
 }
 
-impl WorkflowClaim {
-    pub fn workflow_id(&self) -> Result<WorkflowId, DurableError> {
+impl ClaimedRow {
+    fn workflow_id(&self) -> Result<WorkflowId, DurableError> {
         WorkflowId::new(self.row.id)
-    }
-
-    pub fn lease_token(&self) -> &str {
-        &self.lease_token
     }
 }
 
+/// One workflow leased by a [`WorkflowCoordinator`] (T-C1), not yet
+/// activated.
+///
+/// The claim mutably borrows its coordinator, so a coordinator holds at most
+/// one outstanding workflow claim: a second [`WorkflowCoordinator::claim_one`]
+/// while this claim is alive does not compile. This is the model's
+/// one-claim-per-runtime rule (`TC1_Claim`). Consume the claim with
+/// [`Self::activate`]. Dropping it releases nothing: the row stays `running`
+/// until its lease expires and lease recovery reclaims it.
+#[must_use = "an unused claim holds its lease until it expires"]
+pub struct WorkflowClaim<'a, C> {
+    coordinator: &'a mut WorkflowCoordinator<C>,
+    claimed: ClaimedRow,
+}
+
+impl<C> std::fmt::Debug for WorkflowClaim<'_, C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowClaim")
+            .field("worker_id", &self.coordinator.worker_id)
+            .field("row", &self.claimed.row)
+            .field("lease_token", &self.claimed.lease_token)
+            .finish()
+    }
+}
+
+impl<C> WorkflowClaim<'_, C> {
+    pub fn workflow_id(&self) -> Result<WorkflowId, DurableError> {
+        self.claimed.workflow_id()
+    }
+
+    pub fn lease_token(&self) -> &str {
+        &self.claimed.lease_token
+    }
+}
+
+impl<C> WorkflowClaim<'_, C>
+where
+    C: Send + Sync + 'static,
+{
+    /// Runs one step for this claim and commits its transition (T-C2), or
+    /// records an activation failure (T-C3) when the step fails, panics or
+    /// exceeds `step_timeout`. Returns `FencedWrite` when the claim lost its
+    /// fence: an operator paused or cancelled the workflow, or its lease
+    /// expired and another coordinator recovered it.
+    pub async fn activate(self) -> Result<WorkflowId, DurableError> {
+        self.coordinator.activate_claimed(self.claimed).await
+    }
+}
+
+/// Claims and activates workflows (T-C1..T-C3) under one worker id.
+///
+/// A coordinator holds at most one outstanding claim: [`Self::claim_one`]
+/// takes `&mut self` and the returned [`WorkflowClaim`] borrows the
+/// coordinator until it is activated or dropped. Map one worker id to one
+/// coordinator. Extra coordinators under the same id stay safe, because every
+/// write is fenced by the claim's own lease token, but the trace checker maps
+/// a worker id to one model runtime, and a model runtime holds one claim.
 pub struct WorkflowCoordinator<C> {
     pool: DurablePool,
     context: Arc<C>,
@@ -124,13 +178,13 @@ where
 
     /// Claims one workflow and activates it. A claim that lost its fence, or
     /// a transient database error, is not an error here (see
-    /// [`Self::activate_claim`]): the activation is logged and skipped.
-    pub async fn activate_one(&self) -> Result<Option<WorkflowId>, DurableError> {
-        let Some(claim) = self.claim_one().await? else {
+    /// [`WorkflowClaim::activate`]): the activation is logged and skipped.
+    pub async fn activate_one(&mut self) -> Result<Option<WorkflowId>, DurableError> {
+        let Some(claimed) = self.claim_row().await? else {
             return Ok(None);
         };
-        let workflow_id = claim.workflow_id()?;
-        match self.activate_claim(claim).await {
+        let workflow_id = claimed.workflow_id()?;
+        match self.activate_claimed(claimed).await {
             Err(error) if is_benign_activation_error(&error) => {
                 tracing::warn!(
                     workflow_id = workflow_id.get(),
@@ -145,12 +199,7 @@ where
         Ok(Some(workflow_id))
     }
 
-    /// Runs one step for `claim` and commits its transition (T-C2), or
-    /// records an activation failure (T-C3) when the step fails, panics or
-    /// exceeds `step_timeout`. Returns `FencedWrite` when the claim lost its
-    /// fence: an operator paused or cancelled the workflow, or its lease
-    /// expired and another coordinator recovered it.
-    pub async fn activate_claim(&self, claim: WorkflowClaim) -> Result<WorkflowId, DurableError> {
+    async fn activate_claimed(&self, claim: ClaimedRow) -> Result<WorkflowId, DurableError> {
         let workflow_id = claim.workflow_id()?;
         let lease_fingerprint = lease_fingerprint(&claim.lease_token);
         let span = tracing::info_span!(
@@ -166,7 +215,7 @@ where
         self.activate_claim_inner(claim).instrument(span).await
     }
 
-    async fn activate_claim_inner(&self, claim: WorkflowClaim) -> Result<WorkflowId, DurableError> {
+    async fn activate_claim_inner(&self, claim: ClaimedRow) -> Result<WorkflowId, DurableError> {
         let workflow_id = claim.workflow_id()?;
         let mut connection = self.pool.get().await?;
         let event = persistence::next_delivery_event(
@@ -281,7 +330,18 @@ where
         Ok(workflow_id)
     }
 
-    pub async fn claim_one(&self) -> Result<Option<WorkflowClaim>, DurableError> {
+    /// Leases one ready workflow, or recovers one whose lease expired (T-C1).
+    /// The returned claim borrows this coordinator until it is activated or
+    /// dropped, so a coordinator holds at most one outstanding claim.
+    pub async fn claim_one(&mut self) -> Result<Option<WorkflowClaim<'_, C>>, DurableError> {
+        let claimed = self.claim_row().await?;
+        Ok(claimed.map(|claimed| WorkflowClaim {
+            coordinator: self,
+            claimed,
+        }))
+    }
+
+    async fn claim_row(&self) -> Result<Option<ClaimedRow>, DurableError> {
         let lease_duration_millis = duration_millis(self.config.lease_duration)?;
         let worker_id = self.worker_id.clone();
         let local_definitions = self.registry.definition_keys();
@@ -457,14 +517,14 @@ where
             row.status = WorkflowStatus::Running;
             row.lease_token = Some(lease_token.clone());
             row.lease_expires_at = Some(lease_expires_at);
-            Ok(Some(WorkflowClaim { row, lease_token }))
+            Ok(Some(ClaimedRow { row, lease_token }))
         })
         .await
     }
 
     async fn commit_transition(
         &self,
-        claim: WorkflowClaim,
+        claim: ClaimedRow,
         event: WorkflowEventRow,
         transition: StoredTransition,
     ) -> Result<(), DurableError> {
@@ -503,7 +563,7 @@ where
 
     async fn record_activation_failure(
         &self,
-        claim: &WorkflowClaim,
+        claim: &ClaimedRow,
         message: &str,
     ) -> Result<(), DurableError> {
         let mut connection = self.pool.get().await?;
@@ -611,7 +671,7 @@ where
 
 async fn commit_on_connection(
     connection: &mut crate::DurableConnection,
-    claim: &WorkflowClaim,
+    claim: &ClaimedRow,
     event: &WorkflowEventRow,
     transition: StoredTransition,
     config: CoordinatorConfig,
@@ -732,7 +792,7 @@ async fn commit_on_connection(
 
 async fn commit_wait_transition(
     connection: &mut crate::DurableConnection,
-    claim: &WorkflowClaim,
+    claim: &ClaimedRow,
     delivered: i32,
     transition: StoredTransition,
     now: i64,
@@ -844,7 +904,7 @@ async fn commit_wait_transition(
 
 async fn commit_activity(
     connection: &mut crate::DurableConnection,
-    claim: &WorkflowClaim,
+    claim: &ClaimedRow,
     delivered: i32,
     command: i32,
     state_json: String,
@@ -938,7 +998,7 @@ async fn commit_activity(
 
 async fn commit_child(
     connection: &mut crate::DurableConnection,
-    claim: &WorkflowClaim,
+    claim: &ClaimedRow,
     delivered: i32,
     command: i32,
     state_json: String,
@@ -955,12 +1015,24 @@ async fn commit_child(
     let outcome = crate::DurableStore::insert_child(
         connection,
         &child,
-        deduplication_key,
+        deduplication_key.clone(),
         parent_id,
         command,
         root_workflow_id,
     )
     .await?;
+    // G8: waiting on the caller or an ancestor never ends. This check runs
+    // before `commit_child` takes a lock of its own. For the caller's own key, the keyed row that
+    // `insert_child` locked is the caller's row, so the transaction holds one
+    // row lock when it rolls back: no second lock, no wait. For an ancestor's
+    // key, only the ancestor's generations are locked; the caller's row is not
+    // locked until the fenced update below, which this path never reaches.
+    if !outcome.inserted && is_caller_or_ancestor(connection, claim, outcome.workflow_id).await? {
+        return Err(DurableError::InvalidDefinition(format!(
+            "child key {deduplication_key} resolves to workflow {}, which is the caller or an ancestor",
+            outcome.workflow_id.get()
+        )));
+    }
     // Lock an existing child before the parent: its terminal transaction locks
     // the child and then its waiting parents, so the reverse order deadlocks
     // (G9). The lock is held to commit, so the status read here stays current
@@ -1053,6 +1125,32 @@ async fn commit_child(
     Ok(())
 }
 
+/// Whether `target` is the claimed workflow or on its `parent_workflow_id`
+/// chain. A parent exists before its child, so the chain ends.
+async fn is_caller_or_ancestor(
+    connection: &mut crate::DurableConnection,
+    claim: &ClaimedRow,
+    target: WorkflowId,
+) -> Result<bool, DurableError> {
+    let target = target.get();
+    let mut current = Some(claim.row.id);
+    while let Some(id) = current {
+        if id == target {
+            return Ok(true);
+        }
+        current = if id == claim.row.id {
+            claim.row.parent_workflow_id
+        } else {
+            durable_workflow::table
+                .find(id)
+                .select(durable_workflow::parent_workflow_id)
+                .first::<Option<i64>>(connection)
+                .await?
+        };
+    }
+    Ok(false)
+}
+
 async fn append_history(
     connection: &mut crate::DurableConnection,
     workflow_id: WorkflowId,
@@ -1127,7 +1225,7 @@ fn declare_workflow_claim(
 /// command the recovering claim already inserted (N4).
 async fn lock_fence(
     connection: &mut crate::DurableConnection,
-    claim: &WorkflowClaim,
+    claim: &ClaimedRow,
 ) -> Result<(), DurableError> {
     fenced_workflow!(claim)
         .for_update()

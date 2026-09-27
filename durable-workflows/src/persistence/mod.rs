@@ -16,7 +16,7 @@ pub(crate) use events::{append_event, next_delivery_event, next_event_sequence};
 pub use workflows::find_workflow_by_id;
 pub(crate) use workflows::{
     find_by_deduplication_key, find_workflow_by_id_for_update, insert_started,
-    wake_waiting_parents_on_child_terminal,
+    wake_waiting_parents_on_child_terminal, StartedInsert,
 };
 
 pub fn now_millis() -> i64 {

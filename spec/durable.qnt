@@ -82,6 +82,7 @@
  *   G11 inv_G11_cancelReachesChildren
  *   N1  fixed: T-X2's newest generation is the end of the keyed row's restartedFrom chain (tx2Latest)
  *   D4  TC2_RunChild attaches to the newest generation of the keyed row (newestGen)
+ *   G8  fixed: TC2_RunChild never attaches to the caller or an ancestor (inv_G8_noAncestorWait, in `safety`)
  *   G1  inv_G1_noSelfCancelFromOperator (fixed; in `safety`: a coordinator never errors)
  *   N2  inv_S13_topicConcurrency (executing handlers per topic can exceed the cap after cancel)
  *   N3  fixed: StartOptions.restarted_from_workflow_id is crate-private; TX1_Start's `from` must be terminal
@@ -312,6 +313,9 @@ module durable {
   // (S19: at most one successor per row, so the chain is linear); 0 stays 0
   pure def newestGen(d: Db, x: int): int =
     WF_IDS.fold(x, (cur, i) => { val s = successorsOf(d, cur); if (s == Set()) cur else anyOf(s) })
+  // coordinator.rs is_caller_or_ancestor: w and its parent chain (MAX_WF rounds reach the root)
+  pure def selfAndAncestors(d: Db, w: int): Set[int] =
+    WF_IDS.fold(Set(w), (acc, i) => acc.union(acc.map(x => d.wf.get(x).parent).filter(p => p != 0)))
   // T-X2 (G2 fixed): every parent waiting on the superseded row c waits on its successor
   // instead. The code re-attaches only when the successor runs c's version and otherwise
   // wakes the parents with child_failed (child_superseded); versions are not modeled.
@@ -515,6 +519,8 @@ module durable {
   // T-C2 RunChild(kind, key): key is a domain key or autoKey(w, cmd). existing = the newest
   // generation of the row with (kind, key) (D4), 0 = none: then insert cNew = db.nextWf; else
   // attach (cNew = 0), locking the child and waking at once if it is already terminal.
+  // G8 fixed: an existing row that is w or an ancestor of w is InvalidDefinition, rolled back;
+  // the code then records TC3_ActivationFailure.
   action TC2_RunChild(r: int, w: int, tok: int, kind: str, key: int, existing: int, cNew: int, tnow: int): bool = {
     val cmd = db.wf.get(w).cmdSeq + 1
     val waitOn = if (existing == 0) cNew else existing
@@ -523,6 +529,7 @@ module durable {
       ENABLE_CHILDREN,
       tc2Ok(r, w, tok), key != NO_KEY,
       existing == newestGen(db, anyOf(rowsWithKey(db, kind, key))),
+      not(selfAndAncestors(db, w).contains(existing)),
       if (existing == 0) all {
         cNew == db.nextWf, cNew <= MAX_WF,
         val d2 = newStarted(db, cNew, { ...emptyWf, status: "ready", kind: kind, dedup: key, availableAt: tnow,
@@ -1363,6 +1370,13 @@ module durable {
   val inv_G11_cancelReachesChildren = WF_IDS.forall(p => db.wf.get(p).status == "cancelled" implies
     WF_IDS.forall(c => (db.wf.get(c).parent == p and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
 
+  // G8 (fixed): no workflow waits on itself or an ancestor. Cycles through non-ancestors
+  // (two keyed rows that name each other) are not guarded.
+  val inv_G8_noAncestorWait = WF_IDS.forall(w => {
+    val r = db.wf.get(w)
+    not(r.waitKind == "child" and selfAndAncestors(db, w).contains(r.waitRef))
+  })
+
   // G1 (fixed): an operator action never costs a runtime its restart budget. A pause or cancel
   // of a running row makes its coordinator's T-C2/T-C3 miss the fence (CoordFenceMiss), which is
   // not a task error. Stated in its strong form: the coordinator task never errors (LC1_NoEvent,
@@ -1377,6 +1391,7 @@ module durable {
     inv_S11_openAttempt, inv_S12_attemptsBounded, inv_S13_oneHandler, inv_S14_actTerminal,
     inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor, inv_S19_sourceTerminal,
     inv_S23_childOnce, inv_S24_parentWakes, inv_S25_cancelAtomic, inv_G1_noSelfCancelFromOperator,
+    inv_G8_noAncestorWait,
   }
   // safety plus S17 (expected to hold under READ COMMITTED)
   val safetyRc = safety and inv_S17_capAtClaim and inv_S17_capAlways

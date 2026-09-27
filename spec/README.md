@@ -87,7 +87,7 @@ Actions, one per committed transaction (T-W1: one per statement group):
 | `TX1_Start` | T-X1 | dedup hit returns the existing row; restart-key collision → `Conflict`, no row; both keys rejected |
 | `TX2_RecoverableStart` | T-X2 | newest generation = end of the keyed row's `restartedFrom` chain (`tx2Latest`, N1 fixed); only a `failed`/`blocked` newest row; blocked → cancelled, its waiting parents re-pointed to the successor (G2 fixed); restart-key collision → `Conflict` (all rolled back) |
 | `TX3_Cancel` | T-X3 | cancels own activities (closes open attempts), wakes waiting parents |
-| `TC1_Claim` | T-C1 | at most one expired-lease recovery, then at most one ready claim, fresh token; SKIP LOCKED |
+| `TC1_Claim` | T-C1 | at most one expired-lease recovery, then at most one ready claim, fresh token; SKIP LOCKED; a runtime holds one claim (the implementation enforces this per `WorkflowCoordinator` with a borrowing `WorkflowClaim`) |
 | `LC1_NoEvent` | L-C1 | no deliverable event after `delivered` → task error |
 | `TC2_Continue`, `TC2_Complete`, `TC2_RunActivity`, `TC2_RunChild` | T-C2 | fence `status=running ∧ leaseToken`; Continue, Complete (+ parent wake), RunActivity, RunChild (new, attach, attach-to-terminal + wake) |
 | `TC3_ActivationFailure` | T-C3 | fence; retry with backoff or fail when exhausted (+ parent wake) |
@@ -217,6 +217,15 @@ Changes in v5 (from v4):
   `(kind, key)` (`store.rs` `insert_child` locks the keyed row and walks its
   chain), so a parent that starts a keyed child after a recovery waits on the
   successor.
+- G8 fixed: `TC2_RunChild` requires `existing` not to be `w` or an ancestor
+  of `w` (`selfAndAncestors`, the `parent` chain; `coordinator.rs`
+  `is_caller_or_ancestor`). The code rolls that commit back with
+  `InvalidDefinition` and records `TC3_ActivationFailure`, so a trace never
+  has a `TC2_RunChild` that attaches to the caller or an ancestor. New
+  invariant `inv_G8_noAncestorWait` (no row has a child wait on itself or an
+  ancestor), part of `safety`. G6's fix (the conflict path's version check)
+  changes no action: versions are not modeled, and the rejected commit is a
+  `TC3_ActivationFailure`.
 
 Changes in v4 (from v3):
 
@@ -487,7 +496,9 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 | G1 (operator pause/cancel during a claim costs the restart budget) | **Fixed**: `CoordFenceMiss` is not a task error; `inv_G1_noSelfCancelFromOperator` (the coordinator never errors) is part of `safety` | `pauseResumeTest`, `g1NoSelfCancelTest`, `g1RuntimeStillClaimsTest`, `g1AppCancelFenceMissTest`, simulation; the G1 gap tests' traces pass |
 | G2 (T-X2 strands the parent) | **Fixed**: T-X2 re-points the parents waiting on the superseded blocked row to its successor; `inv_S24_parentWakes` is part of `safety` and `inv_S24_exceptTX2` is gone | `g2ReattachTest`, `safety` in simulation; the G2 gap tests' traces pass |
 | G4 (stale `sequence`) | Not modeled; closed for library transactions by READ COMMITTED per INVARIANTS.md | — |
+| G6 (dedup race skips the version check) | Not modeled (versions are not modeled); **fixed** in the code: the rejected commit is a `TC3_ActivationFailure` | the recorded G6 gap test's trace passes |
 | G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 4; `g7CapExceededTest` (RR) |
+| G8 (child key resolving to the caller or an ancestor) | **Fixed**: `TC2_RunChild` never attaches to the caller or an ancestor; `inv_G8_noAncestorWait` is part of `safety`. Non-ancestor wait cycles stay unguarded (intended) | `g8SelfKeyRejectedTest`, `g8SelfKeyActivationFailureTest`, `g8GrandparentKeyRejectedTest`; the G8 gap tests' traces pass |
 | G10 (one invalid row aborts every topic's claims) | **Fixed** (interface v5): a claimable row past its attempt cap or with invalid bounds is quarantined (`TW1_QuarantineRow`; `quarantined` in `TW1_Claim`): dead-lettered, its workflow blocked, and the T-W1 goes on. `TW1_Error` and `inv_G10_noClaimAbort` are gone | `g10InvalidBoundsTest`, `g10ReplayTest`, `g10WrongReasonTest`; `durable_mc_env` `safety` and `wit_quarantined`; the G10 gap tests' traces pass |
 | G11 (cancel does not reach children) | Reproduces through T-X3 and the operator cancel (T-A4) | `g11CancelTest`, `g11AdminCancelTest`, simulation, the recorded G11 gap test |
 | N1 (T-X2 lineage on a child key) | **Fixed**: `tx2Latest` is the end of the keyed row's restart chain, so neither variant is a step; `inv_N1_tx2OwnLineage` is gone | `n1WrongLineageTest`, `n1SiblingNotSupersededTest`, `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`; both N1 gap tests' traces pass |

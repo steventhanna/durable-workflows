@@ -136,7 +136,7 @@ async fn activity_happy_path() {
         .expect("workflow starts")
         .workflow_id;
 
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(
@@ -391,7 +391,7 @@ async fn continue_then_complete() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("continue"),
         Some(id)
@@ -413,7 +413,7 @@ async fn child_happy_path() {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     let worker = worker(&pool);
     assert_eq!(
         coordinator.activate_one().await.expect("run child"),
@@ -446,7 +446,7 @@ async fn activation_failure_retries_then_fails() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         "rt1:coordinator",
         CoordinatorConfig {
@@ -485,8 +485,8 @@ async fn stale_coordinator_fence_miss() {
         lease_duration: Duration::from_millis(500),
         ..CoordinatorConfig::default()
     };
-    let stale = coordinator(&pool, "rt1:coordinator", short);
-    let fresh = coordinator(&pool, "rt2:coordinator", short);
+    let mut stale = coordinator(&pool, "rt1:coordinator", short);
+    let mut fresh = coordinator(&pool, "rt2:coordinator", short);
     let claim = stale.claim_one().await.expect("claim").expect("claimed");
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(
@@ -494,7 +494,7 @@ async fn stale_coordinator_fence_miss() {
         Some(id)
     );
     assert!(matches!(
-        stale.activate_claim(claim).await,
+        claim.activate().await,
         Err(durable_workflows::DurableError::FencedWrite)
     ));
     assert_eq!(status(&pool, id).await, "succeeded");
@@ -511,7 +511,7 @@ async fn cancel_parent_with_running_child() {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("run child"),
         Some(parent)
@@ -540,7 +540,7 @@ async fn cancel_waiting_activity() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("run activity"),
         Some(id)
@@ -565,7 +565,7 @@ async fn recoverable_start_after_failure() {
     };
     let store = DurableStore::new(pool.clone());
     let keyed = || StartOptions::default().with_deduplication_key("k");
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         "rt1:coordinator",
         CoordinatorConfig {
@@ -853,7 +853,7 @@ where
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("run activity"),
         Some(id)
@@ -871,7 +871,7 @@ where
 }
 
 async fn complete(pool: &durable_workflows::DurablePool, id: durable_workflows::WorkflowId) {
-    let coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("completes"),
         Some(id)

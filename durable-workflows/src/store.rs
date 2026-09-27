@@ -575,7 +575,10 @@ impl DurableStore {
             completed_at: None,
         };
 
-        let (id, inserted) = persistence::insert_started(connection, row).await?;
+        let (id, inserted) = match persistence::insert_started(connection, row).await? {
+            persistence::StartedInsert::Inserted(id) => (id, true),
+            persistence::StartedInsert::Existing(existing) => (existing.id, false),
+        };
         Ok(StartOutcome {
             workflow_id: WorkflowId::new(id)?,
             inserted,
@@ -585,7 +588,9 @@ impl DurableStore {
     /// Inserts a child workflow inside the parent's commit transaction.
     ///
     /// The caller supplies the resolved deduplication key so a re-committed
-    /// parent transition converges on one child instance.
+    /// parent transition converges on one child instance. A key that already
+    /// exists, whether seen by the pre-read or by the insert's conflict,
+    /// resolves to its newest generation (D4), whose version must match (G6).
     pub(crate) async fn insert_child(
         connection: &mut DurableConnection,
         child: &crate::ChildWorkflowCommand,
@@ -600,30 +605,62 @@ impl DurableStore {
                 "child workflow deduplication key must contain 1 to {MAX_DEDUPLICATION_KEY_CHARS} characters"
             )));
         }
-        if let Some(keyed) =
-            persistence::find_by_deduplication_key(connection, child.kind(), &deduplication_key)
-                .await?
+        // Locking the keyed row first waits out a T-X2 that is superseding it,
+        // so the walk below sees that T-X2's successor.
+        let keyed = match persistence::find_by_deduplication_key(
+            connection,
+            child.kind(),
+            &deduplication_key,
+        )
+        .await?
         {
-            // Locking the keyed row first waits out a T-X2 that is superseding
-            // it, so the walk sees that T-X2's successor.
-            let keyed =
+            Some(keyed) => {
                 persistence::find_workflow_by_id_for_update(connection, WorkflowId::new(keyed.id)?)
-                    .await?;
-            let existing = lock_newest_generation(connection, keyed).await?;
-            if existing.version != child.version() {
-                return Err(DurableError::DefinitionMismatch {
-                    actual_kind: existing.kind,
-                    actual_version: existing.version,
-                    expected_kind: child.kind().to_string(),
-                    expected_version: child.version(),
-                });
+                    .await?
             }
-            return Ok(StartOutcome {
-                workflow_id: WorkflowId::new(existing.id)?,
-                inserted: false,
+            None => match Self::insert_new_child(
+                connection,
+                child,
+                deduplication_key,
+                parent_workflow_id,
+                parent_command_sequence,
+                root_workflow_id,
+            )
+            .await?
+            {
+                persistence::StartedInsert::Inserted(id) => {
+                    return Ok(StartOutcome {
+                        workflow_id: WorkflowId::new(id)?,
+                        inserted: true,
+                    });
+                }
+                // A concurrent commit inserted the key after the pre-read (G6).
+                persistence::StartedInsert::Existing(keyed) => *keyed,
+            },
+        };
+        let existing = lock_newest_generation(connection, keyed).await?;
+        if existing.version != child.version() {
+            return Err(DurableError::DefinitionMismatch {
+                actual_kind: existing.kind,
+                actual_version: existing.version,
+                expected_kind: child.kind().to_string(),
+                expected_version: child.version(),
             });
         }
+        Ok(StartOutcome {
+            workflow_id: WorkflowId::new(existing.id)?,
+            inserted: false,
+        })
+    }
 
+    async fn insert_new_child(
+        connection: &mut DurableConnection,
+        child: &crate::ChildWorkflowCommand,
+        deduplication_key: String,
+        parent_workflow_id: i64,
+        parent_command_sequence: i32,
+        root_workflow_id: i64,
+    ) -> Result<persistence::StartedInsert, DurableError> {
         let now = persistence::database_now_millis(connection).await?;
         let row = NewWorkflowRow {
             kind: child.kind().to_string(),
@@ -656,12 +693,7 @@ impl DurableStore {
             updated_at: now,
             completed_at: None,
         };
-
-        let (id, inserted) = persistence::insert_started(connection, row).await?;
-        Ok(StartOutcome {
-            workflow_id: WorkflowId::new(id)?,
-            inserted,
-        })
+        persistence::insert_started(connection, row).await
     }
 }
 

@@ -161,7 +161,13 @@ A child is an ordinary workflow row inserted in the parent's `RunChild` commit
 or a caller-supplied domain key (`src/runtime/coordinator.rs:793-796`). A dedup
 hit reuses the newest recovery generation of the existing row (any parent):
 `insert_child` locks the keyed row and follows its `restartedFromWorkflowId`
-chain (`lock_newest_generation`, D4), then checks the version. Parent-side
+chain (`lock_newest_generation`, D4), then checks the version. A key the
+pre-read misses but the insert collides with (a concurrent commit inserted it)
+takes the same path: the conflict returns the keyed row locked, and the same
+walk and version check follow (G6, fixed); a mismatch is `DefinitionMismatch`.
+A key that resolves to the caller or one of its ancestors
+(`parentWorkflowId` chain) is `InvalidDefinition` (G8, fixed). Both roll back
+the commit and are T-C3 activation failures. Parent-side
 states:
 
 | parent state | meaning |
@@ -255,8 +261,16 @@ claim, sleep `idle_delay` (2 s). A lost fence (`FencedWrite`) or a transient
 database error (deadlock, serialization failure, lock wait timeout;
 `dialect::is_transient_error`) from T-C2 or T-C3 is logged and the loop goes
 on: an operator action or lease recovery already moved the row on, or the
-rolled-back row stays `running` until lease recovery (L2). `activate_claim`
+rolled-back row stays `running` until lease recovery (L2). `WorkflowClaim::activate`
 itself still returns the error. Any other error ends the task (G1, fixed).
+
+A coordinator holds at most one outstanding claim: `claim_one` takes
+`&mut self` and the returned `WorkflowClaim` borrows the coordinator until
+`WorkflowClaim::activate` consumes it, so the model's one-claim-per-runtime
+rule (`TC1_Claim` requires `not(proc.claims[r].active)`) is enforced by the
+type system per coordinator. One worker id should map to one coordinator:
+the fence is the claim's own lease token, so extra coordinators are safe, but
+the trace checker maps a worker id to one model runtime.
 
 **T-C1 claim** (`src/runtime/coordinator.rs:228-393`), one transaction:
 1. `now` ← DB.
@@ -305,8 +319,10 @@ update sets
   → `waiting_approval`.
 - `RunActivity`: fence lock; INSERT activity (pending) before the fenced
   update; `commandSequence+1`; → `waiting_activity`.
-- `RunChild`: dedup lookup (consistent read) and upsert child row; if the
-  child already existed, lock it `FOR UPDATE` (current read) **before** the
+- `RunChild`: dedup lookup (consistent read) and upsert child row; a dedup
+  hit on either path resolves to the newest generation, whose version must
+  match (G6, fixed), and must not be the caller or an ancestor (G8, fixed);
+  if the child already existed, lock it `FOR UPDATE` (current read) **before** the
   fenced parent update (G9, fixed); fenced parent update → `waiting_child`;
   history; if the locked child is terminal, wake waiting parents in the same
   transaction. It takes no fence lock first: that would lock the parent
@@ -888,7 +904,8 @@ workflow becomes terminal (blocked or paused ones block it indefinitely).
 **L11. A parent waiting on a child becomes ready when the child becomes
 terminal** (same transaction; after a T-X2 re-attach, when the successor
 becomes terminal). Not guaranteed if the child
-never terminates (G8). **ENFORCED**.
+never terminates, for example in a wait cycle through keyed rows that are not
+ancestors of each other (G8). **ENFORCED**.
 
 **L12. Cancellation, pause, or restart stops an in-flight activity handler
 within `heartbeat interval + min(shutdown_grace, remaining lease)`**, through
@@ -1001,10 +1018,10 @@ non-terminating child are stable states that need an operator.
 ## 6. Suspected gaps
 
 Status: G4 is closed for library transactions (P4, READ COMMITTED).
-G1, G2, G3, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
+G1, G2, G3, G6, G8, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
 is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixed;
-their tests in `tests/gaps.rs` run un-ignored. G6, G8 and G11, and the model
-finding N2, are confirmed by ignored tests in `tests/gaps.rs`.
+their tests in `tests/gaps.rs` run un-ignored. G11 and the model
+finding N2 are confirmed by ignored tests in `tests/gaps.rs`.
 
 Each item below was traced from the code; the status line above records
 which ones a test has since confirmed or closed.
@@ -1022,10 +1039,10 @@ runtime. Other triggers: lease-recovery races with slow steps, InnoDB
 deadlocks (G9), duplicate-key aborts (G4), and claim-batch errors in the
 dispatcher (`src/runtime/supervisor.rs:1104-1106`). The test
 `pause_fences_a_workflow_transition_claimed_before_the_operator_action`
-confirms that `activate_claim` returns `Err(FencedWrite)`.
+confirms that `activate_claim` (now `WorkflowClaim::activate`) returns `Err(FencedWrite)`.
 **Fixed**: `activate_one` logs a `FencedWrite` or a transient database error
 (`dialect::is_transient_error`) from T-C2/T-C3 and returns the claimed id;
-`activate_claim` still returns the error to a direct caller. The restart
+`WorkflowClaim::activate` still returns the error to a direct caller. The restart
 budget counts within `RuntimeConfig::restart_window` (default 10 minutes).
 The dispatcher logs a transient `claim_batch` error and backs off as after an
 empty sweep. Tests: `g1_pause_during_step_is_not_a_coordinator_error`,
@@ -1146,6 +1163,12 @@ without comparing versions (`src/persistence/workflows.rs:43-70`). Two
 parents that start key k at versions 1 and 2 at the same moment can both wait
 on the v1 child. The v2 parent's flow replay then fails closed
 (`src/flow.rs:272-277`) and the parent fails after its activation attempts.
+**Fixed**: `insert_started` returns the keyed row (locked `FOR UPDATE`) on a
+conflict, and `insert_child` runs one version check for the pre-read and the
+conflict path, after resolving the row to its newest generation (D4). The v2
+parent's commit fails with `DefinitionMismatch`, a T-C3 activation failure,
+so it never waits on the v1 child. Test:
+`g6_child_dedup_race_rejects_version_mismatch`.
 
 **G7. The topic cap can be exceeded by one through heartbeat revival.**
 Interleaving: activity A's lease expires in DB time while its worker gives up
@@ -1161,7 +1184,19 @@ later and loses an attempt without running.
 **G8. Domain keys can form wait cycles.** `child_with_key` can resolve to the
 calling workflow or an ancestor (same kind and key). `commit_child` then
 waits on a non-terminal row (`src/runtime/coordinator.rs:807-873`). There is
-no cycle detection. Liveness only.
+no cycle detection. Liveness only. **Fixed** for the caller and its
+ancestors: after a dedup hit, `commit_child` walks the caller's
+`parentWorkflowId` chain and returns `InvalidDefinition` ("child key {k}
+resolves to workflow {id}, which is the caller or an ancestor"), a T-C3
+activation failure, before the parent update. For the caller's own key the
+keyed row `insert_child` locks is the caller's row, the only lock the
+transaction holds when it rolls back, so there is no second lock and no
+wait. Intended (not fixed): cycles through keyed rows that are not ancestors
+of each other (A waits on B's key while B waits on A's) stay unguarded. Tests:
+`g8_child_key_resolving_to_self_does_not_wait_on_itself`,
+`g8_child_key_resolving_to_a_grandparent_is_an_activation_failure`. Model:
+`TC2_RunChild` never attaches to the caller or an ancestor
+(`inv_G8_noAncestorWait`, in `safety`).
 
 **G9. Lock-order inversion between a child's terminal commit and a parent
 attaching to it.** A child's terminal transaction locks the child, then scans

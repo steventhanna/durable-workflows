@@ -24,10 +24,17 @@ pub(crate) async fn find_by_deduplication_key(
         .optional()?)
 }
 
+/// Outcome of [`insert_started`]: the new row's id, or the row that already
+/// holds the deduplication key, locked `FOR UPDATE`.
+pub(crate) enum StartedInsert {
+    Inserted(i64),
+    Existing(Box<WorkflowRow>),
+}
+
 pub(crate) async fn insert_started(
     connection: &mut DurableConnection,
     workflow: NewWorkflowRow,
-) -> Result<(i64, bool), DurableError> {
+) -> Result<StartedInsert, DurableError> {
     let kind = workflow.kind.clone();
     let deduplication_key = workflow.deduplication_key.clone();
     match dialect::insert_workflow(connection, workflow).await? {
@@ -48,7 +55,7 @@ pub(crate) async fn insert_started(
                 .await?;
             crate::trace::touch_wf(id);
             crate::trace::touch_event(id, 1, "started");
-            Ok((id, true))
+            Ok(StartedInsert::Inserted(id))
         }
         WorkflowInsert::DeduplicationConflict => {
             let key = deduplication_key.as_deref().ok_or_else(|| {
@@ -57,7 +64,7 @@ pub(crate) async fn insert_started(
                 )
             })?;
             match find_by_deduplication_key_for_update(connection, &kind, key).await? {
-                Some(row) => Ok((row.id, false)),
+                Some(row) => Ok(StartedInsert::Existing(Box::new(row))),
                 None => Err(DurableError::Conflict(
                     "duplicate start raced with an uncommitted insert outside READ COMMITTED; retry"
                         .to_string(),

@@ -961,7 +961,7 @@ where
             panicked: false,
         }),
         TaskSpec::Coordinator => {
-            let coordinator = WorkflowCoordinator::new(
+            let mut coordinator = WorkflowCoordinator::new(
                 parts.pool.clone(),
                 parts.context.clone(),
                 parts.workflows.clone(),

@@ -210,7 +210,7 @@ async fn oversized_expired_cursor_backlog_finishes_each_scan_instead_of_restarti
         restarts: AtomicUsize::new(0),
         reject_next: AtomicBool::new(false),
     });
-    let (coordinator, worker) = runners(pool.clone(), context.clone());
+    let (mut coordinator, worker) = runners(pool.clone(), context.clone());
     let store = DurableStore::new(pool.clone());
     for _ in 0..50 {
         store
@@ -272,7 +272,7 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
         restarts: AtomicUsize::new(0),
         reject_next: AtomicBool::new(false),
     });
-    let (coordinator, worker) = runners(pool.clone(), context);
+    let (mut coordinator, worker) = runners(pool.clone(), context);
     let store = DurableStore::new(pool.clone());
     for _ in 0..2 {
         store
@@ -370,7 +370,7 @@ async fn failed_continuation_waits_for_backoff_then_reacquires_priority() {
         restarts: AtomicUsize::new(0),
         reject_next: AtomicBool::new(true),
     });
-    let (coordinator, worker) = runners(pool.clone(), context);
+    let (mut coordinator, worker) = runners(pool.clone(), context);
     DurableStore::new(pool.clone())
         .start(
             &ScanWorkflow {

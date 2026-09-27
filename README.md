@@ -219,10 +219,6 @@ These gaps are confirmed by ignored tests in
 are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
 [`spec/README.md`](spec/README.md).
 
-- **G6** — Under a concurrent child deduplication race, a parent can wait on
-  a child of a different definition version; the parent then fails on replay.
-- **G8** — `child_with_key` can resolve to the calling workflow (or an
-  ancestor), which then waits on itself forever.
 - **G11** — Cancelling a parent workflow does not cancel its children; they
   keep running.
 - **N2** — An application cancel or operator pause frees the topic

@@ -329,7 +329,7 @@ async fn activation_span_has_safe_correlation_fields_without_token_or_payload() 
     workflows
         .register::<SecretWorkflow>()
         .expect("workflow definition");
-    let coordinator = WorkflowCoordinator::new(
+    let mut coordinator = WorkflowCoordinator::new(
         pool,
         Arc::new(()),
         Arc::new(workflows),
@@ -354,7 +354,7 @@ async fn activation_span_has_safe_correlation_fields_without_token_or_payload() 
         .with_writer(buffer.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
-    coordinator.activate_claim(claim).await.expect("activation");
+    claim.activate().await.expect("activation");
     let logs = buffer.contents();
     assert!(logs.contains("durable.workflow.activation"));
     assert!(logs.contains(&workflow_id.to_string()));

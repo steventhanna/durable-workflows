@@ -384,7 +384,7 @@ async fn pause_fences_a_workflow_transition_claimed_before_the_operator_action()
     let (workflows, activities, _) = registries();
     let workflows = Arc::new(workflows);
     let activities = Arc::new(activities);
-    let coordinator = WorkflowCoordinator::new(
+    let mut coordinator = WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         workflows.clone(),
@@ -404,7 +404,7 @@ async fn pause_fences_a_workflow_transition_claimed_before_the_operator_action()
         .await
         .expect("pause");
     assert!(matches!(
-        coordinator.activate_claim(claim).await,
+        claim.activate().await,
         Err(DurableError::FencedWrite)
     ));
 }

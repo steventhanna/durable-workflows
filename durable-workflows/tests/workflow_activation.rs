@@ -419,7 +419,7 @@ async fn activation_persists_continue_then_completion() {
         .expect("workflow starts");
     let registry = durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
         .expect("registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -493,7 +493,7 @@ async fn two_coordinators_cannot_claim_the_same_workflow() {
         durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
             .expect("registry is valid"),
     );
-    let first = durable_workflows::WorkflowCoordinator::new(
+    let mut first = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry.clone(),
@@ -502,7 +502,7 @@ async fn two_coordinators_cannot_claim_the_same_workflow() {
         CoordinatorConfig::default(),
     )
     .expect("coordinator is valid");
-    let second = durable_workflows::WorkflowCoordinator::new(
+    let mut second = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry,
@@ -547,7 +547,7 @@ async fn two_coordinators_claim_distinct_ready_workflows() {
         durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
             .expect("registry is valid"),
     );
-    let first = durable_workflows::WorkflowCoordinator::new(
+    let mut first = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry.clone(),
@@ -556,7 +556,7 @@ async fn two_coordinators_claim_distinct_ready_workflows() {
         CoordinatorConfig::default(),
     )
     .expect("first coordinator is valid");
-    let second = durable_workflows::WorkflowCoordinator::new(
+    let mut second = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry.clone(),
@@ -565,7 +565,7 @@ async fn two_coordinators_claim_distinct_ready_workflows() {
         CoordinatorConfig::default(),
     )
     .expect("second coordinator is valid");
-    let third = durable_workflows::WorkflowCoordinator::new(
+    let mut third = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry,
@@ -614,7 +614,7 @@ async fn old_coordinator_skips_workflow_versions_it_cannot_execute() {
         durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
             .expect("old registry is valid"),
     );
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry,
@@ -665,7 +665,7 @@ async fn stale_lease_cannot_commit_a_transition() {
         durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
             .expect("registry is valid"),
     );
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry,
@@ -689,8 +689,8 @@ async fn stale_lease_cannot_commit_a_transition() {
         .expect("lease is replaced");
     drop(connection);
 
-    let error = coordinator
-        .activate_claim(claim)
+    let error = claim
+        .activate()
         .await
         .expect_err("stale claim must be fenced");
     assert!(matches!(
@@ -722,7 +722,7 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
         lease_duration: Duration::from_millis(2),
         ..CoordinatorConfig::default()
     };
-    let first = durable_workflows::WorkflowCoordinator::new(
+    let mut first = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry.clone(),
@@ -731,7 +731,7 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
         config,
     )
     .expect("coordinator is valid");
-    let second = durable_workflows::WorkflowCoordinator::new(
+    let mut second = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         registry,
@@ -758,7 +758,7 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
     );
     assert_ne!(expired.lease_token(), recovered.lease_token());
     assert!(matches!(
-        first.activate_claim(expired).await,
+        expired.activate().await,
         Err(durable_workflows::DurableError::FencedWrite)
     ));
 
@@ -803,7 +803,7 @@ async fn timer_and_approval_transitions_commit_their_wait_state_atomically() {
         .expect("approval workflow starts");
     let registry = durable_workflows::register_durable_workflows!(() ; WaitWorkflow)
         .expect("registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -896,7 +896,7 @@ async fn activity_transition_commits_state_command_and_wait_atomically() {
         .expect("registry is valid");
     let activities = durable_workflows::register_durable_activities!(() ; TestActivity)
         .expect("activity registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -963,7 +963,7 @@ async fn timer_and_approval_transitions_persist_their_wait_records() {
         ApprovalWorkflow
     )
     .expect("registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -1037,7 +1037,7 @@ async fn non_deliverable_history_never_reaches_workflow_code() {
     drop(connection);
     let registry = durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
         .expect("registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -1078,7 +1078,7 @@ async fn missing_definition_is_skipped_without_advancing_state_or_attempts() {
         )
         .await
         .expect("workflow starts");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(durable_workflows::WorkflowRegistry::new()),
@@ -1127,7 +1127,7 @@ async fn activation_errors_back_off_then_fail_at_the_configured_cap() {
         .expect("workflow starts");
     let registry = durable_workflows::register_durable_workflows!(() ; FailingWorkflow)
         .expect("registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -1202,7 +1202,7 @@ async fn sixteenth_continue_yields_to_another_ready_workflow() {
         OneShotWorkflow
     )
     .expect("registry is valid");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(registry),
@@ -1305,10 +1305,7 @@ async fn empty_expired_lease_scans_do_not_deadlock_distinct_ready_claims() {
         .expect("second task")
         .expect("second claim")
         .expect("second workflow");
-    assert_ne!(
-        left.workflow_id().expect("first id"),
-        right.workflow_id().expect("second id")
-    );
+    assert_ne!(left, right);
 }
 
 async fn paused_expiry_probe_pool() -> (
@@ -1466,14 +1463,23 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
     }
 }
 
+/// Claims on a blocking thread and returns the claimed workflow's id; the
+/// claim borrows `coordinator`, so it cannot leave the task.
 fn claim_with_blocking_probe(
-    coordinator: durable_workflows::WorkflowCoordinator<()>,
+    mut coordinator: durable_workflows::WorkflowCoordinator<()>,
 ) -> tokio::task::JoinHandle<
-    Result<Option<durable_workflows::WorkflowClaim>, durable_workflows::DurableError>,
+    Result<Option<durable_workflows::WorkflowId>, durable_workflows::DurableError>,
 > {
     let runtime = tokio::runtime::Handle::current();
     // Synchronous instrumentation must not block Tokio's local task queues.
-    tokio::task::spawn_blocking(move || runtime.block_on(coordinator.claim_one()))
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(async move {
+            match coordinator.claim_one().await? {
+                Some(claim) => claim.workflow_id().map(Some),
+                None => Ok(None),
+            }
+        })
+    })
 }
 
 #[tokio::test]
@@ -1514,7 +1520,7 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
             .execute(&mut connection)
             .await
             .expect("expired workflows with tied lease timestamps");
-        let coordinator = durable_workflows::WorkflowCoordinator::new(
+        let mut coordinator = durable_workflows::WorkflowCoordinator::new(
             pool.clone(),
             Arc::new(()),
             Arc::new(
@@ -1633,7 +1639,7 @@ async fn library_transactions_pin_read_committed_before_begin() {
         )
         .await
         .expect("workflow starts");
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(
@@ -1653,10 +1659,7 @@ async fn library_transactions_pin_read_committed_before_begin() {
         .await
         .expect("workflow claim")
         .expect("workflow is claimable");
-    coordinator
-        .activate_claim(claim)
-        .await
-        .expect("activation commits");
+    claim.activate().await.expect("activation commits");
     let worker = durable_workflows::ActivityWorker::new(
         pool.clone(),
         Arc::new(()),

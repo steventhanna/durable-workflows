@@ -227,7 +227,7 @@ fn activity_worker(
 }
 
 async fn drain(
-    coordinator: &durable_workflows::WorkflowCoordinator<()>,
+    coordinator: &mut durable_workflows::WorkflowCoordinator<()>,
     worker: &durable_workflows::ActivityWorker<()>,
 ) {
     for _ in 0..32 {
@@ -268,7 +268,7 @@ async fn parent_awaits_child_flow_and_completes_with_its_output() {
         .start(&ParentPipelineFlow { value: 5 }, StartOptions::default())
         .await
         .expect("parent starts");
-    let coordinator = coordinator(&pool, "parent-coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "parent-coordinator", CoordinatorConfig::default());
 
     // First activation: the parent suspends at the child step.
     coordinator
@@ -299,7 +299,7 @@ async fn parent_awaits_child_flow_and_completes_with_its_output() {
     );
 
     let worker = activity_worker(&pool, "child-worker");
-    drain(&coordinator, &worker).await;
+    drain(&mut coordinator, &worker).await;
 
     let child = load_workflow(
         &pool,
@@ -334,7 +334,7 @@ async fn cancelled_child_delivers_child_failed_and_fails_the_parent() {
         .start(&StuckParentFlow {}, StartOptions::default())
         .await
         .expect("parent starts");
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         "cancel-coordinator",
         CoordinatorConfig {
@@ -421,7 +421,7 @@ async fn in_flight_keyed_child_wakes_every_waiting_parent() {
         return;
     };
     let store = DurableStore::new(pool.clone());
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         "shared-waiter-coordinator",
         CoordinatorConfig::default(),
@@ -520,14 +520,14 @@ async fn domain_keyed_child_deduplicates_and_terminal_hits_wake_immediately() {
         return;
     };
     let store = DurableStore::new(pool.clone());
-    let coordinator = coordinator(&pool, "dedup-coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "dedup-coordinator", CoordinatorConfig::default());
     let worker = activity_worker(&pool, "dedup-worker");
 
     let first = store
         .start(&KeyedParentFlow { value: 4 }, StartOptions::default())
         .await
         .expect("first parent starts");
-    drain(&coordinator, &worker).await;
+    drain(&mut coordinator, &worker).await;
     let first_parent = load_workflow(&pool, first.workflow_id).await;
     assert_eq!(first_parent.status.as_str(), "succeeded");
     assert_eq!(first_parent.result_json.as_deref(), Some("8"));
@@ -538,7 +538,7 @@ async fn domain_keyed_child_deduplicates_and_terminal_hits_wake_immediately() {
         .start(&KeyedParentFlow { value: 900 }, StartOptions::default())
         .await
         .expect("second parent starts");
-    drain(&coordinator, &worker).await;
+    drain(&mut coordinator, &worker).await;
     let second_parent = load_workflow(&pool, second.workflow_id).await;
     assert_eq!(second_parent.status.as_str(), "succeeded");
     assert_eq!(second_parent.result_json.as_deref(), Some("8"));
@@ -587,14 +587,14 @@ async fn keyed_child_rejects_dedup_hit_with_different_version() {
         return;
     };
     let store = DurableStore::new(pool.clone());
-    let v1_coordinator = coordinator(&pool, "version-dedup-v1", CoordinatorConfig::default());
+    let mut v1_coordinator = coordinator(&pool, "version-dedup-v1", CoordinatorConfig::default());
     let worker = activity_worker(&pool, "version-dedup-worker");
 
     store
         .start(&KeyedParentFlow { value: 4 }, StartOptions::default())
         .await
         .expect("v1 parent starts");
-    drain(&v1_coordinator, &worker).await;
+    drain(&mut v1_coordinator, &worker).await;
 
     let workflows = durable_workflows::register_durable_workflows!(
         ();
@@ -604,7 +604,7 @@ async fn keyed_child_rejects_dedup_hit_with_different_version() {
     .expect("v2 registry");
     let activities =
         durable_workflows::register_durable_activities!((); DoubleActivity).expect("v2 activities");
-    let v2_coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut v2_coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(workflows),
@@ -657,7 +657,7 @@ async fn paused_parent_resumes_into_waiting_child() {
         .start(&StuckParentFlow {}, StartOptions::default())
         .await
         .expect("parent starts");
-    let coordinator = coordinator(&pool, "pause-coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "pause-coordinator", CoordinatorConfig::default());
     coordinator
         .activate_one()
         .await

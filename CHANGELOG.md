@@ -91,7 +91,16 @@ Compared with the production-internal version it was extracted from:
   v5"): `TW1_Claim` records the rows the claim quarantined, and `TW1_Error`
   is gone; `TX2_RecoverableStart`'s newest generation follows the restart
   chain and re-points waiting parents (G2, N1), and `TC2_RunChild` attaches
-  to the newest generation of a keyed child (D4).
+  to the newest generation of a keyed child (D4) and never to the caller or
+  an ancestor (G8).
+- Breaking: a `WorkflowCoordinator` holds at most one outstanding workflow
+  claim, enforced by the type system. `claim_one` and `activate_one` take
+  `&mut self`, and `claim_one` returns a `WorkflowClaim<'_, C>` that borrows
+  the coordinator until it is activated or dropped, so a second `claim_one`
+  while a claim is alive does not compile. `WorkflowClaim::activate(self)`
+  replaces `WorkflowCoordinator::activate_claim(claim)`. This matches the
+  model's one-claim-per-runtime rule (`TC1_Claim`). Use one coordinator per
+  worker id; the trace checker maps a worker id to one model runtime.
 
 ### Removed
 
@@ -104,7 +113,7 @@ Compared with the production-internal version it was extracted from:
   or hits a transient database error (deadlock, serialization failure, lock
   wait timeout) is logged by `activate_one` and no longer ends the
   coordinator task or uses up the runtime's restart budget.
-  `WorkflowCoordinator::activate_claim` still returns the error. The
+  `WorkflowClaim::activate` still returns the error. The
   activity dispatcher retries after a transient `claim_batch` error, and the
   restart budget counts within `RuntimeConfig::restart_window`.
 - G3: a `step` that panics or exceeds `step_timeout` is an activation
@@ -142,10 +151,19 @@ Compared with the production-internal version it was extracted from:
   same kind in the same tree.
 - D4: `child_with_key` on a key whose row was superseded by a recoverable
   start attaches to the newest generation instead of the cancelled row.
+- G6: a child deduplication hit found by the insert's conflict (a concurrent
+  parent inserted the key first) is version-checked like one found by the
+  pre-read, so a parent can no longer wait on a child of another definition
+  version; the commit fails with `DefinitionMismatch`, an activation failure.
+- G8: `child_with_key` resolving to the calling workflow or one of its
+  ancestors is an activation failure (`InvalidDefinition`: "child key {k}
+  resolves to workflow {id}, which is the caller or an ancestor") instead of
+  a wait that never ends. Wait cycles through keyed workflows that are not
+  ancestors of each other are still not detected.
 
 ### Known issues
 
-The confirmed protocol gaps G6, G8, G11 and N2 have
+The confirmed protocol gaps G11 and N2 have
 ignored reproduction tests in `durable-workflows/tests/gaps.rs` and reproduce
 on both backends. See the "Known issues" section of the README and
 `docs/INVARIANTS.md` §6.

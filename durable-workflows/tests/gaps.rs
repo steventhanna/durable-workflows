@@ -259,6 +259,24 @@ gap_flow!(G8SelfKeyed {}, "gap_g8_self", 1, |_this, ctx| {
     ctx.child_with_key(&G8SelfKeyed {}, "g8-self").await
 });
 
+// depth 0 is started with key "g8-ancestor"; depth 2, its grandchild, asks for
+// a child with that key.
+gap_flow!(
+    G8Ancestor { depth: u8 },
+    "gap_g8_ancestor",
+    1,
+    |this, ctx| {
+        match this.depth {
+            0 => ctx.child(&G8Ancestor { depth: 1 }).await,
+            1 => ctx.child(&G8Ancestor { depth: 2 }).await,
+            _ => {
+                ctx.child_with_key(&G8Ancestor { depth: 0 }, "g8-ancestor")
+                    .await
+            }
+        }
+    }
+);
+
 gap_flow!(G10Flow { topic_b: bool }, "gap_g10_flow", 1, |this, ctx| {
     if this.topic_b {
         ctx.run(&G10ActivityB).await
@@ -316,6 +334,7 @@ fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
             G6ParentOfV1,
             G6ParentOfV2,
             G8SelfKeyed,
+            G8Ancestor,
             G10Flow,
             N4Gated,
             N4GatedChild,
@@ -365,6 +384,34 @@ fn coordinator(
         config,
     )
     .expect("coordinator is valid")
+}
+
+/// Claims one workflow on a task that owns `coordinator` and returns its id.
+/// The task activates the claim once the returned sender fires; the handle
+/// yields the activation's outcome.
+async fn claim_on_task(
+    mut coordinator: WorkflowCoordinator<GapContext>,
+) -> (
+    WorkflowId,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<WorkflowId, DurableError>>,
+) {
+    let (claimed_sender, claimed) = tokio::sync::oneshot::channel();
+    let (activate, activate_signal) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let claim = coordinator
+            .claim_one()
+            .await
+            .expect("claim")
+            .expect("workflow claim");
+        claimed_sender
+            .send(claim.workflow_id().expect("id"))
+            .expect("claim receiver");
+        activate_signal.await.expect("activate signal");
+        claim.activate().await
+    });
+    let workflow_id = claimed.await.expect("claim task reports its claim");
+    (workflow_id, activate, task)
 }
 
 fn worker(pool: &DurablePool, context: Arc<GapContext>) -> ActivityWorker<GapContext> {
@@ -495,7 +542,7 @@ async fn g2_recoverable_start_wakes_parent_of_superseded_blocked_child() {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
     coordinator
         .activate_one()
         .await
@@ -545,7 +592,7 @@ async fn g2_recoverable_start_wakes_parent_of_superseded_blocked_child() {
 async fn block_keyed_child<W>(
     pool: &DurablePool,
     context: &Arc<GapContext>,
-    coordinator: &WorkflowCoordinator<GapContext>,
+    coordinator: &mut WorkflowCoordinator<GapContext>,
     parent: &W,
 ) -> (WorkflowId, WorkflowId)
 where
@@ -572,7 +619,7 @@ where
 async fn block_child(
     pool: &DurablePool,
     context: &Arc<GapContext>,
-    coordinator: &WorkflowCoordinator<GapContext>,
+    coordinator: &mut WorkflowCoordinator<GapContext>,
     child_id: WorkflowId,
 ) {
     assert_eq!(
@@ -605,9 +652,9 @@ async fn g2_reattached_parent_completes_with_the_successor_output() {
         return;
     };
     let context = Arc::new(GapContext::default());
-    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
     let (parent_id, child_id) =
-        block_keyed_child(&pool, &context, &coordinator, &G2ReattachParent {}).await;
+        block_keyed_child(&pool, &context, &mut coordinator, &G2ReattachParent {}).await;
 
     let successor = DurableStore::new(pool.clone())
         .start_or_restart_recoverable(
@@ -656,7 +703,7 @@ async fn g2_keyed_child_lineage_after_two_recoveries() {
         return;
     };
     let context = Arc::new(GapContext::default());
-    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
     let store = DurableStore::new(pool.clone());
     let recover = || {
         store.start_or_restart_recoverable(
@@ -665,11 +712,11 @@ async fn g2_keyed_child_lineage_after_two_recoveries() {
         )
     };
     let (parent_id, keyed_id) =
-        block_keyed_child(&pool, &context, &coordinator, &G2Parent {}).await;
+        block_keyed_child(&pool, &context, &mut coordinator, &G2Parent {}).await;
 
     let first = recover().await.expect("first recovery");
     assert!(first.inserted);
-    block_child(&pool, &context, &coordinator, first.workflow_id).await;
+    block_child(&pool, &context, &mut coordinator, first.workflow_id).await;
     let second = recover().await.expect("second recovery");
     assert!(second.inserted);
     let again = recover().await.expect("live generation is returned");
@@ -705,9 +752,9 @@ async fn d4_child_with_key_after_recovery_attaches_to_the_newest_generation() {
         return;
     };
     let context = Arc::new(GapContext::default());
-    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
     let store = DurableStore::new(pool.clone());
-    let (_, keyed_id) = block_keyed_child(&pool, &context, &coordinator, &G2Parent {}).await;
+    let (_, keyed_id) = block_keyed_child(&pool, &context, &mut coordinator, &G2Parent {}).await;
     let successor = store
         .start_or_restart_recoverable(
             &G2Child {},
@@ -762,7 +809,7 @@ async fn g11_parent_cancellation_cancels_child_workflow() {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, context, CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, context, CoordinatorConfig::default());
     coordinator
         .activate_one()
         .await
@@ -817,15 +864,8 @@ async fn g1_pause_during_step_is_not_a_coordinator_error() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = Arc::new(coordinator(
-        &pool,
-        context.clone(),
-        CoordinatorConfig::default(),
-    ));
-    let activation = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.activate_one().await }
-    });
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let activation = tokio::spawn(async move { coordinator.activate_one().await });
     context
         .entered
         .acquire()
@@ -932,15 +972,8 @@ async fn g1_activation_failure_after_operator_cancel_is_not_a_coordinator_error(
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = Arc::new(coordinator(
-        &pool,
-        context.clone(),
-        CoordinatorConfig::default(),
-    ));
-    let activation = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.activate_one().await }
-    });
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let activation = tokio::spawn(async move { coordinator.activate_one().await });
     context
         .entered
         .acquire()
@@ -981,28 +1014,25 @@ where
         .expect("workflow starts")
         .workflow_id;
     let stale_context = Arc::new(GapContext::default());
-    let stale = Arc::new(
-        WorkflowCoordinator::new(
-            pool.clone(),
-            stale_context.clone(),
-            workflows(),
-            activities(),
-            "n4-stale-coordinator",
-            CoordinatorConfig {
-                lease_duration: Duration::from_millis(300),
-                ..CoordinatorConfig::default()
-            },
-        )
-        .expect("coordinator is valid"),
-    );
-    let claim = stale
-        .claim_one()
-        .await
-        .expect("claim succeeds")
-        .expect("workflow is claimed");
-    let activation = tokio::spawn({
-        let stale = stale.clone();
-        async move { stale.activate_claim(claim).await }
+    let mut stale = WorkflowCoordinator::new(
+        pool.clone(),
+        stale_context.clone(),
+        workflows(),
+        activities(),
+        "n4-stale-coordinator",
+        CoordinatorConfig {
+            lease_duration: Duration::from_millis(300),
+            ..CoordinatorConfig::default()
+        },
+    )
+    .expect("coordinator is valid");
+    let activation = tokio::spawn(async move {
+        let claim = stale
+            .claim_one()
+            .await
+            .expect("claim succeeds")
+            .expect("workflow is claimed");
+        claim.activate().await
     });
     stale_context
         .entered
@@ -1022,7 +1052,7 @@ where
     .await;
     let recovering_context = Arc::new(GapContext::default());
     recovering_context.release.add_permits(1);
-    let recovering = WorkflowCoordinator::new(
+    let mut recovering = WorkflowCoordinator::new(
         pool.clone(),
         recovering_context,
         workflows(),
@@ -1109,7 +1139,7 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = Arc::new(coordinator(&pool, context, CoordinatorConfig::default()));
+    let mut coordinator = coordinator(&pool, context, CoordinatorConfig::default());
     coordinator
         .activate_one()
         .await
@@ -1119,12 +1149,8 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
     let child = id(parent_row
         .wait_reference_id
         .expect("parent waits on a child"));
-    let child_claim = coordinator
-        .claim_one()
-        .await
-        .expect("claim")
-        .expect("child claim");
-    assert_eq!(child_claim.workflow_id().expect("id"), child);
+    let (child_claim, activate_child, completion) = claim_on_task(coordinator).await;
+    assert_eq!(child_claim, child);
 
     // Block the child's next history insert. The child's completion takes its
     // first read (`next_event_sequence` on the child), then waits to insert its
@@ -1172,10 +1198,7 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
             .expect("block the child's next event");
     }
 
-    let completion = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.activate_claim(child_claim).await }
-    });
+    activate_child.send(()).expect("child claim task waits");
     wait_until(
         "child completion to block on its history insert",
         || async { lock_waiters(&pool, 1).await >= 1 },
@@ -1223,7 +1246,6 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "confirms G6: under a dedup race the v2 parent commits waiting_child on the v1 child without a version check"]
 async fn g6_child_dedup_race_rejects_version_mismatch() {
     let Some(pool) = support::fresh_pool_with_max_size(8).await else {
         return;
@@ -1240,19 +1262,29 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
         .await
         .expect("v2 parent starts")
         .workflow_id;
-    let coordinator = Arc::new(coordinator(&pool, context, CoordinatorConfig::default()));
-    let claim_v1 = coordinator
-        .claim_one()
-        .await
-        .expect("claim")
-        .expect("v1 parent claim");
-    let claim_v2 = coordinator
-        .claim_one()
-        .await
-        .expect("claim")
-        .expect("v2 parent claim");
-    assert_eq!(claim_v1.workflow_id().expect("id"), parent_v1);
-    assert_eq!(claim_v2.workflow_id().expect("id"), parent_v2);
+    // One coordinator per claim: a coordinator holds one outstanding claim.
+    let coordinator_v1 = WorkflowCoordinator::new(
+        pool.clone(),
+        context.clone(),
+        workflows(),
+        activities(),
+        "g6-coordinator-v1",
+        CoordinatorConfig::default(),
+    )
+    .expect("coordinator is valid");
+    let coordinator_v2 = WorkflowCoordinator::new(
+        pool.clone(),
+        context,
+        workflows(),
+        activities(),
+        "g6-coordinator-v2",
+        CoordinatorConfig::default(),
+    )
+    .expect("coordinator is valid");
+    let (claim_v1, activate_v1, v1_commit) = claim_on_task(coordinator_v1).await;
+    let (claim_v2, activate_v2, v2_commit) = claim_on_task(coordinator_v2).await;
+    assert_eq!(claim_v1, parent_v1);
+    assert_eq!(claim_v2, parent_v2);
 
     // Share-lock the v1 parent's row: the child insert's foreign-key check
     // still passes, but the fenced parent update that follows insert_child in
@@ -1270,10 +1302,7 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
         .await
         .expect("share-lock v1 parent");
 
-    let v1_commit = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.activate_claim(claim_v1).await }
-    });
+    activate_v1.send(()).expect("v1 claim task waits");
     wait_until("v1 commit to insert its child and block", || async {
         lock_waiters(&pool, 1).await >= 1
     })
@@ -1281,10 +1310,7 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
 
     // The v2 parent's consistent-read pre-check cannot see the uncommitted v1
     // child; its insert then waits on the v1 child's unique key.
-    let v2_commit = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.activate_claim(claim_v2).await }
-    });
+    activate_v2.send(()).expect("v2 claim task waits");
     wait_until("v2 commit to block on the dedup key", || async {
         lock_waiters(&pool, 0).await >= 2
     })
@@ -1342,7 +1368,7 @@ async fn g10_invalid_activity_row_does_not_stop_other_claims() {
         .await
         .expect("topic B workflow starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
     for _ in 0..2 {
         coordinator
             .activate_one()
@@ -1473,14 +1499,14 @@ async fn g3_panicking_step_is_bounded_by_activation_attempts() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = Arc::new(coordinator(
+    let coordinator = Arc::new(tokio::sync::Mutex::new(coordinator(
         &pool,
         context,
         CoordinatorConfig {
             max_activation_attempts: 2,
             ..CoordinatorConfig::default()
         },
-    ));
+    )));
     let mut panics = 0;
     for _ in 0..5 {
         let row = load(&pool, workflow_id).await;
@@ -1492,7 +1518,7 @@ async fn g3_panicking_step_is_bounded_by_activation_attempts() {
         }
         let joined = tokio::spawn({
             let coordinator = coordinator.clone();
-            async move { coordinator.activate_one().await }
+            async move { coordinator.lock().await.activate_one().await }
         })
         .await;
         if joined.as_ref().is_err_and(|error| error.is_panic()) {
@@ -1514,7 +1540,7 @@ async fn g3_panicking_step_is_bounded_by_activation_attempts() {
 /// backoff (1 s) between attempts. Each activation must return promptly.
 async fn activate_until_failed(
     pool: &DurablePool,
-    coordinator: &WorkflowCoordinator<GapContext>,
+    coordinator: &mut WorkflowCoordinator<GapContext>,
     workflow_id: WorkflowId,
 ) -> (usize, WorkflowRow) {
     let started = tokio::time::Instant::now();
@@ -1552,7 +1578,7 @@ async fn g3_panicking_step_fails_at_the_activation_cap() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         Arc::new(GapContext::default()),
         CoordinatorConfig {
@@ -1560,7 +1586,7 @@ async fn g3_panicking_step_fails_at_the_activation_cap() {
             ..CoordinatorConfig::default()
         },
     );
-    let (activations, row) = activate_until_failed(&pool, &coordinator, workflow_id).await;
+    let (activations, row) = activate_until_failed(&pool, &mut coordinator, workflow_id).await;
     assert_eq!(activations, 2);
     assert_eq!(row.activation_attempts, 2);
     assert_eq!(
@@ -1579,7 +1605,7 @@ async fn g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         Arc::new(GapContext::default()),
         CoordinatorConfig {
@@ -1588,7 +1614,7 @@ async fn g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts() {
             ..CoordinatorConfig::default()
         },
     );
-    let (activations, row) = activate_until_failed(&pool, &coordinator, workflow_id).await;
+    let (activations, row) = activate_until_failed(&pool, &mut coordinator, workflow_id).await;
     assert_eq!(activations, 2);
     assert_eq!(row.activation_attempts, 2);
     assert_eq!(
@@ -1602,7 +1628,6 @@ async fn g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "confirms G8: child_with_key resolving to the caller commits a self-wait (waiting_child on itself)"]
 async fn g8_child_key_resolving_to_self_does_not_wait_on_itself() {
     let Some(pool) = support::fresh_pool().await else {
         return;
@@ -1627,6 +1652,54 @@ async fn g8_child_key_resolving_to_self_does_not_wait_on_itself() {
         "workflow {} waits on itself: status {}",
         row.id,
         row.status.as_str()
+    );
+}
+
+#[tokio::test]
+async fn g8_child_key_resolving_to_a_grandparent_is_an_activation_failure() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let grandparent = DurableStore::new(pool.clone())
+        .start(
+            &G8Ancestor { depth: 0 },
+            StartOptions::default().with_deduplication_key("g8-ancestor"),
+        )
+        .await
+        .expect("grandparent starts")
+        .workflow_id;
+    let mut coordinator = coordinator(&pool, context, CoordinatorConfig::default());
+    for _ in 0..3 {
+        coordinator
+            .activate_one()
+            .await
+            .expect("activation")
+            .expect("claim");
+    }
+    let parent = load(&pool, grandparent)
+        .await
+        .wait_reference_id
+        .expect("parent");
+    let caller = load(&pool, WorkflowId::new(parent).expect("id"))
+        .await
+        .wait_reference_id
+        .expect("caller");
+    let row = load(&pool, WorkflowId::new(caller).expect("id")).await;
+    assert_eq!(row.parent_workflow_id, Some(parent));
+    assert!(
+        row.status.as_str() != "waiting_child",
+        "workflow {caller} waits on {:?}",
+        row.wait_reference_id
+    );
+    assert_eq!(row.activation_attempts, 1);
+    let message = row.error_message.expect("activation failure message");
+    assert!(
+        message.contains(&format!(
+            "child key g8-ancestor resolves to workflow {}, which is the caller or an ancestor",
+            grandparent.get()
+        )),
+        "{message}"
     );
 }
 
@@ -1673,7 +1746,7 @@ async fn n1_tree(block_sibling: bool) -> Option<N1Tree> {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = WorkflowCoordinator::new(
+    let mut coordinator = WorkflowCoordinator::new(
         pool.clone(),
         context.clone(),
         n1_workflows(),
@@ -1682,7 +1755,7 @@ async fn n1_tree(block_sibling: bool) -> Option<N1Tree> {
         CoordinatorConfig::default(),
     )
     .expect("coordinator is valid");
-    let activate = || async {
+    let mut activate = async || {
         coordinator
             .activate_one()
             .await
@@ -1955,7 +2028,7 @@ async fn n2_cap_holds_after_revoke(revoke: N2Revoke) {
     };
     let context = Arc::new(N2Context::default());
     let store = DurableStore::new(pool.clone());
-    let coordinator = WorkflowCoordinator::new(
+    let mut coordinator = WorkflowCoordinator::new(
         pool.clone(),
         context.clone(),
         n2_workflows(),

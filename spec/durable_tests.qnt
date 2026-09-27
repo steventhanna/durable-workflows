@@ -164,6 +164,30 @@ module durable_tests {
       .then(all { keepPrev, TC2_RunChild(1, 4, ct(1), "C", DOMAIN_KEY, 2, 0, now) })
       .fail()
 
+  // G8 (fixed): w2 is the child with key "k"; its own RunChild on "k" resolves to w2 and is
+  // rejected, and the code records an activation failure instead
+  action g8KeyedChildClaimed: bool =
+    init
+      .then(start(NO_KEY))
+      .then(claim(1, 1))
+      .then(runChild(1, DOMAIN_KEY))                                   // w2 = C key "k", parent w1
+      .then(claim(1, 2))
+  run g8SelfKeyRejectedTest = g8KeyedChildClaimed.then(runChild(1, DOMAIN_KEY)).fail()
+  run g8SelfKeyActivationFailureTest =
+    g8KeyedChildClaimed
+      .then(all { keepPrev, TC3_ActivationFailure(1, 2, ct(1), 1, MAX_ACTIVATION, now, now) })
+      .expect(lastAction == "TC3_Retry" and db.wf.get(2).status == "ready" and safety)
+  // w4's grandparent w2 holds "k": RunChild on "k" from w4 is rejected
+  run g8GrandparentKeyRejectedTest =
+    g8KeyedChildClaimed
+      .then(all { keepPrev, TC2_RunChild(1, 2, ct(1), "C", nextAutoKey(1), 0, db.nextWf, now) })   // w3
+      .then(claim(1, 3))
+      .then(all { keepPrev, TC2_RunChild(1, 3, ct(1), "C", nextAutoKey(1), 0, db.nextWf, now) })   // w4
+      .then(claim(1, 4))
+      .expect(selfAndAncestors(db, 4) == Set(1, 2, 3, 4))
+      .then(runChild(1, DOMAIN_KEY))
+      .fail()
+
   // N1 (fixed): the keyed child succeeded; a later auto-keyed sibling of the same kind is
   // blocked. T-X2(C, "k") follows the keyed row's own restart chain: it returns w2 and
   // leaves the sibling alone (superseding the sibling is not a step)
