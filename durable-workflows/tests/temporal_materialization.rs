@@ -133,7 +133,10 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
     assert_eq!(first.wake_one(now + 1).await.expect("paused timer"), None);
     let paused_row = workflow(&pool, paused).await;
     assert_eq!(paused_row.status.as_str(), "paused");
-    assert_eq!(paused_row.wait_kind.as_deref(), Some("timer"));
+    assert_eq!(
+        paused_row.wait_kind.map(|kind| kind.as_str()),
+        Some("timer")
+    );
     assert!(deliverable_events(&pool, paused, "timer_fired")
         .await
         .is_empty());
@@ -199,7 +202,7 @@ async fn seed_approval(
             prompt_metadata_json: r#"{"prompt":"safe"}"#.to_string(),
             validation_schema_json: "{}".to_string(),
             validation_version: 1,
-            status: "pending".to_string(),
+            status: durable_workflows::persistence::ApprovalStatus::Pending,
             requested_at: expires_at - 1_000,
             expires_at: Some(expires_at),
             decision_payload_json: None,
@@ -291,7 +294,7 @@ async fn approval_expiry_is_typed_atomic_race_safe_and_preserves_pause() {
         .first::<ApprovalRow>(&mut connection)
         .await
         .expect("approval");
-    assert_eq!(approval.status, "expired");
+    assert_eq!(approval.status.as_str(), "expired");
     assert_eq!(approval.resolved_at, Some(now));
 }
 

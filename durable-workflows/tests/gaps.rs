@@ -1400,7 +1400,7 @@ where
         Some(workflow_id)
     );
     let recovered = load(&pool, workflow_id).await;
-    assert_eq!(recovered.wait_kind.as_deref(), Some(wait));
+    assert_eq!(recovered.wait_kind.map(|kind| kind.as_str()), Some(wait));
 
     stale_context.release.add_permits(1);
     let outcome = activation.await.expect("activation task joins");

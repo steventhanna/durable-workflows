@@ -18,10 +18,13 @@ use tracing::Instrument;
 use crate::{
     deterministic_jitter_percentile,
     observability::{lease_fingerprint, ActivationCounters, BenignActivationKind},
-    persistence::{self, NewWorkflowEventRow, WorkflowEventRow, WorkflowRow, WorkflowStatus},
+    persistence::{
+        self, ApprovalStatus, NewWorkflowEventRow, Wait, WorkflowEventRow, WorkflowRow,
+        WorkflowStatus,
+    },
     schema::durable_workflow,
-    ActivityRegistry, BackoffPolicy, DurableError, DurablePool, RetryPolicy, StoredTransition,
-    WorkflowEvent, WorkflowId, WorkflowRegistry,
+    ActivityId, ActivityRegistry, ApprovalId, BackoffPolicy, DurableError, DurablePool,
+    RetryPolicy, StoredTransition, WorkflowEvent, WorkflowId, WorkflowRegistry,
 };
 use crate::{
     store::ChildStart,
@@ -836,8 +839,13 @@ async fn commit_wait_transition<'tx>(
                     durable_workflow::state_json.eq(state_json),
                     durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
                     durable_workflow::status.eq(WorkflowStatus::Sleeping),
-                    durable_workflow::wait_kind.eq(Some("timer".to_string())),
-                    durable_workflow::wait_reference_id.eq(Some(i64::from(command))),
+                    persistence::WaitColumns::on(Wait::Timer {
+                        command_sequence: u32::try_from(command).map_err(|_| {
+                            DurableError::InvalidState(
+                                "negative workflow command sequence".to_string(),
+                            )
+                        })?,
+                    }),
                     durable_workflow::available_at.eq(wake_at_millis),
                     durable_workflow::command_sequence.eq(command),
                     durable_workflow::delivered_event_sequence.eq(delivered),
@@ -873,7 +881,7 @@ async fn commit_wait_transition<'tx>(
                     prompt_metadata_json: approval_json,
                     validation_schema_json: "{}".to_string(),
                     validation_version: 1,
-                    status: "pending".to_string(),
+                    status: ApprovalStatus::Pending,
                     requested_at: now,
                     expires_at: expires_at_millis,
                     decision_payload_json: None,
@@ -888,8 +896,7 @@ async fn commit_wait_transition<'tx>(
                     durable_workflow::state_json.eq(state_json),
                     durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
                     durable_workflow::status.eq(WorkflowStatus::WaitingApproval),
-                    durable_workflow::wait_kind.eq(Some("approval".to_string())),
-                    durable_workflow::wait_reference_id.eq(Some(approval_id)),
+                    persistence::WaitColumns::on(Wait::Approval(ApprovalId::new(approval_id)?)),
                     durable_workflow::command_sequence.eq(command),
                     durable_workflow::delivered_event_sequence.eq(delivered),
                     durable_workflow::consecutive_continuations.eq(0),
@@ -989,8 +996,7 @@ async fn commit_activity<'tx>(
             durable_workflow::state_json.eq(state_json),
             durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
             durable_workflow::status.eq(WorkflowStatus::WaitingActivity),
-            durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            persistence::WaitColumns::on(Wait::Activity(ActivityId::new(activity_id)?)),
             durable_workflow::command_sequence.eq(command),
             durable_workflow::delivered_event_sequence.eq(delivered),
             durable_workflow::consecutive_continuations.eq(0),
@@ -1157,8 +1163,7 @@ async fn set_child_wait(
             durable_workflow::state_json.eq(state_json),
             durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
             durable_workflow::status.eq(WorkflowStatus::WaitingChild),
-            durable_workflow::wait_kind.eq(Some("child".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(child.workflow_id()?.get())),
+            persistence::WaitColumns::on(Wait::Child(child.workflow_id()?)),
             durable_workflow::command_sequence.eq(command),
             durable_workflow::delivered_event_sequence.eq(delivered),
             durable_workflow::consecutive_continuations.eq(0),

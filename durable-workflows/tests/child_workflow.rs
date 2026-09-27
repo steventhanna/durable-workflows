@@ -278,7 +278,7 @@ async fn parent_awaits_child_flow_and_completes_with_its_output() {
         .expect("parent claim");
     let parent = load_workflow(&pool, started.workflow_id).await;
     assert_eq!(parent.status.as_str(), "waiting_child");
-    assert_eq!(parent.wait_kind.as_deref(), Some("child"));
+    assert_eq!(parent.wait_kind.map(|kind| kind.as_str()), Some("child"));
     let child_id = parent.wait_reference_id.expect("child reference");
 
     let mut connection = pool.get().await.expect("test connection");
@@ -691,7 +691,7 @@ async fn paused_parent_resumes_into_waiting_child() {
         .expect("parent pauses");
     let parent = load_workflow(&pool, started.workflow_id).await;
     assert_eq!(parent.status.as_str(), "paused");
-    assert_eq!(parent.wait_kind.as_deref(), Some("child"));
+    assert_eq!(parent.wait_kind.map(|kind| kind.as_str()), Some("child"));
 
     control
         .resume_workflow(started.workflow_id, &operator)

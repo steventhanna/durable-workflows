@@ -11,8 +11,8 @@ use tracing::Instrument;
 use crate::{
     observability::lease_fingerprint,
     persistence::{
-        self, ActivityRow, ActivityStatus, NewActivityAttemptRow, NewWorkflowEventRow,
-        WorkflowStatus,
+        self, ActivityRow, ActivityStatus, AttemptOutcome, NewActivityAttemptRow,
+        NewWorkflowEventRow, WorkflowStatus,
     },
     schema::{durable_activity, durable_activity_attempt, durable_topic_lock, durable_workflow},
     store::close_attempt,
@@ -1257,7 +1257,7 @@ async fn reconcile_expired(
                 let settled = settle_revoked(
                     connection,
                     row.as_ref(),
-                    "lease_expired",
+                    AttemptOutcome::LeaseExpired,
                     "activity lease expired",
                     now,
                 )
@@ -1332,8 +1332,9 @@ async fn reconcile_expired(
         )
         .set((
             durable_activity_attempt::finished_at.eq(Some(now)),
-            durable_activity_attempt::outcome.eq(Some("lease_expired".to_string())),
-            durable_activity_attempt::error_category.eq(Some("lease_expired".to_string())),
+            durable_activity_attempt::outcome.eq(Some(AttemptOutcome::LeaseExpired)),
+            durable_activity_attempt::error_category
+                .eq(Some(AttemptOutcome::LeaseExpired.as_str())),
             durable_activity_attempt::error_message.eq(Some("activity lease expired".to_string())),
         ))
         .execute(connection)
@@ -1388,7 +1389,7 @@ struct SettledRevoke {
 async fn settle_revoked(
     connection: &mut crate::DurableConnection,
     row: Locked<'_, &ActivityRow>,
-    attempt_outcome: &str,
+    attempt_outcome: AttemptOutcome,
     message: &str,
     now: i64,
 ) -> Result<SettledRevoke, DurableError> {
@@ -1536,14 +1537,15 @@ async fn finish_on_connection(
     match (row.status, outcome) {
         // Revoked (N2): whatever the handler returned is not applied.
         (ActivityStatus::Cancelling, _) => {
-            let outcome = row.last_error_category.clone().ok_or_else(|| {
-                DurableError::InvalidState(format!(
-                    "cancelling activity {} records no revoke outcome",
-                    row.id
-                ))
-            })?;
+            let outcome =
+                AttemptOutcome::try_from(row.last_error_category.as_deref().ok_or_else(|| {
+                    DurableError::InvalidState(format!(
+                        "cancelling activity {} records no revoke outcome",
+                        row.id
+                    ))
+                })?)?;
             let message = row.last_error_message.clone().unwrap_or_default();
-            let settled = settle_revoked(connection, row.as_ref(), &outcome, &message, now).await?;
+            let settled = settle_revoked(connection, row.as_ref(), outcome, &message, now).await?;
             declare_finish(claim, "revoked", Some(settled.available_at));
             Ok(())
         }
@@ -1580,7 +1582,7 @@ async fn finish_on_connection(
             finish_attempt(
                 connection,
                 claim,
-                "succeeded",
+                AttemptOutcome::Succeeded,
                 None,
                 None,
                 Some(output.clone()),
@@ -1622,7 +1624,7 @@ async fn finish_on_connection(
                 finish_attempt(
                     connection,
                     claim,
-                    "retryable_failure",
+                    AttemptOutcome::RetryableFailure,
                     Some(category),
                     Some(message.clone()),
                     None,
@@ -1670,7 +1672,7 @@ async fn dead_letter(
     finish_attempt(
         connection,
         claim,
-        "dead_lettered",
+        AttemptOutcome::DeadLettered,
         Some(category.to_string()),
         Some(message.to_string()),
         None,
@@ -1683,7 +1685,7 @@ async fn dead_letter(
 async fn finish_attempt(
     connection: &mut crate::DurableConnection,
     claim: &ActivityClaim,
-    outcome: &str,
+    outcome: AttemptOutcome,
     category: Option<String>,
     message: Option<String>,
     provider_result: Option<String>,
@@ -1697,7 +1699,7 @@ async fn finish_attempt(
     )
     .set((
         durable_activity_attempt::finished_at.eq(Some(now)),
-        durable_activity_attempt::outcome.eq(Some(outcome.to_string())),
+        durable_activity_attempt::outcome.eq(Some(outcome)),
         durable_activity_attempt::error_category.eq(category),
         durable_activity_attempt::error_message.eq(message),
         durable_activity_attempt::provider_result_json.eq(provider_result),
@@ -1757,8 +1759,7 @@ async fn wake_workflow(
     )
     .set((
         durable_workflow::status.eq(WorkflowStatus::Ready),
-        durable_workflow::wait_kind.eq(None::<String>),
-        durable_workflow::wait_reference_id.eq(None::<i64>),
+        persistence::WaitColumns::cleared(),
         durable_workflow::available_at.eq(now),
         durable_workflow::updated_at.eq(now),
     ))

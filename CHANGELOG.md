@@ -88,6 +88,18 @@ Compared with the production-internal version it was extracted from:
 - `WorkflowStatus` and `ActivityStatus` are `#[non_exhaustive]`. A
   downstream exhaustive `match` on either needs a wildcard arm (breaking),
   so new statuses can ship in a minor release.
+- The remaining string-typed status and kind columns of the public row
+  types are enums, like `WorkflowStatus`: `WorkflowRow::wait_kind` and
+  `NewWorkflowRow::wait_kind` are `Option<persistence::WaitKind>`,
+  `ApprovalRow::status` and `NewApprovalRow::status` are
+  `persistence::ApprovalStatus`, `ScheduleRunRow::status` and
+  `NewScheduleRunRow::status` are `persistence::ScheduleRunStatus`, and
+  `ActivityAttemptRow::outcome` and `NewActivityAttemptRow::outcome` are
+  `Option<persistence::AttemptOutcome>` (breaking for code that reads or
+  builds these rows with strings; `as_str()` gives the old text). All four
+  are `#[non_exhaustive]`. The persisted text and the admin view types are
+  unchanged. Loading a row whose column holds a value outside the enum is
+  an `InvalidState` error instead of a string the engine never wrote.
 - Every transaction the library opens runs at READ COMMITTED on both
   backends. This closes gap G4 for library transactions. MySQL with binary
   logging needs `binlog_format=ROW` (the 8.x default). The `*_with_conn`

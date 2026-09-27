@@ -11,8 +11,9 @@ use crate::{
     },
     error::ensure_size,
     persistence::{
-        self, ActivityRow, ActivityStatus, ApprovalRow, NewActivityRow, NewScheduleRunRow,
-        NewWorkflowEventRow, ScheduleStateRow, WorkflowRow, WorkflowStatus,
+        self, ActivityRow, ActivityStatus, ApprovalRow, ApprovalStatus, AttemptOutcome,
+        NewActivityRow, NewScheduleRunRow, NewWorkflowEventRow, ScheduleRunStatus,
+        ScheduleStateRow, Wait, WorkflowRow, WorkflowStatus,
     },
     schema::{
         durable_activity, durable_approval, durable_schedule_run, durable_schedule_state,
@@ -77,10 +78,8 @@ where
             });
             crate::trace::touch_wf(workflow.id);
             let now = persistence::database_now_millis(connection).await?;
-            if workflow.wait_kind.as_deref() == Some("activity") {
-                if let Some(activity_id) = workflow.wait_reference_id {
-                    pause_activity(connection, activity_id, &operator, now).await?;
-                }
+            if let Some(Wait::Activity(activity_id)) = workflow.wait()? {
+                pause_activity(connection, activity_id.get(), &operator, now).await?;
             }
             let changed = diesel::update(
                 durable_workflow::table
@@ -281,7 +280,7 @@ where
                     connection,
                     source.id,
                     operator.reason(),
-                    "operator_cancelled",
+                    AttemptOutcome::OperatorCancelled,
                     now,
                 )
                 .await?;
@@ -421,7 +420,7 @@ where
                         .optional()?
                         .ok_or_else(|| not_found("activity", activity_id))?;
                     if workflow.status != WorkflowStatus::Blocked
-                        || workflow.wait_reference_id != Some(source.id)
+                        || workflow.wait()? != Some(Wait::Activity(activity_id))
                         || source.status != ActivityStatus::DeadLettered
                     {
                         return Err(DurableError::Conflict(format!(
@@ -504,8 +503,7 @@ where
                     )
                     .set((
                         durable_workflow::status.eq(WorkflowStatus::WaitingActivity),
-                        durable_workflow::wait_kind.eq(Some("activity".to_string())),
-                        durable_workflow::wait_reference_id.eq(Some(replacement_id.get())),
+                        persistence::WaitColumns::on(Wait::Activity(replacement_id)),
                         durable_workflow::available_at.eq(now),
                         durable_workflow::error_category.eq(None::<String>),
                         durable_workflow::error_message.eq(None::<String>),
@@ -567,7 +565,7 @@ where
                 .await
                 .optional()?
                 .ok_or_else(|| not_found("approval", approval_id))?;
-            if approval.status != "pending" {
+            if approval.status != ApprovalStatus::Pending {
                 return Err(DurableError::Conflict(format!(
                     "approval {approval_id} is already {}",
                     approval.status
@@ -583,8 +581,7 @@ where
                 )));
             }
             if !workflow.status.awaits_approval()
-                || workflow.wait_kind.as_deref() != Some("approval")
-                || workflow.wait_reference_id != Some(approval.id)
+                || workflow.wait()? != Some(Wait::Approval(approval_id))
                 || workflow.kind != approval.kind
                 || workflow.version != approval.version
             {
@@ -639,10 +636,10 @@ where
             let changed = diesel::update(
                 durable_approval::table
                     .find(approval.id)
-                    .filter(durable_approval::status.eq("pending")),
+                    .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
             )
             .set((
-                durable_approval::status.eq("resolved"),
+                durable_approval::status.eq(ApprovalStatus::Resolved),
                 durable_approval::decision_payload_json.eq(Some(decision)),
                 durable_approval::decided_by.eq(Some(actor_id)),
                 durable_approval::operator_reason.eq(Some(operator.reason().to_string())),
@@ -664,8 +661,7 @@ where
             )
             .set((
                 durable_workflow::status.eq(next_status),
-                durable_workflow::wait_kind.eq(None::<String>),
-                durable_workflow::wait_reference_id.eq(None::<i64>),
+                persistence::WaitColumns::cleared(),
                 durable_workflow::available_at.eq(now),
                 durable_workflow::updated_at.eq(now),
             ))
@@ -675,7 +671,7 @@ where
             Ok(ApprovalResolutionOutcome {
                 approval_id,
                 workflow_id,
-                status: "resolved".to_string(),
+                status: ApprovalStatus::Resolved.to_string(),
             })
         })
         .await
@@ -824,7 +820,7 @@ where
                         ),
                         scheduled_for,
                         materialized_at: now,
-                        status: "materializing".to_string(),
+                        status: ScheduleRunStatus::Materializing,
                         reason: Some(operator.reason().to_string()),
                         actor_id: Some(actor_id),
                         workflow_id: None,
@@ -845,10 +841,10 @@ where
             let changed = diesel::update(
                 durable_schedule_run::table
                     .find(schedule_run_id.get())
-                    .filter(durable_schedule_run::status.eq("materializing")),
+                    .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Materializing)),
             )
             .set((
-                durable_schedule_run::status.eq("started"),
+                durable_schedule_run::status.eq(ScheduleRunStatus::Started),
                 durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
             ))
             .execute(connection)
@@ -988,7 +984,7 @@ async fn pause_activity(
     .set((
         durable_activity::status.eq(ActivityStatus::Cancelling),
         durable_activity::max_attempts.eq(max_attempts),
-        durable_activity::last_error_category.eq(Some("operator_paused".to_string())),
+        durable_activity::last_error_category.eq(Some(AttemptOutcome::OperatorPaused.as_str())),
         durable_activity::last_error_message.eq(Some(operator.reason().to_string())),
         durable_activity::updated_at.eq(now),
     ))
@@ -1001,15 +997,12 @@ async fn resume_status(
     connection: &mut crate::DurableConnection,
     workflow: &WorkflowRow,
 ) -> Result<WorkflowStatus, DurableError> {
-    match workflow.wait_kind.as_deref() {
+    match workflow.wait()? {
         None => Ok(WorkflowStatus::Ready),
-        Some("timer") => Ok(WorkflowStatus::Sleeping),
-        Some("activity") => {
-            let activity_id = workflow.wait_reference_id.ok_or_else(|| {
-                DurableError::InvalidState("paused activity wait has no reference".to_string())
-            })?;
+        Some(Wait::Timer { .. }) => Ok(WorkflowStatus::Sleeping),
+        Some(Wait::Activity(activity_id)) => {
             let status = durable_activity::table
-                .find(activity_id)
+                .find(activity_id.get())
                 .select(durable_activity::status)
                 .first::<ActivityStatus>(connection)
                 .await
@@ -1032,12 +1025,9 @@ async fn resume_status(
                 ))),
             }
         }
-        Some("child") => {
-            let child_id = workflow.wait_reference_id.ok_or_else(|| {
-                DurableError::InvalidState("paused child wait has no reference".to_string())
-            })?;
+        Some(Wait::Child(child_id)) => {
             let status = durable_workflow::table
-                .find(child_id)
+                .find(child_id.get())
                 .select(durable_workflow::status)
                 .first::<WorkflowStatus>(connection)
                 .await
@@ -1055,14 +1045,11 @@ async fn resume_status(
                 Ok(WorkflowStatus::WaitingChild)
             }
         }
-        Some("approval") => {
-            let approval_id = workflow.wait_reference_id.ok_or_else(|| {
-                DurableError::InvalidState("paused approval wait has no reference".to_string())
-            })?;
+        Some(Wait::Approval(approval_id)) => {
             let status = durable_approval::table
-                .find(approval_id)
+                .find(approval_id.get())
                 .select(durable_approval::status)
-                .first::<String>(connection)
+                .first::<ApprovalStatus>(connection)
                 .await
                 .optional()?
                 .ok_or_else(|| {
@@ -1070,15 +1057,12 @@ async fn resume_status(
                         "paused approval wait references a missing approval".to_string(),
                     )
                 })?;
-            Ok(if status == "pending" {
+            Ok(if status == ApprovalStatus::Pending {
                 WorkflowStatus::WaitingApproval
             } else {
                 WorkflowStatus::Ready
             })
         }
-        Some(value) => Err(DurableError::InvalidState(format!(
-            "paused workflow has unsupported wait kind {value}"
-        ))),
     }
 }
 

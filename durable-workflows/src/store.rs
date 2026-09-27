@@ -6,8 +6,8 @@ use diesel_async::RunQueryDsl;
 use crate::{
     error::ensure_size,
     persistence::{
-        self, ActivityRow, ActivityStatus, ApprovalRow, NewWorkflowEventRow, NewWorkflowRow,
-        WorkflowRow, WorkflowStatus,
+        self, ActivityRow, ActivityStatus, ApprovalRow, ApprovalStatus, AttemptOutcome,
+        NewWorkflowEventRow, NewWorkflowRow, Wait, WaitKind, WorkflowRow, WorkflowStatus,
     },
     schema::{durable_activity, durable_activity_attempt, durable_approval, durable_workflow},
     tx::{self, Locked, TxScope},
@@ -781,7 +781,7 @@ async fn hand_waiting_parents_to_successor<'tx>(
         .await;
     }
     let parents = durable_workflow::table
-        .filter(durable_workflow::wait_kind.eq("child"))
+        .filter(durable_workflow::wait_kind.eq(WaitKind::Child))
         .filter(durable_workflow::wait_reference_id.eq(superseded.id))
         .filter(durable_workflow::status.eq_any(WorkflowStatus::CHILD_WAITERS))
         .for_update()
@@ -794,11 +794,11 @@ async fn hand_waiting_parents_to_successor<'tx>(
             durable_workflow::table
                 .find(parent.id)
                 .filter(durable_workflow::status.eq(&parent.status))
-                .filter(durable_workflow::wait_kind.eq("child"))
+                .filter(durable_workflow::wait_kind.eq(WaitKind::Child))
                 .filter(durable_workflow::wait_reference_id.eq(superseded.id)),
         )
         .set((
-            durable_workflow::wait_reference_id.eq(Some(successor.get())),
+            persistence::WaitColumns::on(Wait::Child(successor)),
             durable_workflow::updated_at.eq(now),
         ))
         .execute(connection)
@@ -968,9 +968,9 @@ async fn cancel_one_workflow<'tx>(
     let workflow_id = WorkflowId::new(workflow.id)?;
     crate::trace::touch_wf(workflow.id);
     let attempt_outcome = if operator_id.is_some() {
-        "operator_cancelled"
+        AttemptOutcome::OperatorCancelled
     } else {
-        "application_cancelled"
+        AttemptOutcome::ApplicationCancelled
     };
     cancel_activities(connection, workflow.id, reason, attempt_outcome, now).await?;
     cancel_approvals(connection, workflow.id, reason, now).await?;
@@ -981,8 +981,7 @@ async fn cancel_one_workflow<'tx>(
     )
     .set((
         durable_workflow::status.eq(WorkflowStatus::Cancelled),
-        durable_workflow::wait_kind.eq(None::<String>),
-        durable_workflow::wait_reference_id.eq(None::<i64>),
+        persistence::WaitColumns::cleared(),
         durable_workflow::lease_owner.eq(None::<String>),
         durable_workflow::lease_token.eq(None::<String>),
         durable_workflow::lease_expires_at.eq(None::<i64>),
@@ -1036,7 +1035,7 @@ pub(crate) async fn cancel_activities(
     connection: &mut DurableConnection,
     workflow_id: i64,
     reason: &str,
-    attempt_outcome: &str,
+    attempt_outcome: AttemptOutcome,
     now: i64,
 ) -> Result<(), DurableError> {
     let activities = durable_activity::table
@@ -1068,7 +1067,7 @@ pub(crate) async fn cancel_activities(
                 )
                 .set((
                     durable_activity::status.eq(ActivityStatus::Cancelling),
-                    durable_activity::last_error_category.eq(Some(attempt_outcome.to_string())),
+                    durable_activity::last_error_category.eq(Some(attempt_outcome.as_str())),
                     durable_activity::last_error_message.eq(Some(reason.to_string())),
                     durable_activity::updated_at.eq(now),
                 ))
@@ -1107,7 +1106,7 @@ pub(crate) async fn cancel_activities(
 pub(crate) async fn close_attempt(
     connection: &mut DurableConnection,
     activity: &ActivityRow,
-    outcome: &str,
+    outcome: AttemptOutcome,
     reason: &str,
     now: i64,
 ) -> Result<(), DurableError> {
@@ -1126,8 +1125,8 @@ pub(crate) async fn close_attempt(
     )
     .set((
         durable_activity_attempt::finished_at.eq(Some(now)),
-        durable_activity_attempt::outcome.eq(Some(outcome.to_string())),
-        durable_activity_attempt::error_category.eq(Some(outcome.to_string())),
+        durable_activity_attempt::outcome.eq(Some(outcome)),
+        durable_activity_attempt::error_category.eq(Some(outcome.as_str())),
         durable_activity_attempt::error_message.eq(Some(reason.to_string())),
     ))
     .execute(connection)
@@ -1143,7 +1142,7 @@ pub(crate) async fn cancel_approvals(
 ) -> Result<(), DurableError> {
     let approvals = durable_approval::table
         .filter(durable_approval::workflow_id.eq(workflow_id))
-        .filter(durable_approval::status.eq("pending"))
+        .filter(durable_approval::status.eq(ApprovalStatus::Pending))
         .for_update()
         .select(ApprovalRow::as_select())
         .load::<ApprovalRow>(connection)
@@ -1152,10 +1151,10 @@ pub(crate) async fn cancel_approvals(
         let changed = diesel::update(
             durable_approval::table
                 .find(approval.id)
-                .filter(durable_approval::status.eq("pending")),
+                .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
         )
         .set((
-            durable_approval::status.eq("cancelled"),
+            durable_approval::status.eq(ApprovalStatus::Cancelled),
             durable_approval::operator_reason.eq(Some(reason.to_string())),
             durable_approval::resolved_at.eq(Some(now)),
         ))

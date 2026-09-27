@@ -6,7 +6,10 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 
 use crate::{
-    persistence::{self, NewScheduleRunRow, ScheduleRunRow, ScheduleStateRow, WorkflowStatus},
+    persistence::{
+        self, NewScheduleRunRow, ScheduleRunRow, ScheduleRunStatus, ScheduleStateRow,
+        WorkflowStatus,
+    },
     schedule::ScheduleCursor,
     schema::{durable_schedule_run, durable_schedule_state, durable_workflow},
     tx::{self, Locked, Tx},
@@ -353,7 +356,7 @@ where
                     local_occurrence: occurrence.local_occurrence,
                     scheduled_for: occurrence.scheduled_for,
                     materialized_at: target.now,
-                    status: "queued".to_string(),
+                    status: ScheduleRunStatus::Queued,
                     reason: Some("overlap_queue_one".to_string()),
                     actor_id: None,
                     workflow_id: None,
@@ -368,9 +371,11 @@ where
         (outcome, _) => outcome,
     };
     let (status, reason) = match outcome {
-        OccurrenceOutcome::Start => ("materializing", None),
-        OccurrenceOutcome::Skip(reason) => ("skipped", Some(reason.to_string())),
-        OccurrenceOutcome::Coalesce => ("coalesced", Some("run_latest".to_string())),
+        OccurrenceOutcome::Start => (ScheduleRunStatus::Materializing, None),
+        OccurrenceOutcome::Skip(reason) => (ScheduleRunStatus::Skipped, Some(reason.to_string())),
+        OccurrenceOutcome::Coalesce => {
+            (ScheduleRunStatus::Coalesced, Some("run_latest".to_string()))
+        }
     };
     let run_id = crate::dialect::insert_schedule_run(
         connection,
@@ -379,7 +384,7 @@ where
             local_occurrence: occurrence.local_occurrence,
             scheduled_for: occurrence.scheduled_for,
             materialized_at: target.now,
-            status: status.to_string(),
+            status,
             reason,
             actor_id: None,
             workflow_id: None,
@@ -403,10 +408,10 @@ where
             let changed = diesel::update(
                 durable_schedule_run::table
                     .find(schedule_run_id.get())
-                    .filter(durable_schedule_run::status.eq("materializing")),
+                    .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Materializing)),
             )
             .set((
-                durable_schedule_run::status.eq("started"),
+                durable_schedule_run::status.eq(ScheduleRunStatus::Started),
                 durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
             ))
             .execute(connection)
@@ -448,7 +453,7 @@ async fn queued_run_exists(
 ) -> Result<bool, DurableError> {
     Ok(durable_schedule_run::table
         .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-        .filter(durable_schedule_run::status.eq("queued"))
+        .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Queued))
         .count()
         .get_result::<i64>(connection)
         .await?
@@ -466,7 +471,7 @@ where
 {
     let run = durable_schedule_run::table
         .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-        .filter(durable_schedule_run::status.eq("queued"))
+        .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Queued))
         .order((
             durable_schedule_run::scheduled_for.asc(),
             durable_schedule_run::id.asc(),
@@ -488,10 +493,10 @@ where
     let changed = diesel::update(
         durable_schedule_run::table
             .find(run.id)
-            .filter(durable_schedule_run::status.eq("queued")),
+            .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Queued)),
     )
     .set((
-        durable_schedule_run::status.eq("started"),
+        durable_schedule_run::status.eq(ScheduleRunStatus::Started),
         durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
         durable_schedule_run::reason.eq(Some("queue_one_promoted".to_string())),
     ))

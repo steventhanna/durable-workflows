@@ -63,8 +63,10 @@ type system cannot express the rule.
   (cancellation, readiness); `WorkflowStatus::is_terminal` / `TERMINAL`,
   `awaits_child` / `CHILD_WAITERS`, `awaits_approval` / `APPROVAL_WAITERS`,
   `awaits_dead_letter` / `DEAD_LETTER_WAITERS`, `is_restartable`,
-  `is_start_recoverable`. Each constant is checked against its predicate at
-  compile time (`status_set_matches_predicate!`); SQL filters use the
+  `is_start_recoverable`. `WaitKind`, `ApprovalStatus`,
+  `ScheduleRunStatus` and `AttemptOutcome` are the same kind of enum (no
+  status sets yet; add one the same way when code needs membership). Each
+  constant is checked against its predicate at compile time (`status_set_matches_predicate!`); SQL filters use the
   constant (`status.eq_any(ActivityStatus::SLOT_HOLDERS)`), Rust code the
   predicate.
 - Every write of `durable_schedule_state.next_local_occurrence` goes through
@@ -73,11 +75,17 @@ type system cannot express the rule.
   the state lock) for a version upgrade. The cursor stays strictly after the
   last materialized occurrence. These types are `pub(crate)`, so their checks
   are unit tests in that module, not trybuild cases.
+- A workflow's wait is read through `WorkflowRow::wait()` (the one parser,
+  `persistence::Wait::parse`, of `wait_kind` + `wait_reference_id` into a
+  `Wait` whose kind carries its reference) and written through the
+  `persistence::WaitColumns` changeset fragment (`on(wait)` or
+  `cleared()`), never by setting one wait column alone.
 - Every `durable_activity` update that clears the lease sets the
   `persistence::LeaseCleared` changeset fragment instead of listing the three
   lease columns (S1, S9).
 - Public enums and config structs that may grow are `#[non_exhaustive]`
-  (`WorkflowStatus`, `ActivityStatus`; the compile-fail case
+  (`WorkflowStatus`, `ActivityStatus`, `WaitKind`, `ApprovalStatus`,
+  `ScheduleRunStatus`, `AttemptOutcome`; the compile-fail case
   `activity_status_match_non_exhaustive` shows a downstream exhaustive
   `match` is E0004).
 - Never persist or compare host wall-clock time with a database timestamp.

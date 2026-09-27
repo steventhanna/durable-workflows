@@ -379,7 +379,7 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
         .expect("gap history");
     assert_eq!((gap.started, gap.skipped), (0, 1));
     let gap_runs = runs(&pool, GapSchedule::KEY).await;
-    assert_eq!(gap_runs[0].status, "skipped");
+    assert_eq!(gap_runs[0].status.as_str(), "skipped");
     assert_eq!(gap_runs[0].reason.as_deref(), Some("dst_gap"));
 
     let scan_start = at(2026, 1, 1, 0);

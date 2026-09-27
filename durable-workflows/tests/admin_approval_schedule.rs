@@ -161,7 +161,7 @@ async fn insert_approval(
             prompt_metadata_json: r#"{"prompt":"safe"}"#.to_string(),
             validation_schema_json: r#"{"type":"boolean"}"#.to_string(),
             validation_version: 1,
-            status: "pending".to_string(),
+            status: durable_workflows::persistence::ApprovalStatus::Pending,
             requested_at: now,
             expires_at,
             decision_payload_json: None,
@@ -228,7 +228,7 @@ async fn approval_resolution_validates_exact_version_and_wakes_with_a_typed_even
         .first::<ApprovalRow>(&mut connection)
         .await
         .expect("approval");
-    assert_eq!(approval.status, "resolved");
+    assert_eq!(approval.status.as_str(), "resolved");
     assert_eq!(approval.decision_payload_json.as_deref(), Some("true"));
     assert_eq!(approval.decided_by, Some(42));
     let workflow = durable_workflow::table
@@ -305,7 +305,7 @@ async fn expired_or_invalid_approval_decisions_roll_back_without_waking() {
         .first::<ApprovalRow>(&mut connection)
         .await
         .expect("approval");
-    assert_eq!(approval.status, "pending");
+    assert_eq!(approval.status.as_str(), "pending");
     assert!(approval.decision_payload_json.is_none());
 }
 

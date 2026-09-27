@@ -1000,7 +1000,10 @@ async fn timer_and_approval_transitions_persist_their_wait_records() {
         .await
         .expect("approval request loads");
     assert_eq!(sleeping_row.status.as_str(), "sleeping");
-    assert_eq!(sleeping_row.wait_kind.as_deref(), Some("timer"));
+    assert_eq!(
+        sleeping_row.wait_kind.map(|kind| kind.as_str()),
+        Some("timer")
+    );
     assert_eq!(approval_row.status.as_str(), "waiting_approval");
     assert_eq!(approval_row.wait_reference_id, Some(request.id));
     assert!(request.prompt_metadata_json.contains("Approve this test"));

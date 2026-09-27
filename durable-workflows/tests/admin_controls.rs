@@ -489,7 +489,10 @@ async fn pause_fences_a_running_activity_and_resume_reopens_the_wait() {
         .first::<ActivityAttemptRow>(&mut connection)
         .await
         .expect("attempt");
-    assert_eq!(attempt.outcome.as_deref(), Some("lease_expired"));
+    assert_eq!(
+        attempt.outcome.map(|outcome| outcome.as_str()),
+        Some("lease_expired")
+    );
     assert!(attempt.finished_at.is_some());
 }
 
@@ -601,7 +604,7 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
             local_occurrence: "2026-01-01T00:00:00".to_string(),
             scheduled_for: 0,
             materialized_at: 0,
-            status: "started".to_string(),
+            status: durable_workflows::persistence::ScheduleRunStatus::Started,
             reason: None,
             actor_id: None,
             workflow_id: Some(workflow_id.get()),

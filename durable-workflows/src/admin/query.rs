@@ -8,7 +8,7 @@ use crate::{
         CursorPosition, JsonFieldSummary, PageRequest, ProgressSummary, TimelineEntry,
         WorkflowListFilter, WorkflowSummary, MAX_ADMIN_PAGE_SIZE, MAX_TIMELINE_PAGE_SIZE,
     },
-    persistence::{ActivityStatus, WorkflowStatus},
+    persistence::{ActivityStatus, ApprovalStatus, AttemptOutcome, WaitKind, WorkflowStatus},
     schema::{
         durable_activity, durable_activity_attempt, durable_approval, durable_progress_event,
         durable_workflow, durable_workflow_event,
@@ -34,7 +34,7 @@ struct WorkflowProjection {
     kind: String,
     version: i32,
     status: WorkflowStatus,
-    wait_kind: Option<String>,
+    wait_kind: Option<WaitKind>,
     schedule_run_id: Option<i64>,
     root_workflow_id: Option<i64>,
     restarted_from_workflow_id: Option<i64>,
@@ -54,7 +54,7 @@ struct WorkflowDetailProjection {
     kind: String,
     version: i32,
     status: WorkflowStatus,
-    wait_kind: Option<String>,
+    wait_kind: Option<WaitKind>,
     schedule_run_id: Option<i64>,
     root_workflow_id: Option<i64>,
     restarted_from_workflow_id: Option<i64>,
@@ -124,7 +124,7 @@ struct AttemptProjection {
     started_at: i64,
     heartbeat_at: i64,
     finished_at: Option<i64>,
-    outcome: Option<String>,
+    outcome: Option<AttemptOutcome>,
     error_category: Option<String>,
     error_message: Option<String>,
     provider_result_bytes: Option<i64>,
@@ -138,7 +138,7 @@ struct AttemptDetailProjection {
     started_at: i64,
     heartbeat_at: i64,
     finished_at: Option<i64>,
-    outcome: Option<String>,
+    outcome: Option<AttemptOutcome>,
     error_category: Option<String>,
     error_message: Option<String>,
     provider_result_json: Option<String>,
@@ -150,7 +150,7 @@ struct ApprovalProjection {
     workflow_id: i64,
     kind: String,
     version: i32,
-    status: String,
+    status: ApprovalStatus,
     decision_bytes: Option<i64>,
     decided_by: Option<i32>,
     operator_reason: Option<String>,
@@ -406,11 +406,11 @@ impl AdminQueryService {
         // Filter on wait_kind so paused approval waits remain visible; status
         // alone excludes paused rows that still hold a pending approval.
         if filter.waiting_approval == Some(true) {
-            query = query.filter(durable_workflow::wait_kind.eq("approval"));
+            query = query.filter(durable_workflow::wait_kind.eq(WaitKind::Approval));
         } else if filter.waiting_approval == Some(false) {
             query = query.filter(
                 durable_workflow::wait_kind
-                    .ne("approval")
+                    .ne(WaitKind::Approval)
                     .or(durable_workflow::wait_kind.is_null()),
             );
         }
@@ -1016,7 +1016,7 @@ fn workflow_summary(row: WorkflowProjection) -> Result<WorkflowSummary, DurableE
         kind: row.kind,
         version: row.version,
         status: row.status.to_string(),
-        wait_kind: row.wait_kind,
+        wait_kind: row.wait_kind.map(|kind| kind.to_string()),
         schedule_run_id: row.schedule_run_id.map(ScheduleRunId::new).transpose()?,
         root_workflow_id: row.root_workflow_id.map(WorkflowId::new).transpose()?,
         restarted_from_workflow_id: row
@@ -1040,7 +1040,7 @@ fn workflow_detail_summary(row: WorkflowDetailProjection) -> Result<WorkflowSumm
         kind: row.kind,
         version: row.version,
         status: row.status.to_string(),
-        wait_kind: row.wait_kind,
+        wait_kind: row.wait_kind.map(|kind| kind.to_string()),
         schedule_run_id: row.schedule_run_id.map(ScheduleRunId::new).transpose()?,
         root_workflow_id: row.root_workflow_id.map(WorkflowId::new).transpose()?,
         restarted_from_workflow_id: row
@@ -1124,7 +1124,7 @@ fn attempt_summary(row: AttemptProjection) -> Result<ActivityAttemptSummary, Dur
         started_at: row.started_at,
         heartbeat_at: row.heartbeat_at,
         finished_at: row.finished_at,
-        outcome: row.outcome,
+        outcome: row.outcome.map(|outcome| outcome.to_string()),
         error_category: row.error_category,
         error_message: row.error_message,
         provider_result: optional_json_summary(row.provider_result_bytes)?,
@@ -1141,7 +1141,7 @@ fn attempt_detail_summary(
         started_at: row.started_at,
         heartbeat_at: row.heartbeat_at,
         finished_at: row.finished_at,
-        outcome: row.outcome,
+        outcome: row.outcome.map(|outcome| outcome.to_string()),
         error_category: row.error_category,
         error_message: row.error_message,
         provider_result: JsonFieldSummary::from_optional_json(row.provider_result_json.as_deref())?,
@@ -1154,7 +1154,7 @@ fn approval_summary(row: ApprovalProjection) -> Result<ApprovalSummary, DurableE
         workflow_id: WorkflowId::new(row.workflow_id)?,
         kind: row.kind,
         version: row.version,
-        status: row.status,
+        status: row.status.to_string(),
         decision: optional_json_summary(row.decision_bytes)?,
         decided_by: row.decided_by,
         operator_reason: row.operator_reason,

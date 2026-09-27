@@ -3,7 +3,9 @@ use diesel_async::RunQueryDsl;
 
 use crate::{
     dialect::{self, WorkflowInsert},
-    persistence::{self, NewWorkflowEventRow, NewWorkflowRow, WorkflowRow, WorkflowStatus},
+    persistence::{
+        self, NewWorkflowEventRow, NewWorkflowRow, Wait, WaitKind, WorkflowRow, WorkflowStatus,
+    },
     schema::{durable_workflow, durable_workflow_event},
     tx::{self, Locked, TxScope},
     ChildResult, DurableConnection, DurableError, WorkflowEvent, WorkflowId,
@@ -147,7 +149,7 @@ pub(crate) async fn wake_waiting_parents_on_child_terminal<'tx>(
     let (child_workflow_id, child_kind, child_version) =
         (child.id, child.kind.as_str(), child.version);
     let parents = durable_workflow::table
-        .filter(durable_workflow::wait_kind.eq("child"))
+        .filter(durable_workflow::wait_kind.eq(WaitKind::Child))
         .filter(durable_workflow::wait_reference_id.eq(child_workflow_id))
         .filter(durable_workflow::status.eq_any(WorkflowStatus::CHILD_WAITERS))
         .for_update()
@@ -179,8 +181,7 @@ async fn wake_loaded_parent_on_child_terminal(
     now: i64,
 ) -> Result<(), DurableError> {
     if !parent.status.awaits_child()
-        || parent.wait_kind.as_deref() != Some("child")
-        || parent.wait_reference_id != Some(child_workflow_id)
+        || parent.wait()? != Some(Wait::Child(WorkflowId::new(child_workflow_id)?))
     {
         return Ok(());
     }
@@ -247,13 +248,12 @@ async fn wake_loaded_parent_on_child_terminal(
         durable_workflow::table
             .find(parent.id)
             .filter(durable_workflow::status.eq(&parent.status))
-            .filter(durable_workflow::wait_kind.eq(parent.wait_kind.clone()))
+            .filter(durable_workflow::wait_kind.eq(parent.wait_kind))
             .filter(durable_workflow::wait_reference_id.eq(parent.wait_reference_id)),
     )
     .set((
         durable_workflow::status.eq(next_status),
-        durable_workflow::wait_kind.eq(None::<String>),
-        durable_workflow::wait_reference_id.eq(None::<i64>),
+        persistence::WaitColumns::cleared(),
         durable_workflow::available_at.eq(now),
         durable_workflow::updated_at.eq(now),
     ))

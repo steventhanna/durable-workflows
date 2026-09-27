@@ -4,7 +4,7 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 
 use crate::{
-    persistence::{ActivityStatus, WorkflowStatus},
+    persistence::{ActivityStatus, WaitKind, WorkflowStatus},
     schema::{durable_activity, durable_workflow},
     ActivityRegistry, DefinitionKey, DurableConnection, DurableError, TopicRegistry,
     WorkflowRegistry,
@@ -75,7 +75,7 @@ impl ReadinessReport {
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
             .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
-            .filter(durable_workflow::wait_kind.eq("activity"))
+            .filter(durable_workflow::wait_kind.eq(WaitKind::Activity))
             .select((durable_activity::kind, durable_activity::version))
             .distinct()
             .load::<(String, i32)>(connection)
@@ -95,7 +95,7 @@ impl ReadinessReport {
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
             .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
-            .filter(durable_workflow::wait_kind.eq("activity"))
+            .filter(durable_workflow::wait_kind.eq(WaitKind::Activity))
             .select(durable_activity::topic)
             .distinct()
             .load::<String>(connection)

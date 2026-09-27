@@ -397,7 +397,10 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         .await
         .expect("attempt");
     assert!(attempt.finished_at.is_some());
-    assert_eq!(attempt.outcome.as_deref(), Some("lease_expired"));
+    assert_eq!(
+        attempt.outcome.map(|outcome| outcome.as_str()),
+        Some("lease_expired")
+    );
     let settled = durable_activity::table
         .find(activity_id)
         .select(ActivityRow::as_select())

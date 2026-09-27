@@ -833,7 +833,8 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
                 local_occurrence: format!("occurrence-{offset}"),
                 scheduled_for: NOW - offset * HOUR_MILLIS,
                 materialized_at: NOW - offset * HOUR_MILLIS,
-                status: status.to_string(),
+                status: durable_workflows::persistence::ScheduleRunStatus::try_from(status)
+                    .expect("schedule run status"),
                 reason: Some(format!("bounded {status}")),
                 actor_id: None,
                 workflow_id: None,
@@ -959,7 +960,7 @@ async fn schedule_run_cursors_support_max_length_schedule_keys() {
                 local_occurrence: format!("occurrence-{offset}"),
                 scheduled_for: NOW - offset,
                 materialized_at: NOW - offset,
-                status: "skipped".to_string(),
+                status: durable_workflows::persistence::ScheduleRunStatus::Skipped,
                 reason: None,
                 actor_id: None,
                 workflow_id: None,
@@ -1010,7 +1011,7 @@ async fn approval_listing_classifies_expiry_without_loading_decisions() {
         (1, "pending", Some(NOW - 1), None),
         (
             2,
-            "approved",
+            "resolved",
             None,
             Some(r#"{"secret":"approval-decision"}"#.to_string()),
         ),
@@ -1024,13 +1025,14 @@ async fn approval_listing_classifies_expiry_without_loading_decisions() {
                 prompt_metadata_json: r#"{"secret":"approval-prompt"}"#.to_string(),
                 validation_schema_json: "{}".to_string(),
                 validation_version: 1,
-                status: status.to_string(),
+                status: durable_workflows::persistence::ApprovalStatus::try_from(status)
+                    .expect("approval status"),
                 requested_at: NOW - i64::from(sequence) * 1_000,
                 expires_at,
                 decision_payload_json: decision,
-                decided_by: (status == "approved").then_some(7),
-                operator_reason: (status == "approved").then(|| "Reviewed".to_string()),
-                resolved_at: (status == "approved").then_some(NOW - 100),
+                decided_by: (status == "resolved").then_some(7),
+                operator_reason: (status == "resolved").then(|| "Reviewed".to_string()),
+                resolved_at: (status == "resolved").then_some(NOW - 100),
             })
             .execute(&mut connection)
             .await

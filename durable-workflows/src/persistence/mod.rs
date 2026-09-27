@@ -1,6 +1,7 @@
 mod activities;
 mod events;
 mod models;
+mod wait;
 mod workflows;
 
 pub use models::{
@@ -14,6 +15,7 @@ use crate::{DurableConnection, DurableError};
 
 pub(crate) use events::{append_event, next_delivery_event, next_event_sequence};
 pub(crate) use models::LeaseCleared;
+pub(crate) use wait::{Wait, WaitColumns};
 pub use workflows::find_workflow_by_id;
 pub(crate) use workflows::{
     find_by_deduplication_key, insert_started, lock_workflow_by_id,
@@ -41,7 +43,8 @@ macro_rules! string_status {
 
         impl $name {
             /// Every variant, generated from the declaration, so the status-set
-            /// checks below cannot miss one.
+            /// checks below cannot miss one. Not every enum has a status set.
+            #[allow(dead_code)]
             const ALL: &'static [Self] = &[$(Self::$variant),+];
 
             pub const fn as_str(self) -> &'static str {
@@ -52,6 +55,7 @@ macro_rules! string_status {
 
             /// `true` when `set` lists `status`. `const` so a status-set
             /// constant can be checked against its predicate at compile time.
+            #[allow(dead_code)]
             const fn set_contains(set: &[Self], status: Self) -> bool {
                 let mut index = 0;
                 while index < set.len() {
@@ -158,6 +162,38 @@ string_status!(ActivityStatus {
     Succeeded => "succeeded",
     DeadLettered => "dead_lettered",
     Cancelled => "cancelled",
+});
+
+string_status!(WaitKind {
+    Timer => "timer",
+    Activity => "activity",
+    Child => "child",
+    Approval => "approval",
+});
+
+string_status!(ApprovalStatus {
+    Pending => "pending",
+    Resolved => "resolved",
+    Expired => "expired",
+    Cancelled => "cancelled",
+});
+
+string_status!(ScheduleRunStatus {
+    Queued => "queued",
+    Materializing => "materializing",
+    Started => "started",
+    Skipped => "skipped",
+    Coalesced => "coalesced",
+});
+
+string_status!(AttemptOutcome {
+    Succeeded => "succeeded",
+    RetryableFailure => "retryable_failure",
+    DeadLettered => "dead_lettered",
+    LeaseExpired => "lease_expired",
+    OperatorCancelled => "operator_cancelled",
+    ApplicationCancelled => "application_cancelled",
+    OperatorPaused => "operator_paused",
 });
 
 // Status membership lives in the exhaustive predicates and constants below;
@@ -320,3 +356,83 @@ status_set_matches_predicate!(ActivityStatus::LEASE_HOLDERS == holds_lease);
 status_set_matches_predicate!(ActivityStatus::NON_TERMINAL == is_non_terminal);
 
 pub use activities::find_activity_by_id;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActivityStatus, ApprovalStatus, AttemptOutcome, ScheduleRunStatus, WaitKind, WorkflowStatus,
+    };
+    use crate::DurableError;
+
+    /// Every variant survives `as_str` -> `try_from` and the serde wire form
+    /// is the persisted text; an unknown string is an `InvalidState` error.
+    macro_rules! round_trips {
+        ($($test:ident: $name:ident),+ $(,)?) => {$(
+            #[test]
+            fn $test() {
+                for &value in $name::ALL {
+                    assert_eq!($name::try_from(value.as_str()).unwrap(), value);
+                    assert_eq!(value.to_string(), value.as_str());
+                    let json = serde_json::to_string(&value).unwrap();
+                    assert_eq!(json, format!("\"{}\"", value.as_str()));
+                    assert_eq!(serde_json::from_str::<$name>(&json).unwrap(), value);
+                }
+                match $name::try_from("no_such_value") {
+                    Err(DurableError::InvalidState(message)) => {
+                        assert!(message.contains(stringify!($name)), "{message}");
+                        assert!(message.contains("no_such_value"), "{message}");
+                    }
+                    other => panic!("unexpected parse result {other:?}"),
+                }
+            }
+        )+};
+    }
+
+    round_trips!(
+        workflow_status_round_trips: WorkflowStatus,
+        activity_status_round_trips: ActivityStatus,
+        wait_kind_round_trips: WaitKind,
+        approval_status_round_trips: ApprovalStatus,
+        schedule_run_status_round_trips: ScheduleRunStatus,
+        attempt_outcome_round_trips: AttemptOutcome,
+    );
+
+    /// The persisted text of every variant, pinned: these strings are stored
+    /// in existing rows and recorded in traces.
+    #[test]
+    fn persisted_text_is_unchanged() {
+        let texts = |values: &[&str]| values.join(",");
+        assert_eq!(
+            texts(&WaitKind::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>()),
+            "timer,activity,child,approval"
+        );
+        assert_eq!(
+            texts(
+                &ApprovalStatus::ALL
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            "pending,resolved,expired,cancelled"
+        );
+        assert_eq!(
+            texts(
+                &ScheduleRunStatus::ALL
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            "queued,materializing,started,skipped,coalesced"
+        );
+        assert_eq!(
+            texts(
+                &AttemptOutcome::ALL
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+            ),
+            "succeeded,retryable_failure,dead_lettered,lease_expired,operator_cancelled,\
+             application_cancelled,operator_paused"
+        );
+    }
+}

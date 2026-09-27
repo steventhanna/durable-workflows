@@ -15,7 +15,7 @@ use crate::{
         MAX_ADMIN_PAGE_SIZE,
     },
     persistence::ScheduleStateRow,
-    persistence::{ActivityStatus, WorkflowStatus},
+    persistence::{ActivityStatus, ApprovalStatus, ScheduleRunStatus, WorkflowStatus},
     schema::{
         durable_activity, durable_activity_attempt, durable_approval, durable_schedule_run,
         durable_schedule_state, durable_topic_lock, durable_workflow,
@@ -46,7 +46,7 @@ struct ScheduleRunProjection {
     local_occurrence: String,
     scheduled_for: i64,
     materialized_at: i64,
-    status: String,
+    status: ScheduleRunStatus,
     reason: Option<String>,
     actor_id: Option<i32>,
     workflow_id: Option<i64>,
@@ -61,7 +61,7 @@ struct ApprovalListProjection {
     workflow_id: i64,
     kind: String,
     version: i32,
-    status: String,
+    status: ApprovalStatus,
     decision_bytes: Option<i64>,
     decided_by: Option<i32>,
     operator_reason: Option<String>,
@@ -609,13 +609,13 @@ impl AdminQueryService {
             .await?;
         let skipped = durable_schedule_run::table
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-            .filter(durable_schedule_run::status.eq("skipped"))
+            .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Skipped))
             .select(count_star())
             .first::<i64>(&mut connection)
             .await?;
         let coalesced = durable_schedule_run::table
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-            .filter(durable_schedule_run::status.eq("coalesced"))
+            .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Coalesced))
             .select(count_star())
             .first::<i64>(&mut connection)
             .await?;
@@ -661,22 +661,26 @@ impl AdminQueryService {
             query = query.filter(durable_approval::version.eq(version));
         }
         if let Some(status) = filter.status.as_deref() {
-            query = match status {
-                "expired" => query.filter(
-                    durable_approval::status
-                        .eq("expired")
-                        .or(durable_approval::status
-                            .eq("pending")
-                            .and(durable_approval::expires_at.le(now))),
+            query = match ApprovalStatus::try_from(status) {
+                Ok(ApprovalStatus::Expired) => query.filter(
+                    durable_approval::status.eq(ApprovalStatus::Expired).or(
+                        durable_approval::status
+                            .eq(ApprovalStatus::Pending)
+                            .and(durable_approval::expires_at.le(now)),
+                    ),
                 ),
-                "pending" => query.filter(
-                    durable_approval::status.eq("pending").and(
+                Ok(ApprovalStatus::Pending) => query.filter(
+                    durable_approval::status.eq(ApprovalStatus::Pending).and(
                         durable_approval::expires_at
                             .is_null()
                             .or(durable_approval::expires_at.gt(now)),
                     ),
                 ),
-                status => query.filter(durable_approval::status.eq(status)),
+                Ok(status @ (ApprovalStatus::Resolved | ApprovalStatus::Cancelled)) => {
+                    query.filter(durable_approval::status.eq(status))
+                }
+                // An unknown filter value still matches no row.
+                Err(_) => query.filter(durable_approval::status.eq(status)),
             };
         }
         if let Some(after) = filter.requested_after {
@@ -766,7 +770,7 @@ fn schedule_run_summary(row: ScheduleRunProjection) -> Result<ScheduleRunSummary
         local_occurrence: row.local_occurrence,
         scheduled_for: row.scheduled_for,
         materialized_at: row.materialized_at,
-        status: row.status,
+        status: row.status.to_string(),
         reason: row.reason,
         actor_id: row.actor_id,
         workflow_id: row.workflow_id.map(WorkflowId::new).transpose()?,
@@ -780,8 +784,10 @@ fn approval_summary(
     row: ApprovalListProjection,
     now: i64,
 ) -> Result<ApprovalSummary, DurableError> {
-    let status = if row.status == "pending" && row.expires_at.is_some_and(|expiry| expiry <= now) {
-        "expired".to_string()
+    let status = if row.status == ApprovalStatus::Pending
+        && row.expires_at.is_some_and(|expiry| expiry <= now)
+    {
+        ApprovalStatus::Expired
     } else {
         row.status
     };
@@ -790,7 +796,7 @@ fn approval_summary(
         workflow_id: WorkflowId::new(row.workflow_id)?,
         kind: row.kind,
         version: row.version,
-        status,
+        status: status.to_string(),
         decision: json_summary(row.decision_bytes)?,
         decided_by: row.decided_by,
         operator_reason: row.operator_reason,

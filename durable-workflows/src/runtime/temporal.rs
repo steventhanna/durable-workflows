@@ -4,7 +4,10 @@ use diesel_async::RunQueryDsl;
 
 use crate::{
     error::ensure_size,
-    persistence::{self, ApprovalRow, NewWorkflowEventRow, WorkflowRow, WorkflowStatus},
+    persistence::{
+        self, ApprovalRow, ApprovalStatus, NewWorkflowEventRow, Wait, WaitKind, WorkflowRow,
+        WorkflowStatus,
+    },
     schema::{durable_approval, durable_workflow},
     ApprovalId, DurableError, DurablePool, WorkflowEvent, WorkflowId, MAX_EVENT_METADATA_BYTES,
 };
@@ -34,7 +37,7 @@ impl TimerMaterializer {
         crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             let Some(workflow) = durable_workflow::table
                 .filter(durable_workflow::status.eq(WorkflowStatus::Sleeping))
-                .filter(durable_workflow::wait_kind.eq("timer"))
+                .filter(durable_workflow::wait_kind.eq(WaitKind::Timer))
                 .filter(durable_workflow::available_at.le(now))
                 .order((
                     durable_workflow::available_at.asc(),
@@ -49,7 +52,7 @@ impl TimerMaterializer {
             else {
                 return Ok(None);
             };
-            let command_sequence = wait_command_sequence(&workflow, "timer")?;
+            let command_sequence = wait_command_sequence(&workflow)?;
             crate::trace::declare_unmodeled("timer_fired", true);
             crate::trace::touch_wf(workflow.id);
             let event = WorkflowEvent::TimerFired { command_sequence };
@@ -84,7 +87,7 @@ impl ApprovalExpiryMaterializer {
     pub async fn materialize_one(&self, now: i64) -> Result<Option<ApprovalId>, DurableError> {
         let mut connection = self.pool.get().await?;
         let candidate = durable_approval::table
-            .filter(durable_approval::status.eq("pending"))
+            .filter(durable_approval::status.eq(ApprovalStatus::Pending))
             .filter(durable_approval::expires_at.le(now))
             .order((
                 durable_approval::expires_at.asc(),
@@ -111,7 +114,7 @@ impl ApprovalExpiryMaterializer {
                 .select(ApprovalRow::as_select())
                 .first::<ApprovalRow>(connection)
                 .await?;
-            if approval.status != "pending"
+            if approval.status != ApprovalStatus::Pending
                 || approval
                     .expires_at
                     .is_none_or(|expires_at| expires_at > now)
@@ -119,8 +122,7 @@ impl ApprovalExpiryMaterializer {
                 return Ok(None);
             }
             if !workflow.status.awaits_approval()
-                || workflow.wait_kind.as_deref() != Some("approval")
-                || workflow.wait_reference_id != Some(approval.id)
+                || workflow.wait()? != Some(Wait::Approval(ApprovalId::new(approval.id)?))
                 || workflow.kind != approval.kind
                 || workflow.version != approval.version
             {
@@ -129,7 +131,7 @@ impl ApprovalExpiryMaterializer {
                     approval.id, workflow.id
                 )));
             }
-            let command_sequence = wait_command_sequence(&workflow, "approval")?;
+            let command_sequence = wait_command_sequence(&workflow)?;
             if i64::from(command_sequence) != i64::from(approval.command_sequence) {
                 return Err(DurableError::InvalidState(format!(
                     "approval {} command sequence does not match workflow {}",
@@ -143,10 +145,10 @@ impl ApprovalExpiryMaterializer {
             let changed = diesel::update(
                 durable_approval::table
                     .find(approval.id)
-                    .filter(durable_approval::status.eq("pending")),
+                    .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
             )
             .set((
-                durable_approval::status.eq("expired"),
+                durable_approval::status.eq(ApprovalStatus::Expired),
                 durable_approval::resolved_at.eq(Some(now)),
             ))
             .execute(connection)
@@ -159,18 +161,25 @@ impl ApprovalExpiryMaterializer {
     }
 }
 
-fn wait_command_sequence(workflow: &WorkflowRow, kind: &str) -> Result<u32, DurableError> {
-    let reference = workflow.wait_reference_id.ok_or_else(|| {
-        DurableError::InvalidState(format!(
-            "workflow {} {kind} wait has no reference",
-            workflow.id
-        ))
-    })?;
-    if kind == "timer" && reference != i64::from(workflow.command_sequence) {
-        return Err(DurableError::InvalidState(format!(
-            "workflow {} timer reference does not match its command sequence",
-            workflow.id
-        )));
+/// The command sequence the wake event of `workflow`'s timer or approval
+/// wait answers. A timer's reference is that command sequence.
+fn wait_command_sequence(workflow: &WorkflowRow) -> Result<u32, DurableError> {
+    match workflow.wait()? {
+        Some(Wait::Timer { command_sequence }) => {
+            if i64::from(command_sequence) != i64::from(workflow.command_sequence) {
+                return Err(DurableError::InvalidState(format!(
+                    "workflow {} timer reference does not match its command sequence",
+                    workflow.id
+                )));
+            }
+        }
+        Some(Wait::Approval(_)) => {}
+        Some(Wait::Activity(_) | Wait::Child(_)) | None => {
+            return Err(DurableError::InvalidState(format!(
+                "workflow {} has no timer or approval wait",
+                workflow.id
+            )));
+        }
     }
     u32::try_from(workflow.command_sequence).map_err(|_| {
         DurableError::InvalidState(format!(
@@ -232,13 +241,12 @@ async fn clear_wait(
         durable_workflow::table
             .find(workflow.id)
             .filter(durable_workflow::status.eq(&workflow.status))
-            .filter(durable_workflow::wait_kind.eq(workflow.wait_kind.clone()))
+            .filter(durable_workflow::wait_kind.eq(workflow.wait_kind))
             .filter(durable_workflow::wait_reference_id.eq(workflow.wait_reference_id)),
     )
     .set((
         durable_workflow::status.eq(next_status),
-        durable_workflow::wait_kind.eq(None::<String>),
-        durable_workflow::wait_reference_id.eq(None::<i64>),
+        persistence::WaitColumns::cleared(),
         durable_workflow::available_at.eq(now),
         durable_workflow::updated_at.eq(now),
     ))

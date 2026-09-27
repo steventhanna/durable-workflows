@@ -632,7 +632,10 @@ async fn success_finishes_attempt_and_wakes_workflow_with_typed_event() {
 
     assert_eq!(activity.status.as_str(), "succeeded");
     assert_eq!(activity.provider_result_json.as_deref(), Some("42"));
-    assert_eq!(attempt.outcome.as_deref(), Some("succeeded"));
+    assert_eq!(
+        attempt.outcome.map(|outcome| outcome.as_str()),
+        Some("succeeded")
+    );
     assert_eq!(workflow.status.as_str(), "ready");
     assert_eq!(workflow.wait_reference_id, None);
     assert!(matches!(

@@ -139,7 +139,7 @@ async fn seed_expired_approval(pool: &durable_workflows::DurablePool, now: i64) 
             prompt_metadata_json: r#"{"prompt":"safe"}"#.to_string(),
             validation_schema_json: "{}".to_string(),
             validation_version: 1,
-            status: "pending".to_string(),
+            status: durable_workflows::persistence::ApprovalStatus::Pending,
             requested_at: now.saturating_sub(1_000),
             expires_at: Some(now.saturating_sub(1)),
             decision_payload_json: None,
