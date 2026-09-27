@@ -279,7 +279,9 @@ not cancel its children, and the parent drops their later outcomes (G11,
 
 **Schedules.** Each schedule key has one runtime task. At spawn and on each
 tick, T-S1 inserts or upgrades the `durable_schedule_state` row; a new version
-resets the cursor to the first occurrence after `now` (S30, G5). T-S2 locks
+moves the cursor to the first occurrence after `now` that is strictly after
+the last materialized occurrence (S27, S30). The cursor is a `ScheduleCursor`
+(`src/schedule/cursor.rs`); only its constructors and `advance_to` set it. T-S2 locks
 the state row, requires the pinned version and fingerprint, returns if the
 schedule is paused, and applies the overlap policy (`Allow`, `SkipIfActive`,
 `QueueOne`) and the misfire policy (`Skip`, `RunLatest`, `CatchUp`). For each
@@ -287,8 +289,9 @@ due occurrence (at most 10,000 per chunk) it inserts a `durable_schedule_run`
 row and, to start it, calls your `ScheduleHandler::start_occurrence` on the
 same connection. It then advances the cursor with a fence on the old cursor,
 version and fingerprint. A failed tick rolls back its run rows and cursor
-together (S26, S27). Admin run-now (T-A9) inserts a `manual:{t}` run and
-ignores the pause and the overlap policy (G12).
+together (S26, S27). Admin run-now (T-A9) inserts a `manual:{t}` run. It
+returns `Conflict` when the overlap policy is `SkipIfActive` or `QueueOne` and
+a run is active, and it ignores the pause on purpose (G12).
 
 **Timers.** Timers have no table. `SleepUntil` sets the workflow to `sleeping`
 with `wait_kind = timer`, `wait_reference_id = command_sequence` and

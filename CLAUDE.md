@@ -20,7 +20,9 @@ system can make the violation fail to compile. In order of preference:
 
 1. **Unrepresentable.** Model the domain so the bad state has no value: an
    enum instead of a combination of `Option` fields, a newtype instead of a
-   raw `i64`/`String`, a parsed type instead of a validated one, an outcome
+   raw `i64`/`String`, a parsed type instead of a validated one (a schedule's
+   local occurrence key is a `LocalOccurrence`, the one parser and formatter
+   of the persisted text, ordered like it), an outcome
    enum instead of a flag (a lease renewal returns `Renewed::Held` or
    `Renewed::Revoked`; a revoked execution finishes as
    `ExecutionOutcome::Revoked`).
@@ -31,7 +33,10 @@ system can make the violation fail to compile. In order of preference:
    private constructor that a function must receive before it may act, an
    exhaustive `match` that forces every new variant to be decided.
 3. **Checked at the boundary.** A constructor or parser that returns `Result`
-   (e.g. `RetryPolicy::fixed`), plus a test.
+   (e.g. `RetryPolicy::fixed`), or a transition that does
+   (`ScheduleCursor::advance_to` rejects a cursor that does not move forward
+   in local time, and `ScheduleCursor::upgrade` places the cursor strictly
+   after a `MaterializedFloor` read from the database, S27), plus a test.
 4. **Checked by the model.** The Quint model, directed tests and trace
    checking. These back up the types; they do not replace them.
 
@@ -59,6 +64,12 @@ type system cannot express the rule.
   compile time (`status_set_matches_predicate!`); SQL filters use the
   constant (`status.eq_any(ActivityStatus::SLOT_HOLDERS)`), Rust code the
   predicate.
+- Every write of `durable_schedule_state.next_local_occurrence` goes through
+  `ScheduleCursor` (`src/schedule/cursor.rs`): `initial` for a new row,
+  `advance_to` for a tick, `upgrade` (with a `MaterializedFloor` loaded under
+  the state lock) for a version upgrade. The cursor stays strictly after the
+  last materialized occurrence. These types are `pub(crate)`, so their checks
+  are unit tests in that module, not trybuild cases.
 - Every `durable_activity` update that clears the lease sets the
   `persistence::LeaseCleared` changeset fragment instead of listing the three
   lease columns (S1, S9).

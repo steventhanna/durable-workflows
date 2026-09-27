@@ -113,6 +113,9 @@ Compared with the production-internal version it was extracted from:
   replaces `WorkflowCoordinator::activate_claim(claim)`. This matches the
   model's one-claim-per-runtime rule (`TC1_Claim`). Use one coordinator per
   worker id; the trace checker maps a worker id to one model runtime.
+- `AdminControlService::run_schedule_now` can return `Conflict` when the
+  schedule's overlap policy is `SkipIfActive` or `QueueOne` and a run of the
+  schedule is active (G12). It still ignores the pause.
 
 ### Removed
 
@@ -178,6 +181,17 @@ Compared with the production-internal version it was extracted from:
   heartbeat learns of the revoke, cancels the handler and settles it (or the
   lease expires); a pause then resume does not claim the next attempt until
   the old one settles.
+- G5: `ScheduleCalendar::next_after` is strictly later than its argument as an
+  instant. A schedule upgraded (or first reconciled) in the second pass of a
+  daylight-saving fall-back hour no longer points its cursor at an occurrence
+  the first pass already ran, which made every later tick fail on the
+  occurrence's unique key. An occurrence in a repeated hour fires once, at
+  the earlier pass. A version upgrade sets the cursor to the new calendar's
+  first occurrence after now that is strictly after the last materialized
+  occurrence, so it never re-targets an occurrence that already ran, also
+  when the upgrade changes the timezone; a new earlier slot still runs (daily
+  08:00 changed to 07:00 at 05:00 runs today at 07:00).
+- G12: admin run-now respects the schedule's overlap policy (see Changed).
 
 ### Known issues
 

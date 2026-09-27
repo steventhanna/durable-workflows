@@ -216,8 +216,8 @@ has reproduction tests for most of the suspected gaps in INVARIANTS §6 and for 
 more (N1, N2) found by the model. A test that confirms its gap is `#[ignore]`d
 with the reason, so the suite stays green; a fix removes the `#[ignore]`. A
 test that refuted its gap (G4, closed by READ COMMITTED) stays as a
-regression test. G5 and G12 are not reproduced by a test yet; G9 was fixed
-without one, and G7 is closed under READ COMMITTED (the Quint model shows why,
+regression test. G5 and G12 are fixed, with tests in the schedule suites; G9
+was fixed without one, and G7 is closed under READ COMMITTED (the Quint model shows why,
 see [`spec/README.md`](spec/README.md)).
 
 Trace checking ([`docs/TRACE_CHECKING.md`](docs/TRACE_CHECKING.md)) records

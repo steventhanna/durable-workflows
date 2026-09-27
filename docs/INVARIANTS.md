@@ -570,9 +570,11 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
   (`delivery+1`); fenced approval → `resolved`; workflow → `ready`
   (paused stays paused).
 - **T-A8 pause/resume schedule** (`677-740`), **T-A9 run now** (`742-820`):
-  lock state; run-now inserts a `manual:{t}` run with
-  `t = max(last scheduledFor + 1, now)` and starts a workflow. It checks
-  neither `pausedAt` nor the overlap policy.
+  lock state; run-now returns `Conflict` when the overlap policy is
+  `SkipIfActive` or `QueueOne` and a run of the key is active (S29), else
+  inserts a `manual:{t}` run with `t = max(last scheduledFor + 1, now)` and
+  starts a workflow. It ignores `pausedAt` on purpose (an operator override)
+  and does not move the cursor.
 
 ### 2.8 Lock order summary
 
@@ -821,10 +823,20 @@ fence (`src/runtime/schedule_materializer.rs:116-128`, `193-214`).
 Run-now uses `manual:{t}` with `t` strictly increasing per key under the same
 lock.
 
-**S27. Between version upgrades, the cursor strictly increases in local time
-and every occurrence before it has exactly one run row.** A failed tick rolls
-back its rows and cursor together. **ENFORCED**. An upgrade resets the cursor
-without run rows for the skipped span (`src/schedule.rs:402-412`; G5).
+**S27. The cursor is always strictly after the last materialized occurrence
+(the largest local occurrence key with a run row; `manual:{t}` rows do not
+count), and a tick advances it strictly in local time.** So the cursor never
+names an occurrence that already has a run row. A failed tick rolls back its
+rows and cursor together. Every cursor write goes through `ScheduleCursor`
+(`src/schedule/cursor.rs`): `initial` for a new state row (no runs yet),
+`advance_to` for a tick (rejects a value that is not strictly later), and
+`upgrade` for T-S1 `Upgraded`: the first occurrence of the new calendar
+strictly after `now` as an instant and strictly after the
+`MaterializedFloor`, read by one query under the state lock. **ENFORCED**. An
+upgrade may move the cursor back in local time (a new calendar with an
+earlier slot runs it), also across a timezone change, but never onto a
+materialized occurrence. It writes no run rows for the span it skips:
+dropping that span is intended (G5).
 
 **S28. Misfire policies.** `Skip`: start iff `dueAt + grace ≥ now`;
 `RunLatest`: only the latest runnable occurrence of the whole backlog starts,
@@ -840,7 +852,9 @@ key are active. `SkipIfActive`: no start
 while any run's workflow of the key is non-terminal (blocked and paused count
 as active); `QueueOne`: at most one `queued` run, promoted only when
 `active=0`. Evaluated under the state lock with a snapshot taken after the
-lock. **ENFORCED**. T-A9 (run-now) bypasses the overlap policy and the pause (G12).
+lock. **ENFORCED**. T-A9 (run-now) applies the same check under the same lock
+and returns `Conflict` instead of queueing or skipping; it bypasses the pause
+on purpose (G12).
 
 **S30. Schedule definition pinning.** T-S2 runs only when the persisted
 `(version, fingerprint)` equals the local definition; versions never
@@ -1108,7 +1122,9 @@ closed under READ COMMITTED, which the library pins for every T-W1 (the
 model shows why; see its entry). G1, G2, G3, G6, G8, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
 is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixed;
 their tests in `tests/gaps.rs` run un-ignored. The model finding N2 is fixed
-(see its entry at the end of this section). G11 is confirmed by an ignored
+(see its entry at the end of this section). G5 and G12 are fixed; their tests
+are in `tests/schedule_state.rs`, `tests/props_schedule.rs` and
+`tests/schedule_overlap.rs`. G11 is confirmed by an ignored
 test in `tests/gaps.rs`.
 
 Each item below was traced from the code; the status line above records
@@ -1243,6 +1259,18 @@ pass. Every T-S2 then fails on `uq_durable_schedule_run_occurrence`
 task error each tick (`src/runtime/supervisor.rs:1024-1026`) → G1. The cursor
 never advances because each tick rolls back. Separately, every upgrade drops
 the unmaterialized span between the old cursor and `now` without run rows.
+**Fixed**: `ScheduleCalendar::next_after` returns the first occurrence
+strictly after `after` as an instant; an occurrence in a repeated hour fires
+once, at the earlier pass, so in the second pass it is skipped. An upgrade
+sets the cursor strictly after the last materialized occurrence (S27,
+`ScheduleCursor::upgrade`), which also covers a timezone change. Dropping the
+unmaterialized span is intended. Tests: `next_after_is_later_as_an_instant`,
+`next_after_instant_minimal_counterexample` (`tests/props_schedule.rs`),
+`reconcile_in_the_second_pass_of_a_fall_back_hour_yields_a_cursor_after_now`,
+`upgrade_in_the_second_pass_does_not_retarget_the_materialized_occurrence`,
+`upgrade_to_a_western_timezone_does_not_retarget_a_materialized_occurrence`,
+`upgrade_to_an_earlier_slot_runs_it_today` (`tests/schedule_state.rs`), and
+the unit tests in `src/schedule/cursor.rs`.
 
 **G6. A concurrent child dedup race skips the version check.** `insert_child`
 checks the version only on its consistent-read pre-check
@@ -1339,9 +1367,12 @@ See the rejected candidate in §3. Child workflows and their external side
 effects continue after the parent is cancelled or superseded.
 
 **G12. Run-now ignores the schedule pause and the overlap policy**
-(`src/admin/control.rs:742-820`). This may be intended as an operator
-override; the tests do not cover a paused or active schedule. Intent is
-UNCLEAR.
+(`src/admin/control.rs:742-820`). **Fixed**: run-now applies the overlap
+policy under the state lock; with `SkipIfActive` or `QueueOne` and an active
+run it returns `Conflict("schedule {k} has an active run; overlap policy {p}
+rejects run-now")`. Ignoring the pause is intended: it is the operator
+override. Test: `run_now_respects_the_overlap_policy_and_ignores_the_pause`
+(`tests/schedule_overlap.rs`).
 
 ---
 

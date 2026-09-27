@@ -19,8 +19,8 @@ use crate::{
     },
     store::{cancel_activities, cancel_approvals},
     ActivityId, ActivityRegistry, ApprovalId, ApprovalResult, DurableError, DurablePool,
-    DurableStore, ScheduleRunId, StartOptions, WorkflowEvent, WorkflowId, WorkflowRegistry,
-    MAX_EVENT_METADATA_BYTES,
+    DurableStore, OverlapPolicy, ScheduleRunId, StartOptions, WorkflowEvent, WorkflowId,
+    WorkflowRegistry, MAX_EVENT_METADATA_BYTES,
 };
 
 #[derive(Clone)]
@@ -751,6 +751,12 @@ where
         .await
     }
 
+    /// Starts one run of the schedule now (T-A9), as a `manual:{t}` run.
+    ///
+    /// Run-now respects the overlap policy: under `SkipIfActive` or
+    /// `QueueOne` it returns `Conflict` while a run of the schedule is active
+    /// (S29, G12). It ignores the pause on purpose, so an operator can run a
+    /// paused schedule once, and it leaves the cursor unchanged.
     pub async fn run_schedule_now(
         &self,
         schedule_key: &str,
@@ -774,6 +780,18 @@ where
             crate::trace::declare_unmodeled("admin_run_schedule_now", true);
             let state = lock_schedule_state(connection, &schedule_key).await?;
             validate_schedule_state(&state, &definition)?;
+            let overlap_checked = match definition.overlap {
+                OverlapPolicy::Allow => false,
+                OverlapPolicy::SkipIfActive | OverlapPolicy::QueueOne => true,
+            };
+            if overlap_checked
+                && crate::runtime::active_workflow_count(connection, &schedule_key).await? > 0
+            {
+                return Err(DurableError::Conflict(format!(
+                    "schedule {schedule_key} has an active run; overlap policy {:?} rejects run-now",
+                    definition.overlap
+                )));
+            }
             let now = persistence::database_now_millis(connection).await?;
             let last_scheduled = durable_schedule_run::table
                 .filter(durable_schedule_run::schedule_key.eq(&schedule_key))
@@ -788,7 +806,10 @@ where
                     connection,
                     NewScheduleRunRow {
                         schedule_key: schedule_key.clone(),
-                        local_occurrence: format!("manual:{scheduled_for}"),
+                        local_occurrence: format!(
+                            "{}{scheduled_for}",
+                            crate::schedule::MANUAL_OCCURRENCE_PREFIX
+                        ),
                         scheduled_for,
                         materialized_at: now,
                         status: "materializing".to_string(),

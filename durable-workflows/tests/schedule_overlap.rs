@@ -8,11 +8,13 @@ use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::DurableConnection;
 use durable_workflows::{
+    admin::{AdminControlService, Operator},
     persistence::ScheduleRunRow,
     schema::{durable_schedule_run, durable_workflow},
-    DurableError, DurableSchedule, DurableStore, DurableWorkflow, MisfirePolicy, OverlapPolicy,
-    ScheduleHandler, ScheduleMaterializer, ScheduleRegistry, ScheduleRunId, StartOptions,
-    WorkflowContext, WorkflowError, WorkflowEvent, WorkflowHandler, WorkflowId, WorkflowTransition,
+    ActivityRegistry, DurableError, DurableSchedule, DurableStore, DurableWorkflow, MisfirePolicy,
+    OverlapPolicy, ScheduleHandler, ScheduleMaterializer, ScheduleRegistry, ScheduleRunId,
+    StartOptions, WorkflowContext, WorkflowError, WorkflowEvent, WorkflowHandler, WorkflowId,
+    WorkflowRegistry, WorkflowTransition,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -235,4 +237,97 @@ async fn queue_one_promotes_once_after_the_active_workflow_finishes() {
     );
     assert_eq!(promoted[1].reason.as_deref(), Some("queue_one_promoted"));
     assert!(promoted[1].workflow_id.is_some());
+}
+
+async fn complete_workflow(pool: &durable_workflows::DurablePool, workflow_id: i64) {
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_workflow::table.find(workflow_id))
+        .set((
+            durable_workflow::status.eq("succeeded"),
+            durable_workflow::completed_at.eq(Some(at_minute(1))),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("complete workflow");
+}
+
+/// G12: run-now respects the overlap policy (S29) and ignores the pause.
+#[tokio::test]
+async fn run_now_respects_the_overlap_policy_and_ignores_the_pause() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let registry = registry();
+    let materializer = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry.clone());
+    for key in [
+        AllowSchedule::KEY,
+        SkipActiveSchedule::KEY,
+        QueueOneSchedule::KEY,
+    ] {
+        registry
+            .reconcile_state(key, &pool, at_minute(0))
+            .await
+            .expect("state");
+        let report = materializer
+            .materialize_schedule(key, at_minute(1))
+            .await
+            .expect("first occurrence");
+        assert_eq!(report.started, 1);
+    }
+    let mut workflows = WorkflowRegistry::new();
+    workflows
+        .register::<OverlapWorkflow>()
+        .expect("workflow registration");
+    let service = AdminControlService::new(
+        pool.clone(),
+        Arc::new(workflows),
+        Arc::new(ActivityRegistry::new()),
+    )
+    .with_schedules(Arc::new(()), registry);
+    let operator = Operator::new("42", "Operational backfill").expect("operator");
+
+    for (key, policy) in [
+        (SkipActiveSchedule::KEY, "SkipIfActive"),
+        (QueueOneSchedule::KEY, "QueueOne"),
+    ] {
+        match service.run_schedule_now(key, &operator).await {
+            Err(DurableError::Conflict(message)) => assert_eq!(
+                message,
+                format!(
+                    "schedule {key} has an active run; overlap policy {policy} rejects run-now"
+                )
+            ),
+            other => panic!("run-now on {key} with an active run: {other:?}"),
+        }
+        assert_eq!(runs(&pool, key).await.len(), 1, "no manual run for {key}");
+    }
+    service
+        .run_schedule_now(AllowSchedule::KEY, &operator)
+        .await
+        .expect("Allow runs now while a run is active");
+
+    let active = runs(&pool, SkipActiveSchedule::KEY).await[0]
+        .workflow_id
+        .expect("active workflow");
+    complete_workflow(&pool, active).await;
+    service
+        .run_schedule_now(SkipActiveSchedule::KEY, &operator)
+        .await
+        .expect("SkipIfActive runs now once no run is active");
+
+    service
+        .pause_schedule(QueueOneSchedule::KEY, &operator)
+        .await
+        .expect("pause");
+    let active = runs(&pool, QueueOneSchedule::KEY).await[0]
+        .workflow_id
+        .expect("active workflow");
+    complete_workflow(&pool, active).await;
+    let manual = service
+        .run_schedule_now(QueueOneSchedule::KEY, &operator)
+        .await
+        .expect("run-now ignores the pause");
+    let queue_runs = runs(&pool, QueueOneSchedule::KEY).await;
+    assert_eq!(queue_runs.len(), 2);
+    assert_eq!(queue_runs[1].workflow_id, Some(manual.workflow_id.get()));
 }

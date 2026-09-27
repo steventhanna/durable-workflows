@@ -15,6 +15,12 @@ use crate::{
     DurableConnection, DurableError, DurablePool, ScheduleRunId, WorkflowId,
 };
 
+mod cursor;
+
+pub(crate) use cursor::{
+    LocalOccurrence, MaterializedFloor, ScheduleCursor, MANUAL_OCCURRENCE_PREFIX,
+};
+
 const MAX_SCHEDULE_KEY_BYTES: usize = 191;
 const MAX_GAP_SCAN_SECONDS: i64 = 86_400;
 const MAX_CATCH_UP_OCCURRENCES: u32 = 100;
@@ -84,6 +90,12 @@ pub struct ScheduleOccurrence {
     pub disposition: LocalTimeDisposition,
 }
 
+impl ScheduleOccurrence {
+    pub(crate) fn local(&self) -> LocalOccurrence {
+        LocalOccurrence::new(self.local_datetime)
+    }
+}
+
 #[derive(Clone)]
 pub struct ScheduleCalendar {
     schedule: Schedule,
@@ -101,8 +113,19 @@ impl ScheduleCalendar {
         Ok(Self { schedule, timezone })
     }
 
+    /// The first occurrence strictly after `after` as an instant.
+    ///
+    /// A local time in a repeated (fall-back) hour resolves to its earlier
+    /// pass and fires once. When `after` is in the second pass, the next local
+    /// time can resolve to an earlier pass at or before `after`; that
+    /// occurrence has already had its instant, so it is skipped (G5).
     pub fn next_after(&self, after: DateTime<Utc>) -> Result<ScheduleOccurrence, DurableError> {
-        self.next_after_local(after.with_timezone(&self.timezone).naive_local())
+        let after_millis = after.timestamp_millis();
+        let mut next = self.next_after_local(after.with_timezone(&self.timezone).naive_local())?;
+        while next.scheduled_for <= after_millis {
+            next = self.next_after_local(next.local_datetime)?;
+        }
+        Ok(next)
     }
 
     pub fn next_after_local(
@@ -151,7 +174,7 @@ impl ScheduleCalendar {
     }
 
     fn resolve(&self, local_datetime: NaiveDateTime) -> Result<ScheduleOccurrence, DurableError> {
-        let local_occurrence = local_datetime.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let local_occurrence = LocalOccurrence::new(local_datetime).to_string();
         match self.timezone.from_local_datetime(&local_datetime) {
             LocalResult::Single(instant) => Ok(occurrence(
                 local_datetime,
@@ -368,6 +391,7 @@ where
             DurableError::InvalidDefinition("schedule deployment timestamp is invalid".to_string())
         })?;
         let next = definition.calendar.next_after(deployed_at)?;
+        let calendar = definition.calendar.clone();
         let metadata = definition.metadata.clone();
         let now = deployed_at.timestamp_millis();
         let mut connection = pool.get().await?;
@@ -379,7 +403,9 @@ where
                     schedule_key: metadata.key.clone(),
                     definition_fingerprint: metadata.fingerprint.clone(),
                     definition_version: metadata.version,
-                    next_local_occurrence: next.local_occurrence.clone(),
+                    next_local_occurrence: ScheduleCursor::initial(next.local())
+                        .local()
+                        .to_string(),
                     next_occurrence_at: next.due_at,
                     last_materialized_at: None,
                     paused_at: None,
@@ -411,12 +437,16 @@ where
                     metadata.key, metadata.version
                 )));
             }
+            // The upgrade drops the unmaterialized span before `now` (intended)
+            // and never targets an occurrence with a run row (S27, G5).
+            let floor = MaterializedFloor::load(connection, &metadata.key).await?;
+            let (cursor, target) = ScheduleCursor::upgrade(&calendar, deployed_at, floor)?;
             diesel::update(durable_schedule_state::table.find(&metadata.key))
                 .set((
                     durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
                     durable_schedule_state::definition_version.eq(metadata.version),
-                    durable_schedule_state::next_local_occurrence.eq(&next.local_occurrence),
-                    durable_schedule_state::next_occurrence_at.eq(next.due_at),
+                    durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
+                    durable_schedule_state::next_occurrence_at.eq(target.due_at),
                     durable_schedule_state::updated_at.eq(now),
                 ))
                 .execute(connection)

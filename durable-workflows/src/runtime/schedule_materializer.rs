@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
 use diesel::{
     dsl::not, ExpressionMethods, JoinOnDsl, NullableExpressionMethods, QueryDsl, SelectableHelper,
 };
@@ -8,6 +7,7 @@ use diesel_async::RunQueryDsl;
 
 use crate::{
     persistence::{self, NewScheduleRunRow, ScheduleRunRow, ScheduleStateRow, WorkflowStatus},
+    schedule::ScheduleCursor,
     schema::{durable_schedule_run, durable_schedule_state, durable_workflow},
     DurableError, DurablePool, LocalTimeDisposition, MisfirePolicy, OverlapPolicy,
     ScheduleCalendar, ScheduleOccurrence, ScheduleRegistry, ScheduleRunId,
@@ -15,7 +15,6 @@ use crate::{
 };
 
 const MAX_DUE_OCCURRENCES_PER_TICK: usize = 10_000;
-const LOCAL_OCCURRENCE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleMaterializationReport {
@@ -146,16 +145,8 @@ where
                 report.started = report.started.saturating_add(1);
             }
 
-            let local = NaiveDateTime::parse_from_str(
-                &state.next_local_occurrence,
-                LOCAL_OCCURRENCE_FORMAT,
-            )
-            .map_err(|error| {
-                DurableError::InvalidState(format!(
-                    "schedule {schedule_key} has invalid persisted local occurrence: {error}"
-                ))
-            })?;
-            let mut occurrence = calendar.occurrence_at_local(local)?;
+            let cursor = ScheduleCursor::load(&schedule_key, &state.next_local_occurrence)?;
+            let mut occurrence = calendar.occurrence_at_local(cursor.local().datetime())?;
             if occurrence.local_occurrence != state.next_local_occurrence
                 || occurrence.due_at != state.next_occurrence_at
             {
@@ -190,6 +181,7 @@ where
             if report.inspected == 0 {
                 return Ok(report);
             }
+            let cursor = cursor.advance_to(occurrence.local())?;
             let changed = diesel::update(
                 durable_schedule_state::table
                     .find(&schedule_key)
@@ -203,7 +195,7 @@ where
                     ),
             )
             .set((
-                durable_schedule_state::next_local_occurrence.eq(&occurrence.local_occurrence),
+                durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
                 durable_schedule_state::next_occurrence_at.eq(occurrence.due_at),
                 durable_schedule_state::last_materialized_at.eq(Some(now)),
                 durable_schedule_state::updated_at.eq(now),
@@ -424,7 +416,9 @@ where
     Ok(())
 }
 
-async fn active_workflow_count(
+/// Non-terminal workflows started by runs of `schedule_key` (S29). Call it
+/// with the schedule state row locked.
+pub(crate) async fn active_workflow_count(
     connection: &mut crate::DurableConnection,
     schedule_key: &str,
 ) -> Result<i64, DurableError> {

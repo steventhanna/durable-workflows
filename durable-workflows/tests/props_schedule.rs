@@ -196,7 +196,6 @@ proptest! {
 
     /// `next_after(t)` is strictly after `t` as an instant.
     #[test]
-    #[ignore = "finding (documents G5): in a fall-back repeated hour, next_after resolves to the earlier pass, before t (src/schedule.rs:93-94,151-161)"]
     fn next_after_is_later_as_an_instant((zone_index, cron, after) in case(3 * 3_600)) {
         let calendar = ScheduleCalendar::new(&cron, ZONES[zone_index]).unwrap();
         let next = calendar.next_after(millis_to_utc(after)).unwrap();
@@ -276,15 +275,17 @@ fn next_after_instant_minimal_counterexample() {
     let calendar = ScheduleCalendar::new("0 30 1 * * *", "America/Denver").unwrap();
     let after = Utc.with_ymd_and_hms(2026, 11, 1, 8, 20, 0).unwrap();
     let next = calendar.next_after(after).unwrap();
-    assert_eq!(next.disposition, LocalTimeDisposition::AmbiguousEarlier);
-    // Documents current behavior (G5): the earlier pass, 07:30Z, is before t.
+    // G5 fixed: 01:30 fired at its earlier pass (07:30Z, before t), so the
+    // next occurrence is the following day's 01:30 MST.
+    assert_eq!(next.disposition, LocalTimeDisposition::Exact);
+    assert_eq!(next.local_occurrence, "2026-11-02T01:30:00");
     assert_eq!(
         next.scheduled_for,
-        Utc.with_ymd_and_hms(2026, 11, 1, 7, 30, 0)
+        Utc.with_ymd_and_hms(2026, 11, 2, 8, 30, 0)
             .unwrap()
             .timestamp_millis()
     );
-    assert!(next.scheduled_for < after.timestamp_millis());
+    assert!(next.scheduled_for > after.timestamp_millis());
 }
 
 #[test]
