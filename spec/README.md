@@ -86,16 +86,16 @@ Actions, one per committed transaction (T-W1: one per statement group):
 |---|---|---|
 | `TX1_Start` | T-X1 | dedup hit returns the existing row; restart-key collision → `Conflict`, no row; both keys rejected |
 | `TX2_RecoverableStart` | T-X2 | newest generation = end of the keyed row's `restartedFrom` chain (`tx2Latest`, N1 fixed); only a `failed`/`blocked` newest row; blocked → cancelled, its waiting parents re-pointed to the successor (G2 fixed); restart-key collision → `Conflict` (all rolled back) |
-| `TX3_Cancel` | T-X3 | cancels own activities (closes open attempts), wakes waiting parents |
+| `TX3_Cancel` | T-X3 | cancels own `pending` activities; a `running` one becomes `cancelling` with its lease and open attempt kept (N2), which only `TW3_Revoked` or reconcile close; wakes waiting parents |
 | `TC1_Claim` | T-C1 | at most one expired-lease recovery, then at most one ready claim, fresh token; SKIP LOCKED; a runtime holds one claim (the implementation enforces this per `WorkflowCoordinator` with a borrowing `WorkflowClaim`) |
 | `LC1_NoEvent` | L-C1 | no deliverable event after `delivered` → task error |
 | `TC2_Continue`, `TC2_Complete`, `TC2_RunActivity`, `TC2_RunChild` | T-C2 | fence `status=running ∧ leaseToken`; Continue, Complete (+ parent wake), RunActivity, RunChild (new, attach, attach-to-terminal + wake) |
 | `TC3_ActivationFailure` | T-C3 | fence; retry with backoff or fail when exhausted (+ parent wake) |
 | `CoordFenceMiss` | T-C2/T-C3 rollback | logged by `activate_one`; not a task error (G1 fixed) |
 | `TW1_*` | T-W1 | simulation form: see the next table; replay form `TW1_Claim`; an invalid row is quarantined (`TW1_QuarantineRow`, G10 fixed) |
-| `TW2_Send` / `TW2_Commit` / `TW2_FenceMiss` / `TW2_Drop` | T-W2 | `now` sampled at send; commit fenced on `status, attemptCount, leaseToken` and open attempt, no expiry check; blocks on T-W1's row lock |
+| `TW2_Send` / `TW2_Commit` / `TW2_FenceMiss` / `TW2_Drop` | T-W2 | `now` sampled at send; commit fenced on `status ∈ {running, cancelling}`, `attemptCount`, `leaseToken` and open attempt, no expiry check; on a `cancelling` row the renewal reports the revoke (execution phase `revoking`); blocks on T-W1's row lock |
 | `HandlerReturn`, `LocalDeadline` | L-W | handler returns only before the local deadline; passing the deadline ends the execution without T-W3 |
-| `TW3_Finish` / `TW3_FenceMiss` | T-W3 | fence on `status, attemptCount, leaseToken`; success needs the workflow wait; dead-letter blocks the workflow; blocks on T-W1's row locks |
+| `TW3_Finish` / `TW3_Revoked` / `TW3_FenceMiss` | T-W3 | fence on `status ∈ {running, cancelling}`, `attemptCount`, `leaseToken`; a `cancelling` row settles (`TW3_Revoked`, whatever the outcome); on a `running` row success needs the workflow wait and dead-letter blocks the workflow; blocks on T-W1's row locks |
 | `Crash` | §5.3 | claims, executions and the in-flight T-W1 (its writes and locks) lost; heartbeat COMMITs already sent can still land |
 
 ### T-W1 under READ COMMITTED
@@ -113,7 +113,7 @@ transaction that would lock it (those actions are disabled until the commit).
 |---|---|---|---|
 | `TW1_BeginBatch(r)` | topic rows `FOR UPDATE SKIP LOCKED` (all or nothing), `UTC_TIMESTAMP` | locking | yes |
 | `TW1_BeginOne(r, t, tnow)` | `UTC_TIMESTAMP` (= `tnow`), then topic row `FOR UPDATE` (blocking) | locking | yes; `tnow ≤ now` covers the lock wait |
-| `TW1_ReconcileScan(r, t)` | reconcile candidate `SELECT` (running, lease ≤ now) | plain | yes (the old G7 window starts here) |
+| `TW1_ReconcileScan(r, t)` | reconcile candidate `SELECT` (running or cancelling, lease ≤ now) | plain | yes (the old G7 window starts here) |
 | `TW1_ReconcileRow(r, a)` | workflow `FOR UPDATE`; activity `FOR UPDATE` with the filters; the updates; history; block | locking | yes |
 | `TW1_Count(r)` | `in_flight` count; if `wanted > 0`, the candidate join | plain, plain | yes |
 | `TW1_ClaimRow(r, a, tok)` / `TW1_SkipRow(r, a)` | workflow and activity `FOR UPDATE SKIP LOCKED` with the filters; update; attempt insert | locking | yes |
@@ -411,7 +411,7 @@ in-flight simulation T-W1, which block the action):
 |---|---|---|---|
 | `TX1_Start(wNew, kind, key, from, inserted, tnow)` — `inserted=false`: dedup hit (`wNew` = existing row) or restart-key `Conflict` (`wNew = 0`); key and `from` both set is not a step | `store.rs:start_with_conn` → `insert_prepared` → `persistence/workflows.rs:insert_started` → `dialect/mysql.rs:insert_workflow` | `db.wf`, `db.nextWf`, locks | `db.wf[wNew]`, `db.events[wNew]`, `db.nextWf`, `now` |
 | `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` — `orig`/`latest` = rows locked (0 = none; `latest` = `tx2Latest`, the end of `orig`'s restart chain), `sNew` = inserted row (0 = none) | `store.rs:start_or_restart_recoverable_with_conn`, `lock_newest_generation`, `hand_waiting_parents_to_successor` | `db.wf`, `db.act`, locks | `db.act` (dead-lettered → cancelled), `db.wf[latest]`, parents waiting on `latest` (`waitRef` → `sNew`), `db.wf[sNew]`, `db.events[sNew]`, `db.nextWf`, `now` |
-| `TX3_Cancel(w, tnow)` — terminal `w` is not a step | `store.rs:cancel_with_conn`, `cancel_locked_workflow`, `cancel_activities`; `persistence/workflows.rs:wake_waiting_parents_on_child_terminal` | `db.wf`, `db.act`, `db.att`, `db.events`, locks | `db.wf[w]`, parents, `db.act`, `db.att`, parents' `db.events`, `now` |
+| `TX3_Cancel(w, tnow)` — terminal `w` is not a step | `store.rs:cancel_with_conn`, `cancel_locked_workflow`, `cancel_activities`; `persistence/workflows.rs:wake_waiting_parents_on_child_terminal` | `db.wf`, `db.act`, `db.events`, locks | `db.wf[w]`, parents, `db.act` (`pending` → `cancelled`, `running` → `cancelling`), parents' `db.events`, `now` |
 | `TC1_Claim(r, rec, cl, tok, leaseExp, tnow)` — `rec`/`cl` = 0 when absent | `runtime/coordinator.rs:claim_one` | `db.wf[rec, cl]`, `db.nextToken`, `proc.claims[r]`, locks | `db.wf[rec, cl]`, `db.nextToken`, `proc.claims[r]`, `ghost.lastIssuedWf`, `now` |
 | `LC1_NoEvent(r, w)` | `coordinator.rs:activate_claim_inner` | `proc.claims[r]`, `db.events[w]` | `proc.claims[r]`, `ghost.noEventError`, `ghost.taskErrors` |
 | `CoordFenceMiss(r, w, tok)` | `coordinator.rs:commit_transition` / `record_activation_failure` (fence miss) | `proc.claims[r]`, `db.wf[w]` | `proc.claims[r]`, `ghost.taskErrors` |
@@ -431,10 +431,11 @@ in-flight simulation T-W1, which block the action):
 | `TW2_FenceMiss(hb)` | `heartbeat_once` fence miss → `HeartbeatFailure` | `proc.hbs`, `db.act`, `db.att`, locks | `proc.hbs`, `proc.execs` |
 | `TW2_Drop(hb)` | `heartbeat_loop` future dropped | `proc.hbs` | `proc.hbs`, `proc.execs` |
 | `TW3_Finish(r, a, tok, outcome, availableAt, tnow)` | `activity_worker.rs:finish_on_connection` (`finish_attempt`, `wake_workflow`, `dead_letter`, `block_workflow`) | `proc.execs`, `db.act`, `db.att`, `db.wf`, `db.events`, locks | `db.act[a]`, `db.att[a]`, `db.wf[w]`, `db.events[w]`, `proc.execs`, ghost, `now` |
+| `TW3_Revoked(r, a, tok, tnow)` — the row is `cancelling`, after any handler return | `finish_on_connection` → `settle_revoked` | `proc.execs`, `db.act`, `db.att`, `db.wf`, locks | `db.act[a]` (`cancelled` if the workflow is terminal, else `pending` at `tnow`; lease cleared), `db.att[a]` (closed), `proc.execs`, ghost, `now` |
 | `TW3_FenceMiss(r, a, tok)` | `finish_on_connection` rollback | same | `proc.execs` |
-| `AdminPause(w, tnow)` — `lastAction` `AdminPause` / `AdminPauseActivity`; paused/terminal `w` is not a step; blocks on a T-W1 lock of `w` or its wait activity | `admin/control.rs:pause_workflow`, `pause_activity`; `store.rs:close_attempt` | `db.wf[w]`, `db.act[waitRef]`, `db.att`, locks | `db.wf[w]` (paused, lease cleared), `db.act[waitRef]` (pending, `maxAttempts+1`), `db.att`, `ghost.opRevoked`, `now` |
+| `AdminPause(w, tnow)` — `lastAction` `AdminPause` / `AdminPauseActivity`; paused/terminal `w` is not a step; blocks on a T-W1 lock of `w` or its wait activity | `admin/control.rs:pause_workflow`, `pause_activity` | `db.wf[w]`, `db.act[waitRef]`, locks | `db.wf[w]` (paused, lease cleared), `db.act[waitRef]` (`running` → `cancelling`, `maxAttempts+1`, lease and open attempt kept; settled later by `TW3_Revoked` or reconcile), `now` |
 | `AdminResume(w, tnow)` — `w` paused; a resume the code rejects (`Conflict`) is not a step | `admin/control.rs:resume_workflow`, `resume_status` | `db.wf[w]`, `db.act[waitRef]`, `db.wf[waitRef]`, locks | `db.wf[w]`, `now` |
-| `AdminCancel(w, tnow)` — terminal `w` is not a step | `admin/control.rs:cancel_workflow` → `store.rs:cancel_locked_workflow` | as `TX3_Cancel` | as `TX3_Cancel`, `ghost.opRevoked` |
+| `AdminCancel(w, tnow)` — terminal `w` is not a step | `admin/control.rs:cancel_workflow` → `store.rs:cancel_locked_workflow` | as `TX3_Cancel` | as `TX3_Cancel` |
 | `Crash(r)` | process exit (INVARIANTS.md §5.3) | `proc` | `proc.claims[r]`, `proc.execs`, `proc.tw1[r]`, `proc.topicHolder` |
 | `Tick` | simulation clock | `now` | `now` |
 
@@ -536,7 +537,7 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 | G2 (T-X2 strands the parent) | **Fixed**: T-X2 re-points the parents waiting on the superseded blocked row to its successor; `inv_S24_parentWakes` is part of `safety` and `inv_S24_exceptTX2` is gone | `g2ReattachTest`, `safety` in simulation; the G2 gap tests' traces pass |
 | G4 (stale `sequence`) | Not modeled; closed for library transactions by READ COMMITTED per INVARIANTS.md | — |
 | G6 (dedup race skips the version check) | Not modeled (versions are not modeled); **fixed** in the code: the rejected commit is a `TC3_ActivationFailure` | the recorded G6 gap test's trace passes |
-| G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 4; `g7CapExceededTest` (RR) |
+| G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 3 (the depth-4 run stopped with no violation); `g7CapExceededTest` (RR) |
 | G8 (child key resolving to the caller or an ancestor) | **Fixed**: `TC2_RunChild` never attaches to the caller or an ancestor; `inv_G8_noAncestorWait` is part of `safety`. Non-ancestor wait cycles stay unguarded (intended) | `g8SelfKeyRejectedTest`, `g8SelfKeyActivationFailureTest`, `g8GrandparentKeyRejectedTest`; the G8 gap tests' traces pass |
 | G10 (one invalid row aborts every topic's claims) | **Fixed** (interface v5): a claimable row past its attempt cap or with invalid bounds is quarantined (`TW1_QuarantineRow`; `quarantined` in `TW1_Claim`): dead-lettered, its workflow blocked, and the T-W1 goes on. `TW1_Error` and `inv_G10_noClaimAbort` are gone | `g10InvalidBoundsTest`, `g10ReplayTest`, `g10WrongReasonTest`; `durable_mc_env` `safety` and `wit_quarantined`; the G10 gap tests' traces pass |
 | G11 (cancel does not reach children) | Reproduces through T-X3 and the operator cancel (T-A4) | `g11CancelTest`, `g11AdminCancelTest`, simulation, the recorded G11 gap test |
@@ -558,11 +559,13 @@ live. If A is running with an expired lease at the count, it was also expired
 at the earlier reconcile scan, so reconcile relocked it; the relock is a
 current read, and it either reconciled A (not running any more) or skipped A
 because a heartbeat had revived it (then the count sees it live). A heartbeat
-after the relock blocks on the row lock and then misses the fence. INVARIANTS.md
-and `docs/design/multi-backend.md` say G7 is "narrowed"; the model says closed,
-under two conditions: (1) `lease_expires_at` is written only by the claim and
-the heartbeat (checked: `activity_worker.rs` claim and `heartbeat_once` are
-the only writers), and (2) at most one heartbeat per claim is in flight. The
+after the relock blocks on the row lock and then misses the fence.
+`docs/design/multi-backend.md` (written before the model) says G7 is "narrowed"; the model says closed, and
+INVARIANTS.md now says so too,
+under two conditions: (1) only the claim and the heartbeat set
+`lease_expires_at` to a time (checked: `activity_worker.rs` claim and
+`heartbeat_once` are the only such writers; every other writer clears it
+through `LeaseCleared`), and (2) at most one heartbeat per claim is in flight. The
 lease can still be revived after it expired (`wit_revivedLease`), which costs
 the activity an attempt later but does not exceed the cap.
 

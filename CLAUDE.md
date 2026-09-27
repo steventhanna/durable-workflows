@@ -7,7 +7,8 @@ Guidance for Claude Code (and other agents) working in this repository.
 A durable workflow engine for Rust on MySQL or Postgres (Diesel 2 +
 diesel-async + bb8, tokio). Workspace: `durable-workflows/` (engine),
 `durable-workflows-macros/` (derives), `tools/durable-trace/` (trace checker,
-not published). The behavior is specified in `docs/INVARIANTS.md` and modeled
+not published). Start with `docs/ARCHITECTURE.md` for how the system works.
+The behavior is specified in `docs/INVARIANTS.md` and modeled
 in Quint under `spec/`; `docs/TRACE_CHECKING.md` explains how recorded test
 runs are replayed through the model.
 

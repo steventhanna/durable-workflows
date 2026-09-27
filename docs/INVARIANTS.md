@@ -14,8 +14,11 @@ what it should do.
   camelCase (`leaseExpiresAt` is the column `lease_expires_at`).
 - Keys compare by exact bytes: every table uses `utf8mb4_bin`, so `provider`
   and `PROVIDER` (or `cafe` and `café`) are distinct topics, kinds, and keys.
-- `now` always means database time: `UTC_TIMESTAMP(3)` in epoch milliseconds
-  (`src/persistence/mod.rs:42-69`), sampled once per transaction unless noted.
+- `now` always means database time in epoch milliseconds: `UTC_TIMESTAMP(3)`
+  on MySQL (`src/dialect/mysql.rs`), `clock_timestamp() AT TIME ZONE 'UTC'`
+  on Postgres (`src/dialect/postgres.rs`), read through
+  `persistence::database_now_millis`; sampled once per transaction unless
+  noted.
 - A **fence** is a `WHERE` predicate on an `UPDATE` whose affected-row count
   must be exactly 1; otherwise the code returns `DurableError::FencedWrite`
   and the enclosing transaction rolls back (e.g. `src/runtime/coordinator.rs:917-923`,
@@ -361,14 +364,21 @@ transaction:
    topic. If any is missing, return no claims (`299-312`).
 2. Sample the local monotonic instant, then `now` ← DB (`314-315`).
 3. For each topic:
-   a. `reconcile_expired` (`852-974`): consistent read of
-      `status=running AND (leaseExpiresAt <= now OR NULL)`; for each: lock
-      workflow `FOR UPDATE` (blocking), relock the activity `FOR UPDATE` and
-      recheck; fenced `UPDATE WHERE status=running AND attemptCount=k AND leaseToken=t`
+   a. `reconcile_expired`: consistent read of lease holders
+      (`status IN LEASE_HOLDERS` = `running`, `cancelling`) with
+      `leaseExpiresAt <= now OR NULL`; for each: lock workflow `FOR UPDATE`
+      (blocking), relock the activity `FOR UPDATE` and recheck. A `running`
+      row: fenced `UPDATE WHERE status=running AND attemptCount=k AND leaseToken=t`
       → `pending` (backoff) or `dead_lettered` (if `attemptCount >= maxAttempts`);
-      close the attempt `lease_expired`; history; if dead-lettered and the
-      workflow waits on it, block the workflow.
-   b. `in_flight` = count of `running AND leaseExpiresAt > now` (consistent read).
+      close the attempt `lease_expired`; history `activity_lease_expired`; if
+      dead-lettered and the workflow waits on it, block the workflow. A
+      `cancelling` row: `settle_revoked` with outcome `lease_expired` (close
+      the attempt; fenced `WHERE status=cancelling AND attemptCount=k AND
+      leaseToken=t` → `cancelled` if the workflow is terminal, else `pending`
+      with `availableAt=now`; lease cleared; history `activity_revoke_settled`).
+      No attempt is added to the budget and nothing is dead-lettered.
+   b. `in_flight` = count of slot holders (`status IN SLOT_HOLDERS` =
+      `running`, `cancelling`) with `leaseExpiresAt > now` (consistent read).
    c. `wanted = min(cap − in_flight, local capacity, remaining batch)`.
    d. Candidates: consistent read joining workflow on
       `workflow.status=waiting_activity AND workflow.waitReferenceId=activity.id`,
@@ -405,18 +415,37 @@ deadline already passed (`553-555`).
 - Heartbeat failure (fence miss or local deadline) → cancel the handler token,
   wait at most `min(grace, last confirmed lease deadline)`, then return the
   error **without** T-W3 (`658-687`).
+- Heartbeat reports the row revoked (`Renewed::Revoked`, a pause or cancel
+  moved it to `cancelling`) → cancel the handler token, wait at most
+  `min(grace, lease deadline)` for the handler to stop, outcome
+  `ExecutionOutcome::Revoked`; the heartbeat loop stops (N2).
 - Forced cancellation → stop heartbeats and return without T-W3 (`605-622`).
 Then T-W3 with the outcome.
 
-**T-W2 heartbeat** (`740-818`), every `min(heartbeat_interval, lease/3)`:
+**T-W2 heartbeat** (`heartbeat_once`), every `min(heartbeat_interval, lease/3)`:
 separate connection, one transaction: sample local instant, `now` ← DB;
-fenced activity `UPDATE WHERE id AND status=running AND attemptCount=k AND leaseToken=t`
+lock the activity `FOR UPDATE` under the lease fence
+`WHERE id AND status IN LEASE_HOLDERS AND attemptCount=k AND leaseToken=t`
+(`leased_activity!`: `running` or `cancelling`); fenced update of that row
 sets `leaseExpiresAt=now+leaseDuration`; fenced attempt update
-(`finishedAt IS NULL`). Raced against the local deadline; losing the race
-drops the in-flight transaction future.
+(`finishedAt IS NULL`) sets `heartbeatAt`. The result is `Renewed::Held` for
+a `running` row and `Renewed::Revoked` for a `cancelling` row: the lease is
+still renewed, so the executor keeps its slot while it stops the handler.
+Raced against the local deadline; losing the race drops the in-flight
+transaction future.
 
-**T-W3 finish** (`706-718`, `1002-1097`), one transaction: lock workflow
-`FOR UPDATE`; `now` ← DB; then:
+**T-W3 finish** (`finish_on_connection`), one transaction: lock workflow
+`FOR UPDATE`; `now` ← DB; lock the activity `FOR UPDATE` under the lease
+fence (`status IN LEASE_HOLDERS`, attempt, token; a miss is `FencedWrite`);
+then:
+- The row is `cancelling` (revoked, N2), whatever the handler outcome:
+  `settle_revoked` with the revoke outcome stored in `lastErrorCategory`
+  (`operator_paused`, `operator_cancelled` or `application_cancelled`):
+  close the attempt; → `cancelled` if the workflow is terminal, else
+  `pending` with `availableAt=now`; lease cleared; history
+  `activity_revoke_settled`. The handler's result is not applied.
+- The row is `running` and the outcome is `Revoked`: `InvalidState` (a
+  revoke is only reported for a `cancelling` row).
 - Success: fenced activity → `succeeded`; close attempt; `wake_workflow`
   requires `status=waiting_activity AND waitReferenceId=activity` (else
   FencedWrite → rollback); append `activity_succeeded` with
@@ -427,7 +456,9 @@ drops the in-flight transaction future.
   attempt; block workflow (requires the same wait, else rollback).
 
 **T-W4 progress report** (`src/progress.rs:83-150`): lock the activity with
-the claim fence; if fewer than 100 events for the attempt, insert the next.
+the claim fence `status=running AND attemptCount=k AND leaseToken=t` (a
+`cancelling` row gets `FencedWrite`); if fewer than 100 events for the
+attempt, insert the next.
 
 ### 2.4 Timer and approval-expiry materializers (`src/runtime/temporal.rs`)
 
@@ -499,8 +530,12 @@ old cursor, version, and fingerprint (`193-214`).
   (`child_superseded`) as after an operator restart (G2 fixed).
 - **T-X3 cancel_with_conn** (`58-93`): inside the caller's transaction; lock
   workflow `FOR UPDATE`; terminal → no-op; else `cancel_locked_workflow`
-  (`503-568`): cancel pending/running activities (closing open attempts),
-  cancel pending approvals, fenced workflow → `cancelled` (wait and lease
+  (`503-568`): `cancel_activities` moves `pending` activities to `cancelled`
+  and `running` (or already `cancelling`) ones to `cancelling`, fenced on
+  status, attempt and token, with `lastErrorCategory` =
+  `application_cancelled` (T-X3) or `operator_cancelled` (T-A4); a
+  `cancelling` row keeps its lease and open attempt, which only T-W3 or
+  reconcile close (`settle_revoked`, N2); cancel pending approvals, fenced workflow → `cancelled` (wait and lease
   cleared), history, wake waiting parents with `child_cancelled`.
 
 ### 2.7 Admin control (`src/admin/control.rs`)
@@ -509,9 +544,14 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
 (schedule actions lock the schedule state row).
 
 - **T-A2 pause** (`59-101`): reject paused/terminal; if waiting on an
-  activity that is `running`, close its attempt (`operator_paused`) and move
-  it to `pending` with `maxAttempts+1` (`888-938`); fenced workflow → `paused`,
-  lease cleared.
+  activity that is `running`, `pause_activity` locks it `FOR UPDATE` and
+  revokes it: fenced `UPDATE WHERE status=running AND attemptCount=k AND
+  leaseToken=t` → `cancelling` with `maxAttempts+1`,
+  `lastErrorCategory=operator_paused`; the lease and the open attempt are
+  kept (S36, N2). The worker's next heartbeat learns of the revoke, and T-W3
+  (or reconcile, once the lease expires) settles it with `settle_revoked`:
+  the attempt closes and the row returns to `pending`. A `cancelling` row is
+  left alone. Fenced workflow → `paused`, lease cleared.
 - **T-A3 resume** (`103-146`): status derived from the wait
   (`940-1020`); `availableAt=now` only when resuming to `ready`.
 - **T-A4 cancel** (`148-180`): terminal → Conflict; else
@@ -624,12 +664,19 @@ token, fenced on `status=pending ∧ attemptCount=k` under
 **ENFORCED**.
 
 **S10. A stale activity lease cannot commit, heartbeat, or report progress.**
-All such writes are fenced on `status=running ∧ attemptCount=k ∧ leaseToken=t`
-(`src/runtime/activity_worker.rs:23-31`; `src/progress.rs:94-106`).
-**ENFORCED** (tests `stale_lease_cannot_emit_progress_or_commit_a_result`,
-`heartbeat_and_completion_are_fenced_by_attempt_and_token`). The fence does not
-test expiry, so a heartbeat can revive an expired but unreconciled lease
-(`src/runtime/activity_worker.rs:797-804`; see G7).
+Every such write is fenced on `attemptCount=k ∧ leaseToken=t` and a status:
+a heartbeat (T-W2) and T-W3's first lock on
+`status ∈ LEASE_HOLDERS` (`running` or `cancelling`, `leased_activity!`),
+so a revoked attempt still renews its lease and learns of the revoke
+(`Renewed::Revoked`); T-W3's result writes (success, retry, dead-letter) on
+`status=running` (`fenced_activity!`), so a revoked attempt can only settle
+(`settle_revoked`); progress (T-W4) on `status=running`, so a revoked
+attempt reports nothing (`src/runtime/activity_worker.rs`;
+`src/progress.rs:94-106`). **ENFORCED** (tests
+`stale_lease_cannot_emit_progress_or_commit_a_result`,
+`heartbeat_and_completion_are_fenced_by_attempt_and_token`). No fence tests
+expiry, so a heartbeat can revive an expired but unreconciled lease
+(`heartbeat_once`; see G7: the revival does not exceed the topic cap).
 
 **S11. Running or cancelling ⇔ exactly one open attempt.**
 `activity.status ∈ {running, cancelling} ⇔` attempt `(id, attemptCount)`
@@ -683,7 +730,9 @@ and the wake clears the wait. **ENFORCED**.
 `maxConcurrency` (`ActivityStatus::SLOT_HOLDERS`; a revoked handler keeps
 its slot until it stops, N2). Claims on
 a topic serialize on its lock row, and reconcile runs first in the same
-transaction. **ENFORCED**, with one exception by one (G7).
+transaction. **ENFORCED**. The one known exception, an overrun by one
+through heartbeat revival (G7), is closed under READ COMMITTED, which the
+library pins for every T-W1; it reproduces only under REPEATABLE READ.
 
 ### Deduplication and lineage
 
@@ -785,11 +834,13 @@ occurrences start; DST-gap occurrences are `skipped(dst_gap)`; chunking
 **ENFORCED** (tests in `tests/schedule_materialization.rs` and the unit
 test at `src/runtime/schedule_materializer.rs:519-585`).
 
-**S29. Overlap policies for materializer runs.** `SkipIfActive`: no start
+**S29. Overlap policies for materializer runs.** `Allow`: no overlap check;
+every occurrence the misfire policy starts is started, whatever runs of the
+key are active. `SkipIfActive`: no start
 while any run's workflow of the key is non-terminal (blocked and paused count
 as active); `QueueOne`: at most one `queued` run, promoted only when
 `active=0`. Evaluated under the state lock with a snapshot taken after the
-lock. **ENFORCED**. T-A9 (run-now) bypasses both overlap and pause (G12).
+lock. **ENFORCED**. T-A9 (run-now) bypasses the overlap policy and the pause (G12).
 
 **S30. Schedule definition pinning.** T-S2 runs only when the persisted
 `(version, fingerprint)` equals the local definition; versions never
@@ -971,7 +1022,10 @@ non-terminating child are stable states that need an operator.
 - Under READ COMMITTED each consistent read sees the rows committed before
   that statement; locking reads and `UPDATE` are current reads and take no gap
   locks. A read taken before a lock can still miss a commit that lands between
-  the read and the lock (G7). Under REPEATABLE READ (a caller's `*_with_conn`
+  the read and the lock, so every such read is rechecked under the lock
+  (T-W1's reconcile relocks each candidate; G7 is closed because T-W1's
+  `in_flight` count is a new statement that sees the revived lease). Under
+  REPEATABLE READ (a caller's `*_with_conn`
   transaction) the snapshot starts at the first consistent read of an InnoDB
   table, so later reads in that transaction can be staler still (G4).
 - Postgres aborts a transaction on any failed statement (`25P02` for every
@@ -1007,15 +1061,20 @@ non-terminating child are stable states that need an operator.
 | in flight | effect |
 |---|---|
 | coordinator between T-C1 and T-C2 | lease expires → L2 recovery; `step` runs again; no activation attempt consumed |
-| activity execution | lease expires → reconcile consumes the attempt (may dead-letter and block) |
+| activity execution | lease expires → reconcile consumes the attempt (may dead-letter and block); a `cancelling` row is settled instead (`settle_revoked`: `pending` or `cancelled`) |
 | claims returned by T-W1 but not yet spawned (dispatcher error at `src/runtime/supervisor.rs:1120-1129`) | same as an activity execution: attempt consumed without running |
 | T-W2 future dropped after its COMMIT was sent | lease extended with no executor (liveness delay only) |
 | any transaction | rolled back, or committed with the error lost |
 
-- Panics: a panic in `step` fails the coordinator task; a panic in a handler
-  is collected and fails the dispatcher task. Both count toward the restart
-  budget (`src/runtime/supervisor.rs:853-866`); the runtime is fail-stop by
-  design (test `panicking_worker_is_reported_restarted_and_recovered_to_dead_letter`).
+- Panics: a panic in `step`, like a `step` that exceeds `step_timeout`, is
+  caught by the coordinator and recorded as a T-C3 activation failure
+  (`step panicked: <message>`); it does not fail the coordinator task or
+  cost restart budget (G3, fixed). A build with `panic = "abort"` still
+  aborts the process. A panic in a handler is collected by the
+  activity-execution manager and fails the dispatcher task, which counts
+  toward the restart budget (`src/runtime/supervisor.rs:853-866`); the
+  runtime is fail-stop there by design (test
+  `panicking_worker_is_reported_restarted_and_recovered_to_dead_letter`).
 
 ### 5.4 Shutdown
 
@@ -1044,8 +1103,9 @@ non-terminating child are stable states that need an operator.
 
 ## 6. Suspected gaps
 
-Status: G4 is closed for library transactions (P4, READ COMMITTED).
-G1, G2, G3, G6, G8, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
+Status: G4 is closed for library transactions (P4, READ COMMITTED). G7 is
+closed under READ COMMITTED, which the library pins for every T-W1 (the
+model shows why; see its entry). G1, G2, G3, G6, G8, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
 is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixed;
 their tests in `tests/gaps.rs` run un-ignored. The model finding N2 is fixed
 (see its entry at the end of this section). G11 is confirmed by an ignored
@@ -1207,7 +1267,22 @@ Reconcile relocks A (current read: live) and skips it (`878-894`). The
 `in_flight` count still uses the snapshot (`319-325`) and misses A. T-W1
 claims up to the cap, so live leases = cap + 1. Under S13's clock assumption
 A has no executor, so real concurrency stays within the cap; A is reconciled
-later and loses an attempt without running.
+later and loses an attempt without running. **Closed** under READ
+COMMITTED: the interleaving needs the `in_flight` count to read the
+snapshot that the reconcile scan started, which only REPEATABLE READ does.
+Under READ COMMITTED the count is a new statement and sees every commit
+before it, so it counts a revived A as live; a heartbeat after the relock
+blocks on the row lock and then misses the fence. T-W1 (`claim_batch`,
+`claim_one`) always runs in a library transaction, which
+`dialect::transaction` pins to READ COMMITTED (§5.1), so the REPEATABLE READ
+form cannot occur. The heartbeat can still revive an expired lease, which
+costs A an attempt later but does not exceed the cap. Evidence
+(`spec/README.md`, "Why G7 is closed under READ COMMITTED"): `safetyRc`
+(`safety` plus S17 at claim and between commits) holds on `durable_mc` in
+simulation and in Apalache at depth 3; the directed tests
+`g7ClosedUnderRcTest` and `g7RcHeartbeatBlockedTest` run both orders. The
+historical REPEATABLE READ instances (`durable_mc_rr`, `durable_mc_act_rr`,
+test `g7CapExceededTest`) still violate S17, as expected.
 
 **G8. Domain keys can form wait cycles.** `child_with_key` can resolve to the
 calling workflow or an ancestor (same kind and key). `commit_child` then
@@ -1355,12 +1430,14 @@ the caller's commit.
 ### 7.5 Suggested model invariants to write first
 
 - `∀w: wf[w].status = running ⇔ wf[w].leaseToken ≠ None` (S1)
-- `∀a: act[a].status = running ⇔ attempt[(a, act[a].attemptCount)].open` (S11)
+- `∀a: act[a].status ∈ {running, cancelling} ⇔ attempt[(a, act[a].attemptCount)].open` (S11)
 - `∀a: act[a].attemptCount ≤ act[a].maxAttempts` (S12)
 - `∀a: act[a].status ∈ {pending, running} ⇒ wf[act[a].wf].waitRef = a` (S15)
 - `∀w: |{e ∈ events[w] : e.deliverySeq > wf[w].delivered}| ≤ 1` (S5)
 - `∀w: wf[w].status = ready ⇒ ∃e ∈ events[w]: e.deliverySeq = wf[w].delivered + 1` (S5)
 - terminal-absorbing as an action property (S6, S14, S20)
-- `∀t: |{a : act[a].topic = t ∧ status = running ∧ leaseExp > now}| ≤ topicCap[t]`
-  checked only at T-W1 commits (S17; G7 shows it can fail between them)
+- `∀t: |{a : act[a].topic = t ∧ status ∈ {running, cancelling} ∧ leaseExp > now}| ≤ topicCap[t]`
+  at T-W1 commits (S17); the model also checks it between commits, which
+  holds under READ COMMITTED and fails only in the historical REPEATABLE READ
+  instances (G7)
 - at most one committed `schedRun` per `(key, localKey)` (S26)

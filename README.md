@@ -16,6 +16,9 @@ notifications, document delivery and scheduled jobs.
 > 14 and 17. The storage schema may still change before 1.0. See
 > [Known issues](#known-issues) for the confirmed protocol gaps.
 
+To learn how the engine works, start with
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## Features
 
 - **Journaled flows.** Write a workflow as a plain `async fn` with
@@ -164,14 +167,22 @@ Each process runs a `DurableRuntime`. It supervises a small set of loops:
 
 - a **workflow coordinator** that claims ready workflows and applies their
   next transition;
-- **activity workers** per topic that claim due activities under a lease and
-  record each attempt;
+- one **activity dispatcher** that claims due activities across all topics
+  in one batch, under each topic's concurrency cap, and spawns one execution
+  per claim; each execution holds a lease, heartbeats, and records its
+  attempt;
 - **materializers** that turn due timers, expiring approvals and cron
   occurrences into workflow events;
-- a **health scanner** that reports stuck or failing work.
+- a **health scanner** that runs on an interval and reports missing workflow
+  or activity definitions and topics, workflows that exhausted their
+  activation attempts, dead-lettered activities with no successful retry,
+  and workflows and activities whose lease expired longer ago than
+  `health_stale_after`. It logs each report and passes it to an optional
+  `HealthAlertSink`.
 
 All coordination goes through the database. Any number of processes can run
-the runtime against the same tables.
+the runtime against the same tables. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+describes the components, the state machines and the concurrency model.
 
 ## Contracts
 
@@ -205,7 +216,9 @@ has reproduction tests for most of the suspected gaps in INVARIANTS §6 and for 
 more (N1, N2) found by the model. A test that confirms its gap is `#[ignore]`d
 with the reason, so the suite stays green; a fix removes the `#[ignore]`. A
 test that refuted its gap (G4, closed by READ COMMITTED) stays as a
-regression test. G5, G7, G9 and G12 are not reproduced by a test yet.
+regression test. G5 and G12 are not reproduced by a test yet; G9 was fixed
+without one, and G7 is closed under READ COMMITTED (the Quint model shows why,
+see [`spec/README.md`](spec/README.md)).
 
 Trace checking ([`docs/TRACE_CHECKING.md`](docs/TRACE_CHECKING.md)) records
 every engine transaction of the test suites and replays the traces through

@@ -615,7 +615,8 @@ where
     /// Renews the claim's lease. Returns [`DurableError::FencedWrite`] once
     /// the claim no longer authorizes work: its lease was lost, or its
     /// workflow was cancelled or paused (the row is `cancelling` and the lease
-    /// is renewed so the caller can stop; lease expiry then settles it).
+    /// is renewed so the caller can stop; finishing the claim, or lease
+    /// expiry, then settles it).
     pub async fn heartbeat(&self, claim: &ActivityClaim) -> Result<(), DurableError> {
         match heartbeat_once(
             &self.pool,
