@@ -528,12 +528,23 @@ async fn persisted_topic_cap_rejects_incompatible_worker_definition() {
     support::drop_durable_tables(&mut connection).await;
 }
 
+// The one place a test reads the host wall clock: it proves the claim path
+// ignores it by putting the database clock a day ahead of it.
+fn host_wall_clock_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_millis()
+        .try_into()
+        .expect("millis fit in i64")
+}
+
 #[tokio::test]
 async fn activity_claim_eligibility_uses_database_time_when_process_clock_differs() {
     let Some(pool) = support::fresh_pool_with_max_size(1).await else {
         return;
     };
-    let process_now = durable_workflows::persistence::now_millis();
+    let process_now = host_wall_clock_millis();
     let database_seconds = process_now / 1_000 + 86_400;
     let database_now = database_seconds * 1_000;
     let mut connection = pool.get().await.expect("clock connection");
@@ -542,7 +553,7 @@ async fn activity_claim_eligibility_uses_database_time_when_process_clock_differ
 
     let (_, activity_id) = schedule_activity(&pool, "external", 3, 5_000, 10_000).await;
     let available_at = database_now - 1_000;
-    assert!(available_at > durable_workflows::persistence::now_millis());
+    assert!(available_at > host_wall_clock_millis());
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
         .set(durable_activity::available_at.eq(available_at))
@@ -677,7 +688,7 @@ async fn retryable_failure_reschedules_with_backoff_and_consumes_attempt() {
     let context = Arc::new(TestContext::default());
     context.mode.store(1, Ordering::SeqCst);
     let worker = worker(pool.clone(), context, "retry-worker");
-    let before = durable_workflows::persistence::now_millis();
+    let before = support::db_now(&pool).await;
 
     worker.run_one("external").await.expect("retry execution");
 
@@ -783,9 +794,19 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .await
         .expect("claim")
         .expect("work");
+    // The first claim is abandoned: the trace records that no handler holds
+    // it (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "expired-one",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
         .execute(&mut connection)
         .await
         .expect("expire lease");

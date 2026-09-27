@@ -198,7 +198,7 @@ async fn runtime_supervises_temporal_sources_isolates_schedules_and_stops_cleanl
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let timer = seed_timer(&pool, now).await;
     let approval = seed_expired_approval(&pool, now).await;
 

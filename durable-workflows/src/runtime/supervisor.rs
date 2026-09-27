@@ -16,8 +16,9 @@ use tracing::Instrument;
 
 use crate::{
     observability::{
-        emit_readiness_alerts, emit_schedule_materialization_alert, HealthScanReport,
-        HealthScanner, HealthScannerConfig,
+        emit_readiness_alerts, emit_schedule_materialization_alert, ActivationCounters,
+        HealthScanReport, HealthScanner, HealthScannerConfig,
+        DEFAULT_MAX_TRANSIENT_ACTIVATION_ERRORS, DEFAULT_TRANSIENT_ACTIVATION_WINDOW,
     },
     persistence, ActivityRegistry, ActivityWorker, ApprovalExpiryMaterializer, CoordinatorConfig,
     DurableError, DurablePool, ReadinessReport, ScheduleMaterializer, ScheduleRegistry,
@@ -46,6 +47,13 @@ pub struct RuntimeConfig {
     pub timer_poll_interval: Duration,
     pub approval_expiry_poll_interval: Duration,
     pub schedule_poll_interval: Duration,
+    /// Transient database errors that roll back workflow activations of this
+    /// process allowed within `transient_activation_error_window`; one more
+    /// adds `HealthAlert::TransientActivationErrors` to the next health report.
+    pub max_transient_activation_errors: u32,
+    /// The window `max_transient_activation_errors` counts over. A count
+    /// starts again once its first error is older than this.
+    pub transient_activation_error_window: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -65,6 +73,8 @@ impl Default for RuntimeConfig {
             timer_poll_interval: Duration::from_secs(10),
             approval_expiry_poll_interval: Duration::from_secs(10),
             schedule_poll_interval: Duration::from_secs(10),
+            max_transient_activation_errors: DEFAULT_MAX_TRANSIENT_ACTIVATION_ERRORS,
+            transient_activation_error_window: DEFAULT_TRANSIENT_ACTIVATION_WINDOW,
         }
     }
 }
@@ -97,6 +107,7 @@ pub struct DurableRuntime<C> {
     config: RuntimeConfig,
     health_alert_sink: Option<HealthAlertSink>,
     topic_worker_limits: HashMap<String, u32>,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 impl<C> DurableRuntime<C>
@@ -138,6 +149,10 @@ where
             max_alerts_per_kind: config.max_health_alerts_per_kind,
         }
         .validate()?;
+        let activation_counters = Arc::new(ActivationCounters::new(
+            config.max_transient_activation_errors,
+            config.transient_activation_error_window,
+        )?);
         Ok(Self {
             pool,
             context,
@@ -149,6 +164,7 @@ where
             config,
             health_alert_sink: None,
             topic_worker_limits: HashMap::new(),
+            activation_counters,
         })
     }
 
@@ -222,6 +238,7 @@ where
             health_alert_sink: self.health_alert_sink,
             activity_executions,
             topic_worker_limits: self.topic_worker_limits,
+            activation_counters: self.activation_counters.clone(),
         });
         let completion_guard = CompletionGuard(completion.clone());
         let supervisor = tokio::spawn(async move {
@@ -234,6 +251,7 @@ where
             completion,
             supervisor,
             forced_shutdown_timeout: self.config.forced_shutdown_timeout,
+            activation_counters: self.activation_counters,
         })
     }
 }
@@ -244,6 +262,7 @@ pub struct RuntimeHandle {
     completion: CancellationToken,
     supervisor: JoinHandle<Vec<RuntimeTaskError>>,
     forced_shutdown_timeout: Duration,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 impl Drop for RuntimeHandle {
@@ -261,6 +280,13 @@ impl RuntimeHandle {
 
     pub fn completion_token(&self) -> CancellationToken {
         self.completion.clone()
+    }
+
+    /// Benign workflow activation outcomes (lost fences and transient
+    /// database errors) of this process's coordinators, which are logged
+    /// and skipped rather than failing the coordinator task (G1).
+    pub fn activation_counters(&self) -> Arc<ActivationCounters> {
+        self.activation_counters.clone()
     }
 
     pub async fn shutdown(mut self, deadline: Duration) -> Result<(), RuntimeShutdownError> {
@@ -322,6 +348,7 @@ struct RuntimeParts<C> {
     health_alert_sink: Option<HealthAlertSink>,
     activity_executions: ActivityExecutionManager,
     topic_worker_limits: HashMap<String, u32>,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 type ActivityExecution = Pin<Box<dyn Future<Output = Result<(), DurableError>> + Send>>;
@@ -968,7 +995,8 @@ where
                 parts.activities.clone(),
                 format!("{}:coordinator", parts.runtime_id),
                 parts.config.coordinator,
-            )?;
+            )?
+            .with_activation_counters(parts.activation_counters.clone());
             loop {
                 if parts.cancellation.is_cancelled() {
                     return Ok(());
@@ -993,7 +1021,10 @@ where
                 if parts.cancellation.is_cancelled() {
                     return Ok(());
                 }
-                let report = scanner.scan_once(database_now(&parts.pool).await?).await?;
+                let mut report = scanner.scan_once(database_now(&parts.pool).await?).await?;
+                report
+                    .alerts
+                    .extend(parts.activation_counters.take_transient_alert());
                 report.emit();
                 if let Some(sink) = &parts.health_alert_sink {
                     // A faulty sink must not take down workflow execution: an

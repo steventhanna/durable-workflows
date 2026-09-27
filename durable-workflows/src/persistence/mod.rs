@@ -20,10 +20,6 @@ pub(crate) use workflows::{
     wake_waiting_parents_on_child_terminal, StartedInsert,
 };
 
-pub fn now_millis() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
 pub async fn database_now_millis(connection: &mut DurableConnection) -> Result<i64, DurableError> {
     let now = crate::dialect::now_millis(connection).await?;
     crate::trace::sample_now(now);

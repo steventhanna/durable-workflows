@@ -273,8 +273,16 @@ claim, sleep `idle_delay` (2 s). A lost fence (`FencedWrite`) or a transient
 database error (deadlock, serialization failure, lock wait timeout;
 `dialect::is_transient_error`) from T-C2 or T-C3 is logged and the loop goes
 on: an operator action or lease recovery already moved the row on, or the
-rolled-back row stays `running` until lease recovery (L2). `WorkflowClaim::activate`
-itself still returns the error. Any other error ends the task (G1, fixed).
+rolled-back row stays `running` until lease recovery (L2). Each skipped
+activation is counted by kind (`BenignActivationKind::FenceMiss` or
+`Transient`) in the runtime's process-local `ActivationCounters`
+(`RuntimeHandle::activation_counters`). When more than
+`RuntimeConfig::max_transient_activation_errors` (10) transient errors fall
+in one `transient_activation_error_window` (5 min), the next health report
+carries `HealthAlert::TransientActivationErrors` (logged and passed to the
+`HealthAlertSink`), so a database that keeps aborting activations is not
+silent. `WorkflowClaim::activate` itself still returns the error and counts
+nothing. Any other error ends the task (G1, fixed).
 
 A coordinator holds at most one outstanding claim: `claim_one` takes
 `&mut self` and the returned `WorkflowClaim` borrows the coordinator until
@@ -1117,9 +1125,10 @@ non-terminating child are stable states that need an operator.
 ### 5.2 Clocks
 
 - Every persisted timestamp and every due/expiry comparison uses DB time
-  (`src/persistence/mod.rs:62-69`). The process wall clock is not used
-  (`persistence::now_millis`, `src/persistence/mod.rs:58-60`, is only public
-  API). Tests confirm session time is honoured (`tests/database_time.rs`).
+  (`persistence::database_now_millis`). The process wall clock is not used
+  and the crate exposes no host wall-clock function; test fixtures read the
+  database clock too (`tests/support::db_now`). Tests confirm session time is
+  honoured (`tests/database_time.rs`).
 - Each transaction samples `now` once, usually at the start, so stored times
   are sample times, not commit times. Timer, approval, and schedule loops
   sample `now` before opening their transaction.
@@ -1213,11 +1222,19 @@ confirms that `activate_claim` (now `WorkflowClaim::activate`) returns `Err(Fenc
 (`dialect::is_transient_error`) from T-C2/T-C3 and returns the claimed id;
 `WorkflowClaim::activate` still returns the error to a direct caller. The restart
 budget counts within `RuntimeConfig::restart_window` (default 10 minutes).
+The skipped activations stay visible: `activate_one` counts them by
+`BenignActivationKind` (fence miss or transient) in `ActivationCounters`,
+which the application reads through `RuntimeHandle::activation_counters`
+(or `WorkflowCoordinator::activation_counters`), and more than
+`max_transient_activation_errors` transient errors within
+`transient_activation_error_window` latch a
+`HealthAlert::TransientActivationErrors` for the next health report (§2.2).
 The dispatcher logs a transient `claim_batch` error and backs off as after an
 empty sweep. Tests: `g1_pause_during_step_is_not_a_coordinator_error`,
 `g1_repeated_operator_pauses_do_not_stop_the_runtime`,
-`g1_activation_failure_after_operator_cancel_is_not_a_coordinator_error`, and
-the `RestartBudget` unit test.
+`g1_activation_failure_after_operator_cancel_is_not_a_coordinator_error`,
+`activate_one_counts_a_lost_fence_as_a_fence_miss`, the `RestartBudget` unit
+test and the `TransientErrorWindow` unit tests.
 
 **N4. A stale RunActivity commit reported a duplicate key, not a fence miss**
 (found by the concurrent workload, `tests/trace_workload.rs`). A coordinator

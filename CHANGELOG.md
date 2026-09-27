@@ -56,11 +56,26 @@ production on MySQL since August 2026.
   not over the process lifetime.
 - `MAX_RETRY_DELAY_SECS` (`i64::MAX / 2_000` seconds): the largest retry
   delay `RetryPolicy::fixed` and `RetryPolicy::exponential` accept.
+- Visibility for benign activation outcomes (G1): `activate_one` counts each
+  activation it skips by `observability::BenignActivationKind` (`FenceMiss`,
+  `Transient`) in process-local `observability::ActivationCounters`
+  (`get(kind)`), read through `RuntimeHandle::activation_counters` or
+  `WorkflowCoordinator::activation_counters`. More than
+  `RuntimeConfig::max_transient_activation_errors` (default 10; must be
+  non-zero) transient errors within
+  `RuntimeConfig::transient_activation_error_window` (default 5 minutes; must
+  be non-zero) add `HealthAlert::TransientActivationErrors` to the next health
+  report and its `HealthAlertSink` call. `HealthAlert` is now
+  `#[non_exhaustive]`.
 
 ### Changed
 
 Compared with the production-internal version it was extracted from:
 
+- Removed the public host-clock function `persistence::now_millis()`.
+  Persisted times and due/expiry comparisons use the database clock
+  (`persistence::database_now_millis(&mut connection)`); a caller that
+  writes a time into a durable table must read that clock, not the host's.
 - New persisted activity status `cancelling`: an application cancel or
   operator pause of a running activity moves it to `cancelling` instead of
   `cancelled`/`pending`; it keeps its lease, open attempt and topic slot

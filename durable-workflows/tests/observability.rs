@@ -162,7 +162,7 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
         .await
         .expect("exhausted workflow")
         .workflow_id;
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let mut connection = pool.get().await.expect("connection");
     diesel::update(durable_workflow::table.find(stale_workflow.get()))
         .set((
@@ -379,7 +379,7 @@ async fn activity_span_has_safe_correlation_fields_without_token_or_payload() {
         .await
         .expect("workflow")
         .workflow_id;
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let mut row = activity_row(workflow_id.get(), 1, "pending", now);
     row.kind = SecretActivity::KIND.to_string();
     row.version = SecretActivity::VERSION;

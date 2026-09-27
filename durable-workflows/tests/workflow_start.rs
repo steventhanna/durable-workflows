@@ -362,13 +362,14 @@ async fn outer_transaction_rollback_removes_the_workflow_and_event() {
         return;
     };
 
+    let now = support::db_now_on(&mut connection).await;
     let result: Result<(), durable_workflows::DurableError> = connection
         .transaction(async move |transaction| {
             diesel::insert_into(durable_topic_lock::table)
                 .values(NewTopicLockRow {
                     topic: "domain-mutation".to_string(),
                     max_concurrency: 1,
-                    updated_at: durable_workflows::persistence::now_millis(),
+                    updated_at: now,
                 })
                 .execute(transaction)
                 .await?;

@@ -19,7 +19,10 @@
 //! runtimes that hold leases (a forced crash waits for a holder of its kind),
 //! keeps the survivors running until the orphaned leases are taken over, and
 //! aims its cancels and pauses at workflows whose activity is running, which
-//! makes each of them reliable per seed.
+//! makes each of them reliable per seed. A seed that reaches half its run
+//! without a fence miss runs the fence probe: the next workflow step is held
+//! until another runtime has recovered its expired lease, then released, so
+//! its commit misses the fence (`CoordFenceMiss`).
 //!
 //! `DURABLE_TRACE_WORKLOAD_SEEDS=N` (N > 4) also runs seeds 5..=N in
 //! `workload_extra_seeds`, four at a time; each gets its own database and
@@ -112,12 +115,40 @@ struct Workload {
     /// (workflow, command sequence) pairs whose one-time slow step already ran.
     /// Timing only: a step's result never depends on it.
     slowed: Mutex<HashSet<(i64, u32)>>,
+    probe: Mutex<FenceProbe>,
+    /// Releases the step the probe holds.
+    release: tokio::sync::Notify,
+}
+
+/// The driver's fence probe. Timing only, like `slowed`.
+#[derive(Default)]
+struct FenceProbe {
+    armed: bool,
+    held: Option<i64>,
 }
 
 impl Workload {
     /// Some steps take a while; a few outlast the coordinator lease once, so
     /// another runtime recovers the workflow and the first one misses its fence.
     async fn pace_step(&self, workflow: i64, sequence: u32) {
+        let hold = self
+            .probe
+            .lock()
+            .map(|mut probe| {
+                let take = probe.armed && probe.held.is_none();
+                if take {
+                    probe.armed = false;
+                    probe.held = Some(workflow);
+                }
+                take
+            })
+            .unwrap_or(false);
+        if hold {
+            // The driver releases the step once another runtime has recovered
+            // the workflow; the cap keeps a stuck driver from hanging the step.
+            let _ = tokio::time::timeout(Duration::from_secs(20), self.release.notified()).await;
+            return;
+        }
         let roll = mix(self.seed, workflow as u64, u64::from(sequence), SALT_PACE) % 100;
         let delay = if roll < 10 {
             let first = self
@@ -659,6 +690,8 @@ async fn run_seed(seed: u64) -> Option<Stats> {
     let workload = Arc::new(Workload {
         seed,
         slowed: Mutex::new(HashSet::new()),
+        probe: Mutex::new(FenceProbe::default()),
+        release: tokio::sync::Notify::new(),
     });
     let mut rng = DriverRng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
     let runtime_count = 2 + rng.below(2);
@@ -682,6 +715,7 @@ async fn run_seed(seed: u64) -> Option<Stats> {
     let mut orphaned_activity = false;
     let mut orphaned_workflow = false;
     let mut starting = true;
+    let mut probed = false;
     // A run whose forced crashes found no lease holder yet goes on (up to
     // twice its length) until they have.
     while started.elapsed() < total
@@ -694,6 +728,17 @@ async fn run_seed(seed: u64) -> Option<Stats> {
         }
         if length >= SOFT_STEP_CAP {
             starting = false;
+        }
+        // From half the run on, a seed with no fence miss yet runs the probe
+        // once. It runs inline, so no crash or cancel meets the held step.
+        if !probed
+            && length < HARD_STEP_CAP
+            && started.elapsed() * 2 > total
+            && Stats::from_records(&trace_records(&pool).await).fence_misses == 0
+        {
+            probed = true;
+            fence_probe(&pool, &store, &workload).await;
+            continue;
         }
         if !starting {
             continue;
@@ -863,6 +908,58 @@ async fn run_seed(seed: u64) -> Option<Stats> {
         stats.actions
     );
     Some(stats)
+}
+
+/// Holds the next workflow step until another runtime has recovered the
+/// workflow's expired lease (the coordinator lease is 2 s and a step does not
+/// renew it), then releases it: its commit misses the fence.
+async fn fence_probe(pool: &DurablePool, store: &DurableStore, workload: &Workload) {
+    if let Ok(mut probe) = workload.probe.lock() {
+        probe.armed = true;
+    }
+    // A fresh workflow's first step arrives even when every other one waits.
+    store
+        .start(&WorkloadFlow { depth: 0 }, StartOptions::default())
+        .await
+        .expect("probe workflow starts");
+    let polling = tokio::time::Instant::now();
+    let mut held = None;
+    while held.is_none() && polling.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        held = workload.probe.lock().ok().and_then(|probe| probe.held);
+    }
+    let Some(workflow) = held else {
+        if let Ok(mut probe) = workload.probe.lock() {
+            probe.armed = false;
+        }
+        return;
+    };
+    let lease_token = |row: &WorkflowRow| row.lease_token.clone();
+    let held_token = lease_token(&workflow_row(pool, workflow).await);
+    let polling = tokio::time::Instant::now();
+    while polling.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if lease_token(&workflow_row(pool, workflow).await) != held_token {
+            break;
+        }
+    }
+    workload.release.notify_one();
+    let polling = tokio::time::Instant::now();
+    while polling.elapsed() < Duration::from_secs(5)
+        && Stats::from_records(&trace_records(pool).await).fence_misses == 0
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn workflow_row(pool: &DurablePool, workflow: i64) -> WorkflowRow {
+    let mut connection = pool.get().await.expect("connection");
+    durable_workflow::table
+        .find(workflow)
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(&mut connection)
+        .await
+        .expect("probe workflow row")
 }
 
 fn assert_interesting(seed: u64, stats: &Stats) {

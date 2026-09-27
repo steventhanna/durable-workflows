@@ -300,7 +300,7 @@ async fn approval_resolution_and_expiry_have_one_transactional_winner() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let workflow_id = start(&pool).await;
     let approval_id = seed_approval(&pool, workflow_id, "waiting_approval", 6, now + 60_000).await;
     let mut workflows = WorkflowRegistry::<()>::new();

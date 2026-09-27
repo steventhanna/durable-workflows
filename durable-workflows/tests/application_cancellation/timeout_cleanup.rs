@@ -1,5 +1,10 @@
 use super::*;
 
+// Budgets: a 60ms timeout, a 150ms shutdown grace and a 40ms cleanup, so the
+// cleanup finishes well inside the grace and the lingering handler is dropped
+// after >= 200ms. Only a host too loaded to run a 40ms sleep within 150ms fails
+// this (seen only alongside check.sh; not reproduced under a parallel full
+// suite run); a larger grace would weaken the linger bound.
 #[tokio::test]
 async fn timeout_awaits_bounded_cleanup_and_never_commits_handler_success() {
     let Some(pool) = support::fresh_pool().await else {
@@ -118,6 +123,10 @@ fn leased_cleanup_worker(
     .expect("worker")
 }
 
+// Budgets: a 180ms lease renewed every 20ms, and a 250ms wait that outlasts
+// one lease, so a reclaim is refused only because renewals continue. Only a
+// host too loaded to run a 20ms heartbeat within 180ms fails this (seen only
+// alongside check.sh; not reproduced under a parallel full suite run).
 #[tokio::test]
 async fn timeout_cleanup_renews_lease_until_handler_finishes_before_allowing_retry() {
     let Some(pool) = support::fresh_pool().await else {
@@ -226,8 +235,6 @@ async fn heartbeat_failure_limits_cleanup_to_the_last_confirmed_lease() {
                 durable_activity::kind.eq(LeasedCleanupActivity::KIND),
                 durable_activity::payload_json
                     .eq(serde_json::to_string(&LeasedCleanupActivity).expect("payload")),
-                // The fixture stamps host time; a database clock behind it would hide the row.
-                durable_activity::available_at.eq(0),
             ))
             .execute(&mut connection)
             .await

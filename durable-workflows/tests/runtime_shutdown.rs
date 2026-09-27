@@ -131,8 +131,10 @@ impl ActivityHandler for RuntimeActivity {
                     .transaction(async move |connection| {
                         diesel::update(durable_activity::table.find(activity_id))
                             .set(
-                                durable_activity::updated_at
-                                    .eq(durable_workflows::persistence::now_millis()),
+                                durable_activity::updated_at.eq(
+                                    durable_workflows::persistence::database_now_millis(connection)
+                                        .await?,
+                                ),
                             )
                             .execute(connection)
                             .await?;
@@ -637,9 +639,18 @@ async fn bounded_shutdown_leaves_a_lease_for_a_second_runtime_to_recover() {
     );
     let running = wait_for_activity_status(&pool, activity_id, "running").await;
     assert_eq!(running.attempt_count, 1);
+    // The stopped runtime abandoned its claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "first:dispatcher",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
         .execute(&mut connection)
         .await
         .expect("expire abandoned lease");
@@ -654,7 +665,7 @@ async fn bounded_shutdown_leaves_a_lease_for_a_second_runtime_to_recover() {
     assert_eq!(pending.attempt_count, 1);
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(durable_activity::available_at.eq(support::db_now_on(&mut connection).await))
         .execute(&mut connection)
         .await
         .expect("make recovered work due");
@@ -888,9 +899,18 @@ async fn bounded_shutdown_stops_heartbeats_and_a_second_runtime_recovers() {
     let still_stopped = wait_for_activity_status(&pool, activity_id, "running").await;
     assert_eq!(still_stopped.lease_expires_at, stopped_expiry);
 
+    // The stopped runtime abandoned its claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "uncooperative:dispatcher",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
         .execute(&mut connection)
         .await
         .expect("expire abandoned lease");
@@ -905,7 +925,7 @@ async fn bounded_shutdown_stops_heartbeats_and_a_second_runtime_recovers() {
     assert_eq!(pending.attempt_count, 1);
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(durable_activity::available_at.eq(support::db_now_on(&mut connection).await))
         .execute(&mut connection)
         .await
         .expect("make retry due");
@@ -986,9 +1006,18 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
         .expect_err("panics are surfaced");
     assert!(shutdown.errors.iter().any(|error| error.panicked));
 
+    // The panicked runtime abandoned its claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "panic-runtime:dispatcher",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
         .execute(&mut connection)
         .await
         .expect("expire panicked lease");

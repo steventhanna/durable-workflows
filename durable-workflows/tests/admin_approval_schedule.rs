@@ -150,7 +150,7 @@ async fn insert_approval(
     workflow_id: WorkflowId,
     expires_at: Option<i64>,
 ) -> durable_workflows::ApprovalId {
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(pool).await;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_approval::table)
         .values(NewApprovalRow {
@@ -201,7 +201,7 @@ async fn approval_resolution_validates_exact_version_and_wakes_with_a_typed_even
     let approval_id = insert_approval(
         &pool,
         workflow_id,
-        Some(durable_workflows::persistence::now_millis() + 60_000),
+        Some(support::db_now(&pool).await + 60_000),
     )
     .await;
     let service = AdminControlService::new(
@@ -264,12 +264,8 @@ async fn expired_or_invalid_approval_decisions_roll_back_without_waking() {
         return;
     };
     let workflow_id = start_workflow(&pool).await;
-    let approval_id = insert_approval(
-        &pool,
-        workflow_id,
-        Some(durable_workflows::persistence::now_millis() - 1),
-    )
-    .await;
+    let approval_id =
+        insert_approval(&pool, workflow_id, Some(support::db_now(&pool).await - 1)).await;
     let service = AdminControlService::new(
         pool.clone(),
         workflow_registry(),
@@ -318,7 +314,7 @@ async fn schedule_controls_are_code_owned_and_run_now_is_atomic_without_cadence_
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let next_occurrence = durable_workflows::persistence::now_millis() + 86_400_000;
+    let next_occurrence = support::db_now(&pool).await + 86_400_000;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_schedule_state::table)
         .values(NewScheduleStateRow {
@@ -421,7 +417,7 @@ async fn schedule_controls_reject_unregistered_and_mismatched_definitions() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_schedule_state::table)
         .values(NewScheduleStateRow {
@@ -476,7 +472,7 @@ async fn failed_manual_schedule_start_rolls_back_the_run_row() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_schedule_state::table)
         .values(NewScheduleStateRow {

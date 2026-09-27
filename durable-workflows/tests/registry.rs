@@ -343,7 +343,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
     let Some(mut connection) = support::fresh_connection().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now_on(&mut connection).await;
 
     for (version, status, key) in [(1, "ready", "active"), (99, "succeeded", "terminal")] {
         diesel::insert_into(durable_workflow::table)

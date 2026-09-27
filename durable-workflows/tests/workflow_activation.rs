@@ -9,6 +9,11 @@ use durable_workflows::{
     WorkflowEvent, WorkflowHandler, WorkflowTransition,
 };
 
+// 2100-01-01T00:00:00Z: after any database clock these tests run under, so
+// a sleeping workflow never wakes during a test. The workflow code has no
+// connection, and a host-clock read would mix clock domains.
+const FAR_FUTURE_WAKE_MILLIS: i64 = 4_102_444_800_000;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ContinueWorkflow;
 
@@ -200,7 +205,7 @@ impl WorkflowHandler for SleepWorkflow {
     > {
         Ok(WorkflowTransition::SleepUntil {
             state: state + 1,
-            wake_at_millis: durable_workflows::persistence::now_millis() + 60_000,
+            wake_at_millis: FAR_FUTURE_WAKE_MILLIS,
         })
     }
 }
@@ -280,7 +285,7 @@ impl WorkflowHandler for WaitWorkflow {
         match self {
             Self::Sleep => Ok(WorkflowTransition::SleepUntil {
                 state: state + 1,
-                wake_at_millis: durable_workflows::persistence::now_millis() + 60_000,
+                wake_at_millis: FAR_FUTURE_WAKE_MILLIS,
             }),
             Self::NeedsApproval => Ok(WorkflowTransition::WaitForApproval {
                 state: state + 1,
@@ -1029,7 +1034,7 @@ async fn non_deliverable_history_never_reaches_workflow_code() {
             actor_type: Some("operator".to_string()),
             actor_id: Some("test".to_string()),
             reason: Some("history only".to_string()),
-            created_at: durable_workflows::persistence::now_millis(),
+            created_at: support::db_now_on(&mut connection).await,
         })
         .execute(&mut connection)
         .await
@@ -1402,11 +1407,12 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
             .expect("workflow starts")
             .workflow_id;
         let mut connection = pool.get().await.expect("fixture connection");
+        let expired_at = support::expired_lease_at(&mut connection).await;
         diesel::update(durable_workflow::table.find(workflow_id.get()))
             .set((
                 durable_workflow::status.eq(WorkflowStatus::Running),
                 durable_workflow::lease_token.eq(Some("original-lease")),
-                durable_workflow::lease_expires_at.eq(Some(0_i64)),
+                durable_workflow::lease_expires_at.eq(Some(expired_at)),
             ))
             .execute(&mut connection)
             .await
@@ -1426,7 +1432,7 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
         .expect("coordinator");
         let claim = claim_with_blocking_probe(coordinator);
         let probe = tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await;
-        let future_expiry = durable_workflows::persistence::now_millis() + 60_000;
+        let future_expiry = support::db_now_on(&mut connection).await + 60_000;
         let lease = (current_status == WorkflowStatus::Running).then_some("renewed-lease");
         let expiry = (current_status == WorkflowStatus::Running).then_some(future_expiry);
         let update = tokio::time::timeout(
@@ -1524,11 +1530,12 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
             );
         }
         let mut connection = pool.get().await.expect("fixture connection");
+        let expired_at = support::expired_lease_at(&mut connection).await;
         diesel::update(durable_workflow::table)
             .set((
                 durable_workflow::status.eq(WorkflowStatus::Running),
                 durable_workflow::lease_token.eq(Some("expired-lease")),
-                durable_workflow::lease_expires_at.eq(Some(0_i64)),
+                durable_workflow::lease_expires_at.eq(Some(expired_at)),
             ))
             .execute(&mut connection)
             .await
@@ -1572,7 +1579,7 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
             .filter(durable_workflow::id.eq_any(&workflow_ids[..32]))
             .filter(durable_workflow::status.eq(WorkflowStatus::Running))
             .filter(durable_workflow::lease_token.eq(Some("expired-lease")))
-            .filter(durable_workflow::lease_expires_at.eq(Some(0_i64)))
+            .filter(durable_workflow::lease_expires_at.eq(Some(expired_at)))
             .count()
             .get_result::<i64>(&mut connection)
             .await

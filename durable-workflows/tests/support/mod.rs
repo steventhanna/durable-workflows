@@ -156,6 +156,33 @@ pub async fn freeze_database_clock(connection: &mut DurableConnection, millis: i
         .unwrap_or_else(|error| panic!("failed to freeze the database clock: {error}"));
 }
 
+/// The database clock the engine reads (`persistence::database_now_millis`).
+/// A fixture that writes or compares a database-time column (`available_at`,
+/// `lease_expires_at`, `created_at`, ..) takes its time from here, never from
+/// the host clock.
+#[allow(dead_code)]
+pub async fn db_now(pool: &durable_workflows::DurablePool) -> i64 {
+    let mut connection = pool.get().await.expect("connection for the database clock");
+    db_now_on(&mut connection).await
+}
+
+/// [`db_now`] on a connection the test already holds (its session clock,
+/// frozen or not).
+#[allow(dead_code)]
+pub async fn db_now_on(connection: &mut DurableConnection) -> i64 {
+    durable_workflows::persistence::database_now_millis(connection)
+        .await
+        .expect("database clock")
+}
+
+/// A lease expiry already in the past by the database clock. Fixtures that
+/// expire a lease use this, not `0`: `0` is the model's "no lease" sentinel,
+/// so a leased row with expiry `0` breaks S1/S9 in the recorded trace.
+#[allow(dead_code)]
+pub async fn expired_lease_at(connection: &mut DurableConnection) -> i64 {
+    db_now_on(connection).await - 1_000
+}
+
 /// URL of the database created for the running test, or the server URL when
 /// the test has not created one yet.
 #[allow(dead_code)]

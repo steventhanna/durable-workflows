@@ -17,7 +17,7 @@ use tracing::Instrument;
 
 use crate::{
     deterministic_jitter_percentile,
-    observability::lease_fingerprint,
+    observability::{lease_fingerprint, ActivationCounters, BenignActivationKind},
     persistence::{self, NewWorkflowEventRow, WorkflowEventRow, WorkflowRow, WorkflowStatus},
     schema::durable_workflow,
     ActivityRegistry, BackoffPolicy, DurableError, DurablePool, RetryPolicy, StoredTransition,
@@ -144,6 +144,7 @@ pub struct WorkflowCoordinator<C> {
     activities: Arc<ActivityRegistry<C>>,
     worker_id: String,
     config: CoordinatorConfig,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 impl<C> WorkflowCoordinator<C>
@@ -177,28 +178,41 @@ where
             activities,
             worker_id,
             config,
+            activation_counters: Arc::new(ActivationCounters::default()),
         })
+    }
+
+    pub(crate) fn with_activation_counters(mut self, counters: Arc<ActivationCounters>) -> Self {
+        self.activation_counters = counters;
+        self
+    }
+
+    /// The counts of benign activations that [`Self::activate_one`] skipped.
+    pub fn activation_counters(&self) -> Arc<ActivationCounters> {
+        self.activation_counters.clone()
     }
 
     /// Claims one workflow and activates it. A claim that lost its fence, or
     /// a transient database error, is not an error here (see
-    /// [`WorkflowClaim::activate`]): the activation is logged and skipped.
+    /// [`WorkflowClaim::activate`]): the activation is logged, counted in
+    /// [`Self::activation_counters`] and skipped.
     pub async fn activate_one(&mut self) -> Result<Option<WorkflowId>, DurableError> {
         let Some(claimed) = self.claim_row().await? else {
             return Ok(None);
         };
         let workflow_id = claimed.workflow_id()?;
-        match self.activate_claimed(claimed).await {
-            Err(error) if is_benign_activation_error(&error) => {
-                tracing::warn!(
-                    workflow_id = workflow_id.get(),
-                    error = %error,
-                    "workflow activation rolled back; the row is left to its new owner or to lease recovery"
-                );
-            }
-            result => {
-                result?;
-            }
+        if let Err(error) = self.activate_claimed(claimed).await {
+            let Some(kind) = benign_activation_kind(&error) else {
+                return Err(error);
+            };
+            self.activation_counters
+                .record(kind, tokio::time::Instant::now());
+            tracing::warn!(
+                workflow_id = workflow_id.get(),
+                benign_kind = kind.as_str(),
+                error = %error,
+                "workflow activation rolled back; the row is left to its new owner or to lease recovery"
+            );
         }
         Ok(Some(workflow_id))
     }
@@ -1278,8 +1292,12 @@ async fn lock_fence<'tx>(
 /// A T-C2/T-C3 outcome that is not a coordinator error: the fence was lost
 /// (an operator action or lease recovery moved the row on), or a transient
 /// database error rolled the transaction back.
-fn is_benign_activation_error(error: &DurableError) -> bool {
-    matches!(error, DurableError::FencedWrite) || crate::dialect::is_transient_error(error)
+fn benign_activation_kind(error: &DurableError) -> Option<BenignActivationKind> {
+    match error {
+        DurableError::FencedWrite => Some(BenignActivationKind::FenceMiss),
+        error if crate::dialect::is_transient_error(error) => Some(BenignActivationKind::Transient),
+        _ => None,
+    }
 }
 
 /// Resolves to `Err(payload)` when polling the inner future panics.

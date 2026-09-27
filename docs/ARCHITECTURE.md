@@ -95,7 +95,13 @@ flowchart TB
   definitions and topics, exhausted activations, dead-lettered activities
   with no successful retry, and stale workflows and activities (a lease that
   expired more than `health_stale_after` ago), logs a `HealthScanReport`, and
-  passes it to an optional `HealthAlertSink`.
+  passes it to an optional `HealthAlertSink`. The coordinator counts the
+  activations it skips as benign (a lost fence or a transient database
+  error, G1) by `BenignActivationKind` in process-local
+  `ActivationCounters`, readable through `RuntimeHandle::activation_counters`;
+  more than `max_transient_activation_errors` transient errors within
+  `transient_activation_error_window` add a `TransientActivationErrors`
+  alert to the next health report.
 
 ### Tables and their writers
 

@@ -133,7 +133,7 @@ async fn schedule_activity(
         .expect("workflow start")
         .workflow_id
         .get();
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(pool).await;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
