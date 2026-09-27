@@ -627,18 +627,6 @@ where
     }
 }
 
-async fn expire_lease_by_database_clock(pool: &DurablePool, workflow_id: WorkflowId) {
-    let mut connection = pool.get().await.expect("test connection");
-    let now = database_now_millis(&mut connection)
-        .await
-        .expect("database clock");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
-        .set(durable_workflow::lease_expires_at.eq(Some(now - 1)))
-        .execute(&mut connection)
-        .await
-        .expect("lease expiry update");
-}
-
 // ---------------------------------------------------------------------------
 // G2
 // ---------------------------------------------------------------------------
@@ -1828,55 +1816,6 @@ async fn g10_quarantined_row_is_dead_lettered_and_blocks_its_workflow() {
     assert_eq!(blocked.status.as_str(), "blocked");
     assert_eq!(blocked.error_category.as_deref(), Some("invalid_row"));
     assert_eq!(blocked.wait_reference_id, Some(bad_activity));
-}
-
-#[tokio::test]
-#[ignore = "confirms G3: a panicking step never counts an activation attempt; after lease recovery it panics again forever"]
-async fn g3_panicking_step_is_bounded_by_activation_attempts() {
-    let Some(pool) = support::fresh_pool().await else {
-        return;
-    };
-    let context = Arc::new(GapContext::default());
-    let workflow_id = DurableStore::new(pool.clone())
-        .start(&G3Panic {}, StartOptions::default())
-        .await
-        .expect("workflow starts")
-        .workflow_id;
-    let coordinator = Arc::new(tokio::sync::Mutex::new(coordinator(
-        &pool,
-        context,
-        CoordinatorConfig {
-            max_activation_attempts: 2,
-            ..CoordinatorConfig::default()
-        },
-    )));
-    let mut panics = 0;
-    for _ in 0..5 {
-        let row = load(&pool, workflow_id).await;
-        if row.status.as_str() == "failed" {
-            break;
-        }
-        if row.status.as_str() == "running" {
-            expire_lease_by_database_clock(&pool, workflow_id).await;
-        }
-        let joined = tokio::spawn({
-            let coordinator = coordinator.clone();
-            async move { coordinator.lock().await.activate_one().await }
-        })
-        .await;
-        if joined.as_ref().is_err_and(|error| error.is_panic()) {
-            panics += 1;
-        }
-    }
-    let row = load(&pool, workflow_id).await;
-    assert_eq!(
-        row.status.as_str(),
-        "failed",
-        "poison-pill step is unbounded: {panics} coordinator panics, status {}, \
-         activation_attempts {}",
-        row.status.as_str(),
-        row.activation_attempts
-    );
 }
 
 /// Activates `workflow_id` until it fails, waiting out the activation retry

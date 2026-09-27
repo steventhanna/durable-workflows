@@ -337,8 +337,12 @@ async fn schedule_activity_payload(
         .expect("workflow start")
         .workflow_id
         .get();
-    let now = durable_workflows::persistence::now_millis();
     let mut connection = pool.get().await.expect("test connection");
+    // Claims compare `available_at` with the database clock; a host stamp ahead of it
+    // would hide the row from the first dispatcher sweep.
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
             workflow_id,
@@ -965,7 +969,12 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
         .expect("runtime starts");
     let cancellation = handle.cancellation_token();
     let completion = handle.completion_token();
-    tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+    // The second panic needs the restarted dispatcher to reconcile the expired lease and
+    // then claim the retry (fixed 1 s), and an empty dispatcher sweep backs off 1/2/5/10 s
+    // (INVARIANTS §2.3). The claim lands on the third sweep (~3 s); one missed sweep (a
+    // transient claim error, a row not yet due) moves it to the fourth (~8 s), past the
+    // old 5 s budget. Wait out the whole ladder.
+    tokio::time::timeout(Duration::from_secs(20), cancellation.cancelled())
         .await
         .expect("restart budget is exhausted");
     tokio::time::timeout(Duration::from_secs(5), completion.cancelled())

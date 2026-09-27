@@ -16,8 +16,10 @@
 //! Every seed asserts that its own trace holds a `Crash`, a `TC1_Claim` that
 //! recovered an expired workflow lease, a `TW1_Claim` that reconciled an
 //! expired activity lease, and a fence miss: the driver aims its crashes at
-//! runtimes that hold leases and its cancels and pauses at workflows whose
-//! activity is running, which makes each of them reliable per seed.
+//! runtimes that hold leases (a forced crash waits for a holder of its kind),
+//! keeps the survivors running until the orphaned leases are taken over, and
+//! aims its cancels and pauses at workflows whose activity is running, which
+//! makes each of them reliable per seed.
 //!
 //! `DURABLE_TRACE_WORKLOAD_SEEDS=N` (N > 4) also runs seeds 5..=N in
 //! `workload_extra_seeds`, four at a time; each gets its own database and
@@ -675,8 +677,16 @@ async fn run_seed(seed: u64) -> Option<Stats> {
     let total = Duration::from_secs(workload_secs());
     let mut crashes = 0;
     let mut crashed = HashSet::new();
+    // Whether a crash has left an activity / a workflow lease to expire; the
+    // coverage assertions need one of each.
+    let mut orphaned_activity = false;
+    let mut orphaned_workflow = false;
     let mut starting = true;
-    while started.elapsed() < total {
+    // A run whose forced crashes found no lease holder yet goes on (up to
+    // twice its length) until they have.
+    while started.elapsed() < total
+        || (started.elapsed() < total * 2 && !(orphaned_activity && orphaned_workflow))
+    {
         tokio::time::sleep(Duration::from_millis(200 + rng.below(600))).await;
         let length = trace_len(&pool).await;
         if length >= HARD_STEP_CAP {
@@ -689,14 +699,43 @@ async fn run_seed(seed: u64) -> Option<Stats> {
             continue;
         }
         let state = snapshot(&pool).await;
-        // At least two crashes (one per lease kind): forced from 40% and 70%
-        // of the run on.
+        // A crash that orphans an activity lease is forced from 40% of the
+        // run on and one that orphans a workflow lease from 70%, until each
+        // has happened.
         let late = started.elapsed() * 5 > total * 2;
         let later = started.elapsed() * 10 > total * 7;
-        let roll = if (crashes == 0 && late) || (crashes == 1 && later) {
-            95
+        let forced = if late && !orphaned_activity {
+            Some(true)
+        } else if later && !orphaned_workflow {
+            Some(false)
         } else {
-            rng.below(100)
+            None
+        };
+        // A forced crash waits up to 2 s for a runtime holding a lease of its
+        // kind; without one, this round does ordinary work instead, so the
+        // seed keeps starting the workflows whose leases it needs.
+        let mut forced_victim = None;
+        if let Some(activities) = forced {
+            let polling = tokio::time::Instant::now();
+            while forced_victim.is_none() && polling.elapsed() < Duration::from_secs(2) {
+                let holders: Vec<usize> = snapshot(&pool)
+                    .await
+                    .lease_holders(activities)
+                    .iter()
+                    .filter_map(|holder| runtimes.iter().position(|runtime| &runtime.id == holder))
+                    .collect();
+                forced_victim = rng.pick(&holders);
+                if forced_victim.is_none() {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            }
+        }
+        // Random crashes leave room for the forced ones.
+        let unmet = u32::from(!orphaned_activity) + u32::from(!orphaned_workflow);
+        let roll = match (forced, forced_victim) {
+            (_, Some(_)) => 95,
+            (Some(_), None) => rng.below(78),
+            (None, None) => rng.below(100),
         };
         match roll {
             0..=54 => {
@@ -754,11 +793,11 @@ async fn run_seed(seed: u64) -> Option<Stats> {
                     }
                 }
             }
-            78..=99 if crashes < MAX_CRASHES => {
+            78..=99 if forced_victim.is_some() || crashes + unmet < MAX_CRASHES => {
                 // Alternate between activity and workflow lease holders, so a
                 // reconcile and a recovery follow: wait up to 2 s for one.
                 let activities = crashes.is_multiple_of(2);
-                let mut victim = None;
+                let mut victim = forced_victim;
                 let polling = tokio::time::Instant::now();
                 while victim.is_none() && polling.elapsed() < Duration::from_secs(2) {
                     let holders: Vec<usize> = snapshot(&pool)
@@ -778,9 +817,14 @@ async fn run_seed(seed: u64) -> Option<Stats> {
                     usize::try_from(rng.below(runtimes.len() as u64)).unwrap_or(0)
                 });
                 let runtime = runtimes.remove(victim);
+                let victim_id = runtime.id.clone();
                 crashed.insert(runtime.id.clone());
                 crash(&pool, runtime).await;
                 crashes += 1;
+                // The runtime is gone: a lease it still holds must expire.
+                let left = snapshot(&pool).await;
+                orphaned_activity |= left.lease_holders(true).contains(&victim_id);
+                orphaned_workflow |= left.lease_holders(false).contains(&victim_id);
                 runtimes.push(spawn_runtime(&url, &workload, format!("rt{next_runtime}")).await);
                 next_runtime += 1;
             }
@@ -788,6 +832,19 @@ async fn run_seed(seed: u64) -> Option<Stats> {
         }
     }
 
+    // Keep the survivors running until every orphaned lease has been taken
+    // over: an activity lease (3 s) is reconciled by the next dispatcher
+    // sweep after it expires, and an empty sweep backs off up to 10 s.
+    let settling = tokio::time::Instant::now();
+    while settling.elapsed() < Duration::from_secs(20) {
+        let stats = Stats::from_records(&trace_records(&pool).await);
+        if (!orphaned_activity || stats.reconciles > 0)
+            && (!orphaned_workflow || stats.recoveries > 0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     for runtime in &runtimes {
         runtime.handle.cancellation_token().cancel();
     }

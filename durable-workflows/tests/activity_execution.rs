@@ -297,8 +297,12 @@ async fn schedule_activity(
         .expect("workflow start")
         .workflow_id
         .get();
-    let now = durable_workflows::persistence::now_millis();
     let mut connection = pool.get().await.expect("test connection");
+    // Claims compare `available_at` with the database clock; a host stamp ahead of it
+    // would hide the row from the first claim.
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
             workflow_id,
@@ -787,7 +791,13 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .expect("expire lease");
     drop(connection);
 
-    let recovery_started = durable_workflows::persistence::now_millis();
+    // Reconciliation stamps the retry with the database clock; measure from it too.
+    let recovery_started = {
+        let mut connection = pool.get().await.expect("test connection");
+        durable_workflows::persistence::database_now_millis(&mut connection)
+            .await
+            .expect("database clock")
+    };
     assert!(second
         .claim_one("external")
         .await
@@ -802,8 +812,11 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .expect("reconciled activity");
     assert_eq!(status, "pending");
     assert!(available_at >= recovery_started + 900);
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(durable_activity::available_at.eq(now))
         .execute(&mut connection)
         .await
         .expect("make recovered activity due");

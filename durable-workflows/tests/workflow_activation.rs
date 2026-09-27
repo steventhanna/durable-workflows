@@ -1145,8 +1145,12 @@ async fn activation_errors_back_off_then_fail_at_the_configured_cap() {
         .expect("first failure is recorded");
 
     let mut connection = pool.get().await.expect("test connection");
+    // Due by the database clock, which the claim compares against.
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::update(durable_workflow::table.find(started.workflow_id.get()))
-        .set(durable_workflow::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(durable_workflow::available_at.eq(now))
         .execute(&mut connection)
         .await
         .expect("retry is made due");
@@ -1221,6 +1225,13 @@ async fn sixteenth_continue_yields_to_another_ready_workflow() {
         .start(&OneShotWorkflow, durable_workflows::StartOptions::default())
         .await
         .expect("short workflow starts");
+    // The yield stamps the database clock, so the lower bound is read from it too.
+    let before_yield = {
+        let mut connection = pool.get().await.expect("test connection");
+        durable_workflows::persistence::database_now_millis(&mut connection)
+            .await
+            .expect("database clock")
+    };
     coordinator
         .activate_one()
         .await
@@ -1242,7 +1253,9 @@ async fn sixteenth_continue_yields_to_another_ready_workflow() {
     assert_eq!(long_row.status.as_str(), "ready");
     assert_eq!(long_row.state_json, "16");
     assert_eq!(long_row.consecutive_continuations, 0);
-    assert!(long_row.available_at > durable_workflows::persistence::now_millis() - 100);
+    let delay = i64::try_from(CoordinatorConfig::default().continuation_delay.as_millis())
+        .expect("continuation delay fits in i64");
+    assert!(long_row.available_at >= before_yield + delay);
     assert_eq!(short_row.status.as_str(), "succeeded");
 
     support::drop_durable_tables(&mut connection).await;
