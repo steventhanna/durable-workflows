@@ -1108,7 +1108,14 @@ async fn commit_child(
                 "child_cancelled".to_string(),
                 "child workflow was cancelled".to_string(),
             ))),
-            _ => None,
+            WorkflowStatus::Ready
+            | WorkflowStatus::Running
+            | WorkflowStatus::WaitingActivity
+            | WorkflowStatus::WaitingChild
+            | WorkflowStatus::Sleeping
+            | WorkflowStatus::WaitingApproval
+            | WorkflowStatus::Paused
+            | WorkflowStatus::Blocked => None,
         };
         if let Some(terminal_outcome) = terminal_outcome {
             persistence::wake_waiting_parents_on_child_terminal(

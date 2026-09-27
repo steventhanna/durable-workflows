@@ -138,7 +138,7 @@ impl AdminQueryService {
             .filter(durable_activity::topic.eq_any(&keys))
             .filter(
                 durable_activity::status
-                    .eq(ActivityStatus::Running)
+                    .eq_any(ActivityStatus::SLOT_HOLDERS)
                     .and(durable_activity::lease_expires_at.gt(now)),
             )
             .group_by((durable_activity::topic, durable_activity::status))
@@ -166,11 +166,9 @@ impl AdminQueryService {
             )
             .filter(durable_activity::topic.eq_any(&keys))
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-            .filter(not(durable_workflow::status.eq_any([
-                WorkflowStatus::Succeeded,
-                WorkflowStatus::Failed,
-                WorkflowStatus::Cancelled,
-            ])))
+            .filter(not(
+                durable_workflow::status.eq_any(WorkflowStatus::TERMINAL)
+            ))
             .select((
                 durable_activity::topic,
                 durable_activity::id,
@@ -249,7 +247,7 @@ impl AdminQueryService {
                     )),
             )
             .filter(durable_activity::topic.eq_any(&keys))
-            .filter(durable_activity::status.eq(ActivityStatus::Running))
+            .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
             .filter(durable_activity::lease_expires_at.gt(now))
             .group_by(durable_activity::topic)
             .select((
@@ -291,8 +289,9 @@ impl AdminQueryService {
         let mut active_counts = HashMap::new();
         for (topic, status, count) in status_rows {
             let count = nonnegative_count(count)?;
-            if status == ActivityStatus::Running {
-                active_counts.insert(topic, count);
+            if status.holds_slot() {
+                let active = active_counts.entry(topic).or_insert(0_u64);
+                *active = active.saturating_add(count);
             }
         }
 
@@ -602,11 +601,9 @@ impl AdminQueryService {
                     .on(durable_workflow::schedule_run_id.eq(durable_schedule_run::id.nullable())),
             )
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-            .filter(not(durable_workflow::status.eq_any([
-                WorkflowStatus::Succeeded,
-                WorkflowStatus::Cancelled,
-                WorkflowStatus::Failed,
-            ])))
+            .filter(not(
+                durable_workflow::status.eq_any(WorkflowStatus::TERMINAL)
+            ))
             .select(count_star())
             .first::<i64>(&mut connection)
             .await?;

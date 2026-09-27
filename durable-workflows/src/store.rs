@@ -1,7 +1,5 @@
 use chrono::{DateTime, Utc};
-use diesel::{
-    BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
-};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, RunQueryDsl};
 
 use crate::{
@@ -107,12 +105,7 @@ impl DurableStore {
                             resource: "workflow",
                             identifier: workflow_id.to_string(),
                         })?;
-                    if matches!(
-                        workflow.status,
-                        WorkflowStatus::Succeeded
-                            | WorkflowStatus::Failed
-                            | WorkflowStatus::Cancelled
-                    ) {
+                    if workflow.status.is_terminal() {
                         return Ok(());
                     }
                     let now = persistence::database_now_millis(connection).await?;
@@ -297,10 +290,7 @@ impl DurableStore {
                     let root_id = original.root_workflow_id.unwrap_or(original.id);
                     let original_id = original.id;
                     let latest = lock_newest_generation(transaction, original).await?;
-                    if !matches!(
-                        latest.status,
-                        WorkflowStatus::Failed | WorkflowStatus::Blocked
-                    ) {
+                    if !latest.status.is_start_recoverable() {
                         declare_recoverable_start(
                             W::KIND,
                             W::VERSION,
@@ -359,7 +349,7 @@ impl DurableStore {
                     if crate::trace::ENABLED {
                         for id in durable_activity::table
                             .filter(durable_activity::workflow_id.eq(latest.id))
-                            .filter(durable_activity::status.eq("dead_lettered"))
+                            .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
                             .select(durable_activity::id)
                             .load::<i64>(transaction)
                             .await?
@@ -371,13 +361,11 @@ impl DurableStore {
                     diesel::update(
                         durable_activity::table
                             .filter(durable_activity::workflow_id.eq(latest.id))
-                            .filter(durable_activity::status.eq("dead_lettered")),
+                            .filter(durable_activity::status.eq(ActivityStatus::DeadLettered)),
                     )
                     .set((
-                        durable_activity::status.eq("cancelled"),
-                        durable_activity::lease_owner.eq(None::<String>),
-                        durable_activity::lease_token.eq(None::<String>),
-                        durable_activity::lease_expires_at.eq(None::<i64>),
+                        durable_activity::status.eq(ActivityStatus::Cancelled),
+                        persistence::LeaseCleared::new(),
                         durable_activity::updated_at.eq(now),
                         durable_activity::completed_at.eq(Some(now)),
                     ))
@@ -387,10 +375,10 @@ impl DurableStore {
                         let changed = diesel::update(
                             durable_workflow::table
                                 .find(latest.id)
-                                .filter(durable_workflow::status.eq("blocked")),
+                                .filter(durable_workflow::status.eq(WorkflowStatus::Blocked)),
                         )
                         .set((
-                            durable_workflow::status.eq("cancelled"),
+                            durable_workflow::status.eq(WorkflowStatus::Cancelled),
                             durable_workflow::lease_owner.eq(None::<String>),
                             durable_workflow::lease_token.eq(None::<String>),
                             durable_workflow::lease_expires_at.eq(None::<i64>),
@@ -751,11 +739,7 @@ async fn hand_waiting_parents_to_successor(
     let parents = durable_workflow::table
         .filter(durable_workflow::wait_kind.eq("child"))
         .filter(durable_workflow::wait_reference_id.eq(superseded.id))
-        .filter(
-            durable_workflow::status
-                .eq(WorkflowStatus::WaitingChild)
-                .or(durable_workflow::status.eq(WorkflowStatus::Paused)),
-        )
+        .filter(durable_workflow::status.eq_any(WorkflowStatus::CHILD_WAITERS))
         .for_update()
         .select(WorkflowRow::as_select())
         .load::<WorkflowRow>(connection)
@@ -916,15 +900,26 @@ pub(crate) async fn cancel_activities(
 ) -> Result<(), DurableError> {
     let activities = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
-        .filter(durable_activity::status.eq_any([ActivityStatus::Pending, ActivityStatus::Running]))
+        .filter(durable_activity::status.eq_any(ActivityStatus::NON_TERMINAL))
         .for_update()
         .select(ActivityRow::as_select())
         .load::<ActivityRow>(connection)
         .await?;
     for activity in activities {
         crate::trace::touch_act(activity.id);
-        if activity.status == ActivityStatus::Running {
-            close_attempt(connection, &activity, attempt_outcome, reason, now).await?;
+        match activity.status {
+            ActivityStatus::Running => {
+                close_attempt(connection, &activity, attempt_outcome, reason, now).await?;
+            }
+            ActivityStatus::Pending => {}
+            ActivityStatus::Succeeded
+            | ActivityStatus::DeadLettered
+            | ActivityStatus::Cancelled => {
+                return Err(DurableError::InvalidState(format!(
+                    "cancel loaded activity {} in terminal status {}",
+                    activity.id, activity.status
+                )));
+            }
         }
         let changed = diesel::update(
             durable_activity::table
@@ -933,9 +928,7 @@ pub(crate) async fn cancel_activities(
         )
         .set((
             durable_activity::status.eq(ActivityStatus::Cancelled),
-            durable_activity::lease_owner.eq(None::<String>),
-            durable_activity::lease_token.eq(None::<String>),
-            durable_activity::lease_expires_at.eq(None::<i64>),
+            persistence::LeaseCleared::new(),
             durable_activity::updated_at.eq(now),
             durable_activity::completed_at.eq(Some(now)),
         ))

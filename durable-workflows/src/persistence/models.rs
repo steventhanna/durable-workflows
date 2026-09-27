@@ -1,5 +1,5 @@
 use super::{ActivityStatus, WorkflowStatus};
-use diesel::{Insertable, Queryable, Selectable};
+use diesel::{AsChangeset, Insertable, Queryable, Selectable};
 
 use crate::schema::{
     durable_activity, durable_activity_attempt, durable_approval, durable_progress_event,
@@ -355,4 +355,26 @@ pub struct NewTopicLockRow {
     pub topic: String,
     pub max_concurrency: i32,
     pub updated_at: i64,
+}
+
+/// Changeset fragment that clears an activity's lease (S1, S9). Every
+/// activity update that leaves `running` includes it, so a new exit path
+/// cannot forget one of the three columns.
+#[derive(Debug, Clone, Copy, AsChangeset)]
+#[diesel(table_name = durable_activity)]
+#[diesel(treat_none_as_null = true)]
+pub(crate) struct LeaseCleared {
+    lease_owner: Option<&'static str>,
+    lease_token: Option<&'static str>,
+    lease_expires_at: Option<i64>,
+}
+
+impl LeaseCleared {
+    pub(crate) const fn new() -> Self {
+        Self {
+            lease_owner: None,
+            lease_token: None,
+            lease_expires_at: None,
+        }
+    }
 }

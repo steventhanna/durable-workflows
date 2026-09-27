@@ -324,7 +324,7 @@ where
         }
 
         let stale_activities = durable_activity::table
-            .filter(durable_activity::status.eq(ActivityStatus::Running))
+            .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
             .filter(
                 durable_activity::lease_expires_at
                     .le(stale_before)

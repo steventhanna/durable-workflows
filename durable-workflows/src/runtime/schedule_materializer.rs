@@ -434,11 +434,9 @@ async fn active_workflow_count(
                 .on(durable_workflow::schedule_run_id.eq(durable_schedule_run::id.nullable())),
         )
         .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-        .filter(not(durable_workflow::status.eq_any([
-            WorkflowStatus::Succeeded,
-            WorkflowStatus::Cancelled,
-            WorkflowStatus::Failed,
-        ])))
+        .filter(not(
+            durable_workflow::status.eq_any(WorkflowStatus::TERMINAL)
+        ))
         .count()
         .get_result::<i64>(connection)
         .await?)

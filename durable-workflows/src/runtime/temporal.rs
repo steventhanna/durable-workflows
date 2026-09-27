@@ -117,10 +117,8 @@ impl ApprovalExpiryMaterializer {
             {
                 return Ok(None);
             }
-            if !matches!(
-                workflow.status,
-                WorkflowStatus::WaitingApproval | WorkflowStatus::Paused
-            ) || workflow.wait_kind.as_deref() != Some("approval")
+            if !workflow.status.awaits_approval()
+                || workflow.wait_kind.as_deref() != Some("approval")
                 || workflow.wait_reference_id != Some(approval.id)
                 || workflow.kind != approval.kind
                 || workflow.version != approval.version

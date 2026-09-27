@@ -58,6 +58,9 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- `WorkflowStatus` and `ActivityStatus` are `#[non_exhaustive]`. A
+  downstream exhaustive `match` on either needs a wildcard arm (breaking),
+  so new statuses can ship in a minor release.
 - Every transaction the library opens runs at READ COMMITTED on both
   backends. This closes gap G4 for library transactions. MySQL with binary
   logging needs `binlog_format=ROW` (the 8.x default). The `*_with_conn`

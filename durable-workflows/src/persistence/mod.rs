@@ -13,6 +13,7 @@ pub use models::{
 use crate::{DurableConnection, DurableError};
 
 pub(crate) use events::{append_event, next_delivery_event, next_event_sequence};
+pub(crate) use models::LeaseCleared;
 pub use workflows::find_workflow_by_id;
 pub(crate) use workflows::{
     find_by_deduplication_key, find_workflow_by_id_for_update, insert_started,
@@ -37,15 +38,33 @@ macro_rules! string_status {
             serde::Serialize, serde::Deserialize,
         )]
         #[diesel(sql_type = diesel::sql_types::Text)]
+        #[non_exhaustive]
         pub enum $name {
             $(#[serde(rename = $value)] $variant),+
         }
 
         impl $name {
+            /// Every variant, generated from the declaration, so the status-set
+            /// checks below cannot miss one.
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
             pub const fn as_str(self) -> &'static str {
                 match self {
                     $(Self::$variant => $value),+
                 }
+            }
+
+            /// `true` when `set` lists `status`. `const` so a status-set
+            /// constant can be checked against its predicate at compile time.
+            const fn set_contains(set: &[Self], status: Self) -> bool {
+                let mut index = 0;
+                while index < set.len() {
+                    if set[index] as usize == status as usize {
+                        return true;
+                    }
+                    index += 1;
+                }
+                false
             }
         }
 
@@ -98,6 +117,30 @@ macro_rules! string_status {
     };
 }
 
+/// Fails the build unless the status-set constant `$set` lists exactly the
+/// statuses for which the exhaustive predicate `$predicate` is `true`.
+macro_rules! status_set_matches_predicate {
+    ($name:ident :: $set:ident == $predicate:ident) => {
+        const _: () = {
+            let mut index = 0;
+            while index < $name::ALL.len() {
+                let status = $name::ALL[index];
+                assert!(
+                    $name::set_contains(&$name::$set, status) == status.$predicate(),
+                    concat!(
+                        stringify!($name),
+                        "::",
+                        stringify!($set),
+                        " disagrees with ",
+                        stringify!($predicate)
+                    )
+                );
+                index += 1;
+            }
+        };
+    };
+}
+
 string_status!(WorkflowStatus {
     Ready => "ready",
     Running => "running",
@@ -119,4 +162,163 @@ string_status!(ActivityStatus {
     DeadLettered => "dead_lettered",
     Cancelled => "cancelled",
 });
+
+// Status membership lives in the exhaustive predicates and constants below;
+// code elsewhere uses them instead of listing statuses, so adding a variant
+// is a compile error at each predicate that must decide (and each constant
+// is checked against its predicate at compile time).
+
+impl WorkflowStatus {
+    /// Statuses a workflow never leaves.
+    pub(crate) const TERMINAL: [Self; 3] = [Self::Succeeded, Self::Failed, Self::Cancelled];
+    /// Statuses in which a workflow may hold a `child` wait: waiting, or
+    /// paused while waiting (resume restores `WaitingChild`).
+    pub(crate) const CHILD_WAITERS: [Self; 2] = [Self::WaitingChild, Self::Paused];
+    /// Statuses in which a workflow may hold an `approval` wait.
+    pub(crate) const APPROVAL_WAITERS: [Self; 2] = [Self::WaitingApproval, Self::Paused];
+    /// Statuses in which a workflow may still wait on a dead-lettered
+    /// activity that an operator can retry: blocked, or paused while blocked
+    /// (resume restores `Blocked`).
+    pub(crate) const DEAD_LETTER_WAITERS: [Self; 2] = [Self::Blocked, Self::Paused];
+
+    pub(crate) const fn is_terminal(self) -> bool {
+        match self {
+            Self::Succeeded | Self::Failed | Self::Cancelled => true,
+            Self::Ready
+            | Self::Running
+            | Self::WaitingActivity
+            | Self::WaitingChild
+            | Self::Sleeping
+            | Self::WaitingApproval
+            | Self::Paused
+            | Self::Blocked => false,
+        }
+    }
+
+    pub(crate) const fn awaits_child(self) -> bool {
+        match self {
+            Self::WaitingChild | Self::Paused => true,
+            Self::Ready
+            | Self::Running
+            | Self::WaitingActivity
+            | Self::Sleeping
+            | Self::WaitingApproval
+            | Self::Blocked
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Cancelled => false,
+        }
+    }
+
+    pub(crate) const fn awaits_approval(self) -> bool {
+        match self {
+            Self::WaitingApproval | Self::Paused => true,
+            Self::Ready
+            | Self::Running
+            | Self::WaitingActivity
+            | Self::WaitingChild
+            | Self::Sleeping
+            | Self::Blocked
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Cancelled => false,
+        }
+    }
+
+    pub(crate) const fn awaits_dead_letter(self) -> bool {
+        match self {
+            Self::Blocked | Self::Paused => true,
+            Self::Ready
+            | Self::Running
+            | Self::WaitingActivity
+            | Self::WaitingChild
+            | Self::Sleeping
+            | Self::WaitingApproval
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Cancelled => false,
+        }
+    }
+
+    /// Source statuses an operator restart accepts: terminal, paused or
+    /// blocked (N3).
+    pub(crate) const fn is_restartable(self) -> bool {
+        match self {
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Paused | Self::Blocked => true,
+            Self::Ready
+            | Self::Running
+            | Self::WaitingActivity
+            | Self::WaitingChild
+            | Self::Sleeping
+            | Self::WaitingApproval => false,
+        }
+    }
+
+    /// Statuses of the newest generation from which
+    /// `start_or_restart_recoverable` starts a new generation instead of
+    /// returning the existing one.
+    pub(crate) const fn is_start_recoverable(self) -> bool {
+        match self {
+            Self::Failed | Self::Blocked => true,
+            Self::Ready
+            | Self::Running
+            | Self::WaitingActivity
+            | Self::WaitingChild
+            | Self::Sleeping
+            | Self::WaitingApproval
+            | Self::Paused
+            | Self::Succeeded
+            | Self::Cancelled => false,
+        }
+    }
+}
+
+status_set_matches_predicate!(WorkflowStatus::TERMINAL == is_terminal);
+status_set_matches_predicate!(WorkflowStatus::CHILD_WAITERS == awaits_child);
+status_set_matches_predicate!(WorkflowStatus::APPROVAL_WAITERS == awaits_approval);
+status_set_matches_predicate!(WorkflowStatus::DEAD_LETTER_WAITERS == awaits_dead_letter);
+
+impl ActivityStatus {
+    /// Statuses that count against the topic concurrency cap (they own an
+    /// open attempt).
+    pub(crate) const SLOT_HOLDERS: [Self; 1] = [Self::Running];
+    /// Statuses whose row carries a lease that heartbeats renew and that
+    /// lease-expiry reconciliation recovers.
+    pub(crate) const LEASE_HOLDERS: [Self; 1] = [Self::Running];
+    /// Statuses a row may still leave: the activity can still run, and
+    /// workflow cancellation must settle it.
+    pub(crate) const NON_TERMINAL: [Self; 2] = [Self::Pending, Self::Running];
+
+    pub(crate) const fn holds_slot(self) -> bool {
+        match self {
+            Self::Running => true,
+            Self::Pending | Self::Succeeded | Self::DeadLettered | Self::Cancelled => false,
+        }
+    }
+
+    pub(crate) const fn holds_lease(self) -> bool {
+        match self {
+            Self::Running => true,
+            Self::Pending | Self::Succeeded | Self::DeadLettered | Self::Cancelled => false,
+        }
+    }
+
+    /// Statuses a row never leaves. A dead-lettered row is terminal: an
+    /// operator retry inserts a new row.
+    pub(crate) const fn is_terminal(self) -> bool {
+        match self {
+            Self::Succeeded | Self::DeadLettered | Self::Cancelled => true,
+            Self::Pending | Self::Running => false,
+        }
+    }
+
+    const fn is_non_terminal(self) -> bool {
+        !self.is_terminal()
+    }
+}
+
+status_set_matches_predicate!(ActivityStatus::SLOT_HOLDERS == holds_slot);
+status_set_matches_predicate!(ActivityStatus::LEASE_HOLDERS == holds_lease);
+status_set_matches_predicate!(ActivityStatus::NON_TERMINAL == is_non_terminal);
+
 pub use activities::find_activity_by_id;

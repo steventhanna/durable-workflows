@@ -65,7 +65,7 @@ where
         let mut connection = self.pool.get().await?;
         crate::dialect::transaction(&mut connection, async move |connection| {
             let workflow = lock_workflow(connection, workflow_id).await?;
-            if workflow.status == WorkflowStatus::Paused || is_terminal(workflow.status) {
+            if workflow.status == WorkflowStatus::Paused || workflow.status.is_terminal() {
                 return Err(conflict(workflow_id, "cannot be paused", workflow.status));
             }
             crate::trace::declare(|| {
@@ -166,7 +166,7 @@ where
         let mut connection = self.pool.get().await?;
         crate::dialect::transaction(&mut connection, async move |connection| {
             let workflow = lock_workflow(connection, workflow_id).await?;
-            if is_terminal(workflow.status) {
+            if workflow.status.is_terminal() {
                 return Err(conflict(
                     workflow_id,
                     "is already terminal",
@@ -225,7 +225,7 @@ where
         crate::dialect::transaction(&mut connection, async move |connection| {
             crate::trace::declare_unmodeled("admin_restart", true);
             let source = lock_workflow(connection, workflow_id).await?;
-            if !is_restartable(source.status) {
+            if !source.status.is_restartable() {
                 return Err(conflict(
                     workflow_id,
                     "must be paused, blocked, or terminal before restart",
@@ -272,7 +272,7 @@ where
                 ));
             }
             let now = persistence::database_now_millis(connection).await?;
-            if !is_terminal(source.status) {
+            if !source.status.is_terminal() {
                 cancel_activities(
                     connection,
                     source.id,
@@ -571,10 +571,8 @@ where
                     "approval {approval_id} has expired"
                 )));
             }
-            if !matches!(
-                workflow.status,
-                WorkflowStatus::WaitingApproval | WorkflowStatus::Paused
-            ) || workflow.wait_kind.as_deref() != Some("approval")
+            if !workflow.status.awaits_approval()
+                || workflow.wait_kind.as_deref() != Some("approval")
                 || workflow.wait_reference_id != Some(approval.id)
                 || workflow.kind != approval.kind
                 || workflow.version != approval.version
@@ -944,9 +942,7 @@ async fn pause_activity(
         durable_activity::status.eq(ActivityStatus::Pending),
         durable_activity::available_at.eq(now),
         durable_activity::max_attempts.eq(max_attempts),
-        durable_activity::lease_owner.eq(None::<String>),
-        durable_activity::lease_token.eq(None::<String>),
-        durable_activity::lease_expires_at.eq(None::<i64>),
+        persistence::LeaseCleared::new(),
         durable_activity::updated_at.eq(now),
     ))
     .execute(connection)
@@ -982,7 +978,7 @@ async fn resume_status(
                 }
                 ActivityStatus::DeadLettered => Ok(WorkflowStatus::Blocked),
                 ActivityStatus::Succeeded => Ok(WorkflowStatus::Ready),
-                value => Err(DurableError::Conflict(format!(
+                value @ ActivityStatus::Cancelled => Err(DurableError::Conflict(format!(
                     "paused workflow references activity in {value} state"
                 ))),
             }
@@ -1002,11 +998,12 @@ async fn resume_status(
                         "paused child wait references a missing workflow".to_string(),
                     )
                 })?;
-            match status {
-                WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled => Err(DurableError::Conflict(format!(
+            if status.is_terminal() {
+                Err(DurableError::Conflict(format!(
                     "paused workflow references terminal child workflow {child_id} whose outcome was never delivered"
-                ))),
-                _ => Ok(WorkflowStatus::WaitingChild),
+                )))
+            } else {
+                Ok(WorkflowStatus::WaitingChild)
             }
         }
         Some("approval") => {
@@ -1059,17 +1056,6 @@ async fn append_operator_event(
         },
     )
     .await
-}
-
-fn is_terminal(status: WorkflowStatus) -> bool {
-    matches!(
-        status,
-        WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-    )
-}
-
-fn is_restartable(status: WorkflowStatus) -> bool {
-    is_terminal(status) || matches!(status, WorkflowStatus::Blocked | WorkflowStatus::Paused)
 }
 
 fn ensure_changed(changed: usize) -> Result<(), DurableError> {

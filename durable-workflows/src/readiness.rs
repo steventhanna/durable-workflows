@@ -56,19 +56,13 @@ impl ReadinessReport {
         C: Send + Sync + 'static,
     {
         let required_workflows = durable_workflow::table
-            .filter(durable_workflow::status.ne_all([
-                WorkflowStatus::Succeeded,
-                WorkflowStatus::Failed,
-                WorkflowStatus::Cancelled,
-            ]))
+            .filter(durable_workflow::status.ne_all(WorkflowStatus::TERMINAL))
             .select((durable_workflow::kind, durable_workflow::version))
             .distinct()
             .load::<(String, i32)>(connection)
             .await?;
         let mut required_activities = durable_activity::table
-            .filter(
-                durable_activity::status.eq_any([ActivityStatus::Pending, ActivityStatus::Running]),
-            )
+            .filter(durable_activity::status.eq_any(ActivityStatus::NON_TERMINAL))
             .select((durable_activity::kind, durable_activity::version))
             .distinct()
             .load::<(String, i32)>(connection)
@@ -80,9 +74,7 @@ impl ReadinessReport {
                     .and(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))),
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-            .filter(
-                durable_workflow::status.eq_any([WorkflowStatus::Blocked, WorkflowStatus::Paused]),
-            )
+            .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
             .filter(durable_workflow::wait_kind.eq("activity"))
             .select((durable_activity::kind, durable_activity::version))
             .distinct()
@@ -90,9 +82,7 @@ impl ReadinessReport {
             .await?;
         required_activities.extend(recoverable_dead_letters);
         let mut stored_topics = durable_activity::table
-            .filter(
-                durable_activity::status.eq_any([ActivityStatus::Pending, ActivityStatus::Running]),
-            )
+            .filter(durable_activity::status.eq_any(ActivityStatus::NON_TERMINAL))
             .select(durable_activity::topic)
             .distinct()
             .load::<String>(connection)
@@ -104,9 +94,7 @@ impl ReadinessReport {
                     .and(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))),
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-            .filter(
-                durable_workflow::status.eq_any([WorkflowStatus::Blocked, WorkflowStatus::Paused]),
-            )
+            .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
             .filter(durable_workflow::wait_kind.eq("activity"))
             .select(durable_activity::topic)
             .distinct()

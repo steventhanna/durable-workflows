@@ -43,10 +43,25 @@ type system cannot express the rule.
 - Status enums (`WorkflowStatus`, `ActivityStatus`, and every status or kind
   stored as a string) are matched exhaustively inside the crate: no `_ =>`
   arm, no hand-written list of statuses. Put membership in one exhaustive
-  method or constant on the enum (for example "which statuses hold a topic
-  slot") and use it everywhere, so adding a variant is a compile error at each
-  place that must decide.
-- Public enums and config structs that may grow are `#[non_exhaustive]`.
+  method or constant on the enum and use it everywhere, so adding a variant
+  is a compile error at each place that must decide. Today (in
+  `src/persistence/mod.rs`): `ActivityStatus::holds_slot` / `SLOT_HOLDERS`
+  (topic cap, in-flight counts), `holds_lease` / `LEASE_HOLDERS` (lease
+  reconciliation, stale-lease health), `is_terminal` / `NON_TERMINAL`
+  (cancellation, readiness); `WorkflowStatus::is_terminal` / `TERMINAL`,
+  `awaits_child` / `CHILD_WAITERS`, `awaits_approval` / `APPROVAL_WAITERS`,
+  `awaits_dead_letter` / `DEAD_LETTER_WAITERS`, `is_restartable`,
+  `is_start_recoverable`. Each constant is checked against its predicate at
+  compile time (`status_set_matches_predicate!`); SQL filters use the
+  constant (`status.eq_any(ActivityStatus::SLOT_HOLDERS)`), Rust code the
+  predicate.
+- Every `durable_activity` update that clears the lease sets the
+  `persistence::LeaseCleared` changeset fragment instead of listing the three
+  lease columns (S1, S9).
+- Public enums and config structs that may grow are `#[non_exhaustive]`
+  (`WorkflowStatus`, `ActivityStatus`; the compile-fail case
+  `activity_status_match_non_exhaustive` shows a downstream exhaustive
+  `match` is E0004).
 - Never persist or compare host wall-clock time with a database timestamp.
   Persisted times and due/expiry comparisons use the database clock; process
   time (`tokio::time::Instant`) is only for local deadlines, timeouts and

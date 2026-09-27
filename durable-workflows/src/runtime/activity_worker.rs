@@ -203,7 +203,7 @@ where
 
             let in_flight = durable_activity::table
                 .filter(durable_activity::topic.eq(&topic))
-                .filter(durable_activity::status.eq(ActivityStatus::Running))
+                .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
                 .filter(durable_activity::lease_expires_at.gt(now))
                 .count()
                 .get_result::<i64>(connection)
@@ -336,7 +336,7 @@ where
                 reconciled.extend(reconcile_expired(connection, &topic, now).await?);
                 let in_flight = durable_activity::table
                     .filter(durable_activity::topic.eq(&topic))
-                    .filter(durable_activity::status.eq(ActivityStatus::Running))
+                    .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
                     .filter(durable_activity::lease_expires_at.gt(now))
                     .count()
                     .get_result::<i64>(connection)
@@ -1013,7 +1013,7 @@ async fn reconcile_expired(
     let mut reconciled = Vec::new();
     let candidates = durable_activity::table
         .filter(durable_activity::topic.eq(topic))
-        .filter(durable_activity::status.eq(ActivityStatus::Running))
+        .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
         .filter(
             durable_activity::lease_expires_at
                 .le(now)
@@ -1035,7 +1035,7 @@ async fn reconcile_expired(
         let Some(row) = durable_activity::table
             .find(activity_id)
             .filter(durable_activity::topic.eq(topic))
-            .filter(durable_activity::status.eq(ActivityStatus::Running))
+            .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
             .filter(
                 durable_activity::lease_expires_at
                     .le(now)
@@ -1049,6 +1049,19 @@ async fn reconcile_expired(
         else {
             continue;
         };
+        // Each lease holder needs its own expiry transition.
+        match row.status {
+            ActivityStatus::Running => {}
+            ActivityStatus::Pending
+            | ActivityStatus::Succeeded
+            | ActivityStatus::DeadLettered
+            | ActivityStatus::Cancelled => {
+                return Err(DurableError::InvalidState(format!(
+                    "lease reconciliation loaded activity {} in status {}, which holds no lease",
+                    row.id, row.status
+                )));
+            }
+        }
         let lease_token = row.lease_token.clone().ok_or_else(|| {
             DurableError::InvalidState(format!("running activity {} has no lease token", row.id))
         })?;
@@ -1083,9 +1096,7 @@ async fn reconcile_expired(
             durable_activity::available_at.eq(available_at),
             durable_activity::last_error_category.eq(Some("lease_expired".to_string())),
             durable_activity::last_error_message.eq(Some("activity lease expired".to_string())),
-            durable_activity::lease_owner.eq(None::<String>),
-            durable_activity::lease_token.eq(None::<String>),
-            durable_activity::lease_expires_at.eq(None::<i64>),
+            persistence::LeaseCleared::new(),
             durable_activity::updated_at.eq(now),
             durable_activity::completed_at.eq(exhausted.then_some(now)),
         ))
@@ -1236,9 +1247,7 @@ async fn finish_on_connection(
                     durable_activity::provider_result_json.eq(Some(output.clone())),
                     durable_activity::last_error_category.eq(None::<String>),
                     durable_activity::last_error_message.eq(None::<String>),
-                    durable_activity::lease_owner.eq(None::<String>),
-                    durable_activity::lease_token.eq(None::<String>),
-                    durable_activity::lease_expires_at.eq(None::<i64>),
+                    persistence::LeaseCleared::new(),
                     durable_activity::updated_at.eq(now),
                     durable_activity::completed_at.eq(Some(now)),
                 ))
@@ -1280,9 +1289,7 @@ async fn finish_on_connection(
                         durable_activity::available_at.eq(available_at),
                         durable_activity::last_error_category.eq(Some(category.clone())),
                         durable_activity::last_error_message.eq(Some(message.clone())),
-                        durable_activity::lease_owner.eq(None::<String>),
-                        durable_activity::lease_token.eq(None::<String>),
-                        durable_activity::lease_expires_at.eq(None::<i64>),
+                        persistence::LeaseCleared::new(),
                         durable_activity::updated_at.eq(now),
                     ))
                     .execute(connection)
@@ -1329,9 +1336,7 @@ async fn dead_letter(
             durable_activity::status.eq(ActivityStatus::DeadLettered),
             durable_activity::last_error_category.eq(Some(category.to_string())),
             durable_activity::last_error_message.eq(Some(message.to_string())),
-            durable_activity::lease_owner.eq(None::<String>),
-            durable_activity::lease_token.eq(None::<String>),
-            durable_activity::lease_expires_at.eq(None::<i64>),
+            persistence::LeaseCleared::new(),
             durable_activity::updated_at.eq(now),
             durable_activity::completed_at.eq(Some(now)),
         ))
