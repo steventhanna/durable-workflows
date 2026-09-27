@@ -399,6 +399,24 @@ async fn schedule_activity_payload(
     (workflow_id, activity_id)
 }
 
+/// Sets the activity's `available_at` to the database clock plus `delay`.
+async fn set_activity_available_in(
+    pool: &durable_workflows::DurablePool,
+    activity_id: i64,
+    delay: Duration,
+) {
+    let mut connection = pool.get().await.expect("test connection");
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
+    let delay = i64::try_from(delay.as_millis()).expect("delay fits in millis");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set(durable_activity::available_at.eq(now + delay))
+        .execute(&mut connection)
+        .await
+        .expect("activity availability update");
+}
+
 async fn wait_for_activity_status(
     pool: &durable_workflows::DurablePool,
     activity_id: i64,
@@ -719,6 +737,13 @@ async fn activity_dispatcher_restarts_without_waiting_for_blocked_sibling() {
     let context = Arc::new(RuntimeTestContext::default());
     context.mode.store(5, Ordering::SeqCst);
     let (_, blocked_id) = schedule_activity(&pool, 1, 10_000, 11_000).await;
+    // Every fixture is written before the runtime starts: a live coordinator
+    // could claim a workflow between its start and its wait update. The panic
+    // and probe activities are held back until their turn.
+    let (_, panic_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Panic).await;
+    let (_, probe_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Probe).await;
+    set_activity_available_in(&pool, panic_id, Duration::from_secs(3_600)).await;
+    set_activity_available_in(&pool, probe_id, Duration::from_secs(3_600)).await;
     let mut config = runtime_config();
     config.max_workers_per_topic = 2;
     let handle = runtime(pool.clone(), context.clone(), "continuation", config)
@@ -727,9 +752,9 @@ async fn activity_dispatcher_restarts_without_waiting_for_blocked_sibling() {
         .expect("runtime ready");
     context.blocked_started.notified().await;
 
-    let (_, panic_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Panic).await;
+    set_activity_available_in(&pool, panic_id, Duration::ZERO).await;
     context.panic_started.notified().await;
-    let (_, probe_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Probe).await;
+    set_activity_available_in(&pool, probe_id, Duration::ZERO).await;
 
     // A restart may sweep before the probe is inserted, then use the normal
     // one-second dispatcher backoff; leave time for the following database claim.
