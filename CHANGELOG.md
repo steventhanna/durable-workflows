@@ -58,6 +58,15 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- New persisted activity status `cancelling`: an application cancel or
+  operator pause of a running activity moves it to `cancelling` instead of
+  `cancelled`/`pending`; it keeps its lease, open attempt and topic slot
+  until its handler stops or its lease expires, then settles to `cancelled`
+  (terminal workflow) or `pending` (paused). Every process must run the new
+  code before such a row can appear: an older worker neither renews nor
+  settles it (it recovers only through lease expiry on a new process).
+  `ActivityWorker::heartbeat` returns `FencedWrite` for a revoked claim.
+
 - `WorkflowStatus` and `ActivityStatus` are `#[non_exhaustive]`. A
   downstream exhaustive `match` on either needs a wildcard arm (breaking),
   so new statuses can ship in a minor release.
@@ -163,10 +172,16 @@ Compared with the production-internal version it was extracted from:
   resolves to workflow {id}, which is the caller or an ancestor") instead of
   a wait that never ends. Wait cycles through keyed workflows that are not
   ancestors of each other are still not detected.
+- N2: an application cancel or operator pause no longer frees the topic
+  concurrency slot while the revoked handler still runs, so a cap-1 topic
+  can no longer run two handlers. The row is `cancelling` until the worker's
+  heartbeat learns of the revoke, cancels the handler and settles it (or the
+  lease expires); a pause then resume does not claim the next attempt until
+  the old one settles.
 
 ### Known issues
 
-The confirmed protocol gaps G11 and N2 have
-ignored reproduction tests in `durable-workflows/tests/gaps.rs` and reproduce
+The confirmed protocol gap G11 has an
+ignored reproduction test in `durable-workflows/tests/gaps.rs` and reproduce
 on both backends. See the "Known issues" section of the README and
 `docs/INVARIANTS.md` §6.

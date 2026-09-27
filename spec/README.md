@@ -213,6 +213,41 @@ Changes in v5 (from v4):
   are crate-private; only the admin restart (T-A5, recorded as `Unmodeled`)
   sets them. `TX1_Start` with `from != 0` needs a terminal source, so
   `inv_S19_sourceTerminal` is part of `safety`.
+- N2 fixed: new activity status `"cancelling"` (`ActRow.status`,
+  `viewAct`; the recorder writes the row's status as is). `cancelActivities`
+  (T-X3, T-A4) and `AdminPause` (T-A2, `maxAttempts + 1`) move a `running`
+  row to `cancelling` and keep its token, lease expiry and open attempt; a
+  `cancelling` row is left alone (its `lastErrorCategory`, the attempt
+  outcome, is not modeled). `liveOnTopic`, `TW1_Count` and the reconcile
+  scan count `running` and `cancelling` (`holdsLease`). `resumeStatus`
+  maps `cancelling` to `waiting_activity`.
+- `TW2_Commit` accepts a `cancelling` row (`hbFenceOk`); the renewal then
+  reports `Renewed::Revoked` and a `running` execution's phase becomes
+  `revoking` (still executing until its deadline). `HandlerReturn(r, a, tok,
+  "revoked")` needs phase `revoking` and no deadline check (the executor
+  stops the handler within `min(shutdown_grace, lease deadline)`), and sets
+  phase `revoked`.
+- New action `TW3_Revoked(r, a, tok, tnow)`: after any handler return
+  (phase `succeeded`, `retryable`, `permanent` or `revoked`), a `cancelling`
+  row with the execution's attempt, token and open attempt settles
+  (`settleRevoked`): the attempt closes, the lease clears, the row becomes
+  `cancelled` if its workflow is terminal (`availableAt` kept) else
+  `pending` at `availableAt = tnow`. `TW3_Finish` takes only a `running` row
+  and a handler outcome; `TW3_FenceMiss` needs the `leased_activity!` fence
+  (`running` or `cancelling`, attempt, token) to miss. The recorder's
+  `TW3_Finish` with outcome `"revoked"` maps to `TW3_Revoked`.
+- `TW1_Claim`'s `reconciled` entries gain `revoked: bool` (recorded as
+  `"revoked": true` on a reconciled `cancelling` row; absent = `false`). A
+  revoked entry needs a `cancelling` row with an expired lease, `exhausted =
+  false` and `availableAt` = the settled value; it settles the row
+  (`settleRevoked`, attempt outcome `lease_expired`). `TW1_ReconcileRow`
+  does the same in simulation.
+- `inv_S9_actLease`, `inv_S11_openAttempt` cover `cancelling` as a lease
+  holder; `inv_S15_actWfCoupling` and `inv_S25_cancelAtomic` allow a
+  `cancelling` row whose workflow is terminal, paused or waits on it;
+  `executing(e)` includes phase `revoking`; `inv_S13_topicConcurrency` is
+  part of `safety`. `wit_pausedActivity` no longer reads the workflow of an
+  unused activity row (a QNT507 runtime error).
 - D4: `TC2_RunChild`'s `existing` is the newest generation of the row with
   `(kind, key)` (`store.rs` `insert_child` locks the keyed row and walks its
   chain), so a parent that starts a keyed child after a recovery waits on the
@@ -407,14 +442,17 @@ in-flight simulation T-W1, which block the action):
 
 ### Directed scenarios (`quint test`)
 
-All 43 pass (`durable_tests` 36, `durable_tests_rr` 2, `durable_tests_drift` 1, `durable_tests_env` 4).
+All 56 pass (`durable_tests` 49, `durable_tests_rr` 2, `durable_tests_drift` 1, `durable_tests_env` 4).
 
 | Test | Module | Shows |
 |---|---|---|
 | `g7ClosedUnderRcTest` | RC | The old G7 schedule: the late heartbeat lands between the reconcile scan and the relock. The relock skips a1, `in_flight` sees it live, no claim. S17 holds. Also witnesses the revived expired lease. |
 | `g7RcHeartbeatBlockedTest` | RC | The other order: the relock reconciles a1 (pending again after a 1-tick retry delay) and holds it; the heartbeat blocks, then misses the fence. S17 holds. |
 | `tw1ReplayDetectsCapTest` | RC | Replay form: a recorded T-W1 that under-counted `in_flight` violates `inv_S17_capAtClaim`. |
-| `n2CancelFreesSlotTest` | RC | N2: 2 handlers execute on a cap-1 topic after a cancel. |
+| `n2CancelKeepsSlotTest`, `n2CancelNoSecondClaimTest` | RC | N2 (fixed): an app cancel moves the running activity to `cancelling` (token, lease and open attempt kept); another runtime's `in_flight` count sees the cap reached and claims nothing. |
+| `n2RevokeThenSettleTest` | RC | The heartbeat renews the `cancelling` row (phase `revoking`), the handler returns `revoked`, `TW3_Revoked` settles it to `cancelled` (terminal workflow), and the slot is free for the next claim. |
+| `n2RevokedFinishNotAppliedTest`, `n2RevokedFinishNoFenceMissTest` | RC | A handler that returns `succeeded` after the revoke cannot finish (`TW3_Finish`) or miss the fence: only `TW3_Revoked` applies. |
+| `n2ReconcileSettlesCancellingTest` | RC | The runtime crashes while the row is `cancelling`; after the lease expires, reconcile settles it (attempt closed) and the next claim takes the slot. |
 | `g2ReattachTest` | RC | G2 (fixed): T-X2 cancels the blocked keyed child and re-points its waiting parent to the successor (S24 holds); the successor's completion wakes the parent. |
 | `d4AttachNewestTest`, `d4AttachKeyedRowRejectedTest` | RC | D4: a later `RunChild` on the key attaches to the newest generation; attaching to the cancelled keyed row is not a step. |
 | `n1WrongLineageTest`, `n1SiblingNotSupersededTest` | RC | N1 (fixed): T-X2 on a child key whose keyed row succeeded returns that row and leaves the blocked auto-keyed sibling alone; superseding the sibling is not a step. |
@@ -432,7 +470,9 @@ All 43 pass (`durable_tests` 36, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `g10InvalidBoundsTest` | RC, `ENABLE_ENV_EDITS` | G10 (fixed): an external write gives a1 (topic t) invalid bounds; one `claim_batch` claims a2 on topic u, then `TW1_QuarantineRow(2, 1)` quarantines a1 and the T-W1 goes on; at commit a1 is `dead_lettered`, w1 `blocked`, a2 running, no task error; `safety` holds. |
 | `pauseResumeTest`, `pauseTwiceRejectedTest`, `resumeNotPausedRejectedTest` | RC | T-A2/T-A3: pausing a claimed row clears its lease; the coordinator's commit misses the fence, which is not a task error (`inv_G1_noSelfCancelFromOperator` holds); resume → `ready` at `tnow`. Pausing a paused row and resuming a non-paused row are not steps. |
 | `g1NoSelfCancelTest`, `g1RuntimeStillClaimsTest`, `g1AppCancelFenceMissTest` | RC, `MAX_TASK_RESTARTS = 1` | G1 (fixed): two operator pauses during claims leave runtime 1 up, and it claims again; an application cancel's fence miss is not a task error either. |
-| `n2PauseFreesSlotTest`, `pausedActivityNotClaimedTest` | RC | S36 + N2: pausing during a running activity sets it `pending` with `maxAttempts + 1` and closes the attempt; the paused handler still executes while r2 claims the cap-1 slot (`inv_S13_topicConcurrency` fails); its finish misses the fence; resume → `waiting_activity`. A paused workflow's activity is not claimable. |
+| `n2PauseKeepsSlotTest`, `n2PauseNoSecondClaimTest` | RC | S36 + N2 (fixed): pausing during a running activity moves it to `cancelling` with `maxAttempts + 1`, attempt open; no second claim on the cap-1 topic; the handler returns, `TW3_Revoked` settles it to `pending` at `now` (one more attempt); resume → `waiting_activity`, and attempt 2 is claimed. |
+| `n2PauseResumeWaitsForSettleTest`, `pausedActivityNotClaimedTest`, `pausedSettledActivityNotClaimedTest` | RC | Pause then resume while the handler runs: attempt k+1 is not claimed until attempt k settles. A paused workflow's activity is not claimable, `cancelling` or settled. |
+| `n2ReconcileReplaySettlesTest`, `n2ReconcileReplayNotRevokedRejectedTest` | RC | Replay: a recorded reconcile of an expired paused `cancelling` row with `revoked: true` settles it to `pending` at `tnow`; the same entry with `revoked: false` is not a step. |
 | `pausedParentWokenTest`, `pausedParentResumesWaitingTest` | RC | A paused parent gets its child's outcome and stays paused (wait cleared), then resumes to `ready`; resumed before the child ends → `waiting_child`. |
 | `g11AdminCancelTest`, `adminCancelPausedTest` | RC | G11 through the operator cancel; admin cancel of a paused workflow cancels its pending activity. |
 | `continuationPriorityTest`, `continuationPriorityNowRejectedTest`, `noPriorityEarlyRejectedTest` | RC | A continuation-priority activity is inserted at `CONTINUATION_READY_AT` (0 < `tnow`) and claimed; `prio` with `availableAt = now`, or no `prio` with `availableAt < tnow`, is not a step. |
@@ -448,7 +488,7 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 
 | Instance | Property | Expected | Result |
 |---|---|---|---|
-| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity, S14-S16, S18, S19 incl. source terminal, S23, S24, S25, G1) | hold | no violation |
+| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity and per topic, S14-S16, S18, S19 incl. source terminal, S23, S24, S25, G1) | hold | no violation |
 | `durable_mc` | `safetyRc` (= `safety` + S17 at claim and between commits) | hold | no violation |
 | `durable_mc_act` | `safetyRc` | hold | no violation |
 | `durable_mc_rr` | `safety` | hold | no violation |
@@ -456,7 +496,6 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 | `durable_mc_env` | `safety` (external writes and invalid-bounds commands on) | hold | no violation |
 | `durable_mc_env` | `wit_quarantined` (G10 fixed; non-vacuity) | violate | see `results/summary.txt` |
 | `durable_mc` | `inv_G11_cancelReachesChildren` | violate | violated (11 states) |
-| `durable_mc`, `durable_mc_act` | `inv_S13_topicConcurrency` (N2) | violate | not found at 40 (or 80) steps; found by `n2CancelFreesSlotTest` |
 | `durable_mc_drift` | `inv_S13_oneHandler` | violate | not found at 40 or 80 steps; found by `driftTwoHandlersTest` |
 | `durable_mc` | witnesses S3, blocked, child succeeded, activity succeeded, coordinator fence miss, reconcile row, commit inside an open T-W1 | violate | all violated (reachable) |
 | `durable_mc` | `wit_revivedLease` | violate | not found at 40 or 80 steps; reached in `g7ClosedUnderRcTest` |
@@ -503,7 +542,7 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 | G11 (cancel does not reach children) | Reproduces through T-X3 and the operator cancel (T-A4) | `g11CancelTest`, `g11AdminCancelTest`, simulation, the recorded G11 gap test |
 | N1 (T-X2 lineage on a child key) | **Fixed**: `tx2Latest` is the end of the keyed row's restart chain, so neither variant is a step; `inv_N1_tx2OwnLineage` is gone | `n1WrongLineageTest`, `n1SiblingNotSupersededTest`, `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`; both N1 gap tests' traces pass |
 | D4 (keyed child after a recovery) | `TC2_RunChild` attaches to the newest generation of the keyed row | `d4AttachNewestTest`, `d4AttachKeyedRowRejectedTest` |
-| N2 (revoke frees the slot, cap exceeded in execution) | Reproduces through application cancel and operator pause | `n2CancelFreesSlotTest`, `n2PauseFreesSlotTest`, both recorded N2 gap tests |
+| N2 (revoke frees the slot, cap exceeded in execution) | **Fixed**: cancel and pause revoke a running activity to `cancelling`, which keeps its lease, open attempt and topic slot until `TW3_Revoked` or reconcile settles it; `inv_S13_topicConcurrency` is part of `safety` | `n2CancelKeepsSlotTest`, `n2PauseKeepsSlotTest`, `n2RevokeThenSettleTest`, `n2ReconcileSettlesCancellingTest`, simulation; both N2 gap tests' traces pass |
 | N3 (public restart source not checked) | **Fixed**: the restart fields are crate-private; `TX1_Start` needs a terminal `from`; `inv_S19_sourceTerminal` is part of `safety` | `n3LiveSourceTest`, `safety` in simulation; trybuild `start_options_restart_field_private` |
 | S13 with clock drift | Reproduces, unchanged | `driftTwoHandlersTest` |
 
@@ -538,7 +577,7 @@ is terminal) did not. The field and `root_workflow_id` are now crate-private
 
 ## Counterexamples (unchanged from the first iteration)
 
-N2, G11 and the drift case follow the same steps as before (see the
+G11 and the drift case follow the same steps as before (see the
 directed tests); only the T-W1 steps are now statement groups. G7 now needs
 `RR_SNAPSHOT = true`.
 
@@ -553,5 +592,5 @@ directed tests); only the T-W1 steps are now statement groups. G7 now needs
 4. `(kind, version)` for children (G6).
 5. Schedules (T-S1, T-S2, T-A8, T-A9); G5 and G12.
 6. A guided simulation (or TLC through the TLA+ transpiler) that reaches the
-   long schedules (N2, drift) without directed tests.
+   long schedules (drift) without directed tests.
 7. Trace checking with the replay interface above.

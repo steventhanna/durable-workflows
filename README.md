@@ -221,9 +221,6 @@ are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
 
 - **G11** — Cancelling a parent workflow does not cancel its children; they
   keep running.
-- **N2** — An application cancel or operator pause frees the topic
-  concurrency slot while the cancelled handler is still running, so a cap-1
-  topic can briefly run two handlers.
 
 ## Contributing
 

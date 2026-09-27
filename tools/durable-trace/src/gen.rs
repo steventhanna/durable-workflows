@@ -935,6 +935,12 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
             let a = ctx.act.id(int(params, "activity_id", seq)?);
             let tok = token(ctx, &params["token"]);
             let outcome = text(params, "outcome", seq)?;
+            // A revoked attempt (the row was `cancelling`, N2) settles whatever the
+            // handler returned: its own model action.
+            if outcome == "revoked" {
+                let call = format!("TW3_Revoked({r}, {a}, {tok}, {tnow})");
+                return finish_step(ctx, record, seq, label, call, "TW3_Revoked").map(Some);
+            }
             // availableAt only matters for a retry.
             let (available_at, last) = match outcome {
                 "succeeded" => (tnow, "TW3_Succeeded"),
@@ -1000,16 +1006,29 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
         other => return Err(format!("unsupported_action:{other}")),
     };
 
+    finish_step(ctx, record, seq, label, call, last).map(Some)
+}
+
+/// The step for `call`: it must end in model action `last`, hold the
+/// invariants, and leave the recorded post-images.
+fn finish_step(
+    ctx: &mut Ctx,
+    record: &Value,
+    seq: i64,
+    label: String,
+    call: String,
+    last: &str,
+) -> Result<Step, Excluded> {
     let mut expect = vec![format!("lastAction == {}", quote(last))];
     expect.extend(ctx.invariants.iter().cloned());
     expect.extend(post_expectations(ctx, record, seq)?);
-    Ok(Some(Step {
+    Ok(Step {
         seq,
         class: classify(record),
         label,
         call,
         expect,
-    }))
+    })
 }
 
 /// The model id of a heartbeat already sent; `None` if its `TW2_Send` is not
@@ -1054,8 +1073,10 @@ fn tw1_claim(
                 .as_bool()
                 .ok_or_else(|| format!("malformed:reconciled:{seq}"))?;
             let available_at = int(row, "available_at", seq)?;
+            // A `cancelling` row whose lease expired settles (N2); absent = a running row.
+            let revoked = row["revoked"].as_bool().unwrap_or(false);
             reconciled.push(format!(
-                "{{ a: {a}, exhausted: {exhausted}, availableAt: {available_at} }}"
+                "{{ a: {a}, exhausted: {exhausted}, availableAt: {available_at}, revoked: {revoked} }}"
             ));
         }
     }
@@ -1355,4 +1376,108 @@ fn parse_id(id: &str, seq: i64) -> Result<i64, Excluded> {
 
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> Ctx {
+        Ctx {
+            wf: Interner::new(),
+            act: Interner::new(),
+            tok: Interner::new(),
+            rt: Interner::new(),
+            key: Interner::new(),
+            topics: BTreeSet::from(["t".to_string()]),
+            versions: HashMap::new(),
+            max_attempts: 1,
+            seen_activation: 1,
+            max_activation: None,
+            local_slots: 1,
+            max_now: 0,
+            hb: Interner::new(),
+            committed_hbs: BTreeSet::new(),
+            env_edits: false,
+            invariants: Vec::new(),
+        }
+    }
+
+    fn step(ctx: &mut Ctx, record: &Value) -> Step {
+        translate(ctx, record)
+            .expect("translates")
+            .expect("is a step")
+    }
+
+    #[test]
+    fn revoked_finish_is_tw3_revoked() {
+        let mut ctx = ctx();
+        let record = json!({
+            "seq": 7, "action": "TW3_Finish", "actor": "w1", "now": 42,
+            "params": {
+                "activity_id": 11, "attempt": 1, "max_attempts": 3, "token": "tok-a",
+                "outcome": "revoked", "available_at": 42, "workflow_id": 5
+            },
+            "post": {}
+        });
+        let step = step(&mut ctx, &record);
+        assert_eq!(step.call, "TW3_Revoked(1, 1, 1, 42)");
+        assert_eq!(step.expect[0], "lastAction == \"TW3_Revoked\"");
+    }
+
+    #[test]
+    fn revoked_handler_return_keeps_its_outcome() {
+        let mut ctx = ctx();
+        let record = json!({
+            "seq": 6, "action": "HandlerReturn", "actor": "w1",
+            "params": { "activity_id": 11, "attempt": 1, "token": "tok-a", "outcome": "revoked" }
+        });
+        assert_eq!(
+            step(&mut ctx, &record).call,
+            "HandlerReturn(1, 1, 1, \"revoked\")"
+        );
+    }
+
+    #[test]
+    fn reconciled_rows_carry_the_revoked_flag() {
+        let mut ctx = ctx();
+        let record = json!({
+            "seq": 9, "action": "TW1_Claim", "actor": "w2:dispatcher", "now": 50,
+            "params": {
+                "reconciled": [
+                    { "activity_id": 11, "exhausted": false, "workflow_blocked": false,
+                      "available_at": 50, "revoked": true },
+                    { "activity_id": 12, "exhausted": false, "workflow_blocked": false,
+                      "available_at": 51 }
+                ],
+                "claimed": [], "quarantined": [],
+                "local_avail": { "t": 1 }, "in_flight_seen": { "t": 0 }
+            },
+            "post": {}
+        });
+        let call = step(&mut ctx, &record).call;
+        assert!(
+            call.contains("{ a: 1, exhausted: false, availableAt: 50, revoked: true }"),
+            "{call}"
+        );
+        assert!(
+            call.contains("{ a: 2, exhausted: false, availableAt: 51, revoked: false }"),
+            "{call}"
+        );
+    }
+
+    #[test]
+    fn cancelling_row_maps_to_the_model_status() {
+        let mut ctx = ctx();
+        let row = json!({
+            "status": "cancelling", "workflow_id": 5, "topic": "t", "attempt_count": 1,
+            "max_attempts": 2, "available_at": 40, "lease_token": "tok-a",
+            "lease_expires_at": 70, "timeout_millis": 10, "lease_duration_millis": 20
+        });
+        assert_eq!(
+            act_row(&mut ctx, &row, 1).expect("maps"),
+            "{ status: \"cancelling\", wf: 1, topic: \"t\", attemptCount: 1, maxAttempts: 2, \
+             availableAt: 40, token: 1, leaseExp: 70, invalidBounds: false }"
+        );
+    }
 }

@@ -104,22 +104,68 @@ module durable_tests {
     init.then(startAndRunActivity(1)).then(tw1Replay(1, 1, 0)).then(tick).then(tick).then(tick)   // a1 lease 3, t=3
   run reconcileReplayDelayTest =
     expiredA1
-      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 5 }], Map("t" -> 0), [], []) })
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 5, revoked: false }], Map("t" -> 0), [], []) })
       .expect(db.act.get(1).status == "pending" and db.act.get(1).availableAt == 5 and safety)
   run reconcileReplayEarlyRejectedTest =
     expiredA1
-      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 2 }], Map("t" -> 0), [], []) })
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 2, revoked: false }], Map("t" -> 0), [], []) })
       .fail()
 
-  // N2: cancel frees the topic slot while the cancelled handler still executes
-  run n2CancelFreesSlotTest =
+  // N2 (fixed): an app cancel revokes the running activity (cancelling: lease, token and open
+  // attempt kept), so the cancelled handler keeps the cap-1 slot until it stops
+  // a second runtime's claim_batch: the in_flight count sees the cap reached, so no claim
+  action tw1Full(r: int): bool =
+    all { keepPrev, TW1_BeginBatch(r) }
+      .then(all { keepPrev, TW1_ReconcileScan(r, "t") })
+      .then(all { keepPrev, TW1_Count(r) })
+  action n2Cancelled: bool =
     init
       .then(startAndRunActivity(1))
       .then(startAndRunActivity(1))
-      .then(tw1Claim(1, 1))                                            // r1 runs a1, cap 1 reached
+      .then(tw1Claim(1, 1))                                            // r1 runs a1 (token 3, lease 3), cap 1 reached
       .then(all { keepPrev, TX3_Cancel(1, now) })                      // app cancels w1
-      .then(tw1Claim(2, 2))                                            // r2 claims a2
-      .expect(proc.execs.size() == 2 and not(inv_S13_topicConcurrency) and safety and inv_S17_capAlways)
+  run n2CancelKeepsSlotTest =
+    n2Cancelled
+      .expect(db.wf.get(1).status == "cancelled" and db.act.get(1).status == "cancelling" and db.act.get(1).token == 3
+              and db.act.get(1).leaseExp == 3 and db.att.get(1).get(1).open and liveOnTopic(db, "t", now) == 1 and safety)
+      .then(tw1Full(2))
+      .expect(lastAction == "TW1_CountFull")                           // in_flight counts the cancelling row
+  run n2CancelNoSecondClaimTest = n2Cancelled.then(tw1Full(2)).then(all { keepPrev, TW1_ClaimRow(2, 2, db.nextToken) }).fail()
+  // revoke then settle: the heartbeat renews the cancelling row and reports it revoked, the
+  // handler stops, T-W3 settles it (w1 terminal -> cancelled, attempt closed); the slot frees
+  run n2RevokeThenSettleTest =
+    n2Cancelled
+      .then(tick)                                                      // t=1
+      .then(all { keepPrev, TW2_Send(1, 1, 3, 1) })
+      .then(all { keepPrev, TW2_Commit(1, 1, 4) })                     // renewed to 4: Renewed::Revoked
+      .expect(findExec(proc, 1, 1, 3).phase == "revoking" and db.act.get(1).leaseExp == 4
+              and db.act.get(1).status == "cancelling" and safety)
+      .then(all { keepPrev, HandlerReturn(1, 1, 3, "revoked") })
+      .then(all { keepPrev, TW3_Revoked(1, 1, 3, now) })
+      .expect(lastAction == "TW3_Revoked" and db.act.get(1).status == "cancelled" and db.act.get(1).token == 0
+              and not(db.att.get(1).get(1).open) and proc.execs.size() == 0 and safety)
+      .then(tw1Claim(2, 2))                                            // the slot is free now
+      .expect(db.act.get(2).status == "running" and safety and inv_S17_capAlways)
+  // a revoked handler's result is never applied: T-W3 on the cancelling row takes TW3_Revoked
+  run n2RevokedFinishNotAppliedTest =
+    n2Cancelled.then(handler(1, 1, "succeeded")).then(finish(1, 1, "succeeded")).fail()
+  run n2RevokedFinishNoFenceMissTest =
+    n2Cancelled.then(handler(1, 1, "succeeded")).then(all { keepPrev, TW3_FenceMiss(1, 1, 3) }).fail()
+  // the runtime dies while the row is cancelling: reconcile settles it once the lease expires
+  // (attempt outcome lease_expired), and the next claim takes the slot
+  run n2ReconcileSettlesCancellingTest =
+    n2Cancelled
+      .then(all { keepPrev, Crash(1) })
+      .then(tick).then(tick).then(tick)                                // t=3: a1 lease expired
+      .then(all { keepPrev, TW1_BeginBatch(2) })
+      .then(all { keepPrev, TW1_ReconcileScan(2, "t") })
+      .expect(proc.tw1.get(2).cands == Set(1))
+      .then(all { keepPrev, TW1_ReconcileRow(2, 1, 0) })               // w1 terminal: availableAt kept
+      .then(all { keepPrev, TW1_Count(2) })
+      .then(all { keepPrev, TW1_ClaimRow(2, 2, db.nextToken) })
+      .then(all { keepPrev, TW1_Commit(2) })
+      .expect(db.act.get(1).status == "cancelled" and not(db.att.get(1).get(1).open)
+              and db.act.get(2).status == "running" and safety and inv_S17_capAlways)
 
   // P (w1) spawns keyed child C (w2); C's activity dead-letters -> C blocked
   action blockedKeyedChild: bool =
@@ -330,26 +376,49 @@ module durable_tests {
       .then(all { keepPrev, CoordFenceMiss(1, 1, 1) })
       .expect(ghost.taskErrors.get(1) == 0 and inv_G1_noSelfCancelFromOperator and safety)
 
-  // S36 + N2: pausing a workflow whose activity runs sets the activity pending with
-  // maxAttempts + 1 and closes the attempt; the paused handler still executes while another
-  // claim takes the cap-1 slot
-  run n2PauseFreesSlotTest =
+  // S36 + N2 (fixed): pausing a workflow whose activity runs revokes the activity (cancelling,
+  // maxAttempts + 1, lease and open attempt kept); the paused handler keeps the cap-1 slot
+  action n2Paused: bool =
     init
       .then(startAndRunActivity1(1))
       .then(startAndRunActivity1(1))
       .then(tw1Claim(1, 1))                                            // r1 runs a1 (token 3), cap 1 reached
       .then(pause(1))
-      .expect(lastAction == "AdminPauseActivity" and db.act.get(1).status == "pending" and db.act.get(1).maxAttempts == 2
-              and db.act.get(1).token == 0 and not(db.att.get(1).get(1).open) and not(wit_pausedActivity) and safety)
-      .then(tw1Claim(2, 2))                                            // r2 claims a2
-      .expect(proc.execs.size() == 2 and not(inv_S13_topicConcurrency) and safety and inv_S17_capAlways)
-      .then(all { keepPrev, HandlerReturn(1, 1, 3, "succeeded") })       // the paused handler's lease token
-      .then(all { keepPrev, TW3_FenceMiss(1, 1, 3) })                  // paused handler's finish misses the fence
+  run n2PauseKeepsSlotTest =
+    n2Paused
+      .expect(lastAction == "AdminPauseActivity" and db.act.get(1).status == "cancelling" and db.act.get(1).maxAttempts == 2
+              and db.act.get(1).token == 3 and db.att.get(1).get(1).open and wit_pausedActivity and safety)
+      .then(all { keepPrev, HandlerReturn(1, 1, 3, "succeeded") })     // returns before any heartbeat saw the revoke
+      .then(all { keepPrev, TW3_Revoked(1, 1, 3, now) })               // settles: pending, one more attempt
+      .expect(db.act.get(1).status == "pending" and db.act.get(1).availableAt == now and db.act.get(1).maxAttempts == 2
+              and db.act.get(1).attemptCount == 1 and db.act.get(1).token == 0 and not(db.att.get(1).get(1).open)
+              and not(wit_pausedActivity) and safety)
       .then(resume(1))
-      .expect(db.wf.get(1).status == "waiting_activity" and db.act.get(1).status == "pending" and safety)
-  // a paused workflow's pending activity is not claimable
+      .expect(db.wf.get(1).status == "waiting_activity" and safety)
+      .then(tw1Claim(2, 1))                                            // attempt 2 of a1
+      .expect(db.act.get(1).status == "running" and db.act.get(1).attemptCount == 2 and safety and inv_S17_capAlways)
+  run n2PauseNoSecondClaimTest = n2Paused.then(tw1Full(2)).then(all { keepPrev, TW1_ClaimRow(2, 2, db.nextToken) }).fail()
+  // pause then resume while the handler runs: attempt k+1 is not claimed until attempt k settles
+  run n2PauseResumeWaitsForSettleTest =
+    n2Paused.then(resume(1))
+      .expect(db.wf.get(1).status == "waiting_activity" and db.act.get(1).status == "cancelling" and safety)
+      .then(tw1Replay(2, 1, 0)).fail()
+  // a paused workflow's activity is not claimable: neither revoked (cancelling) nor settled (pending)
   run pausedActivityNotClaimedTest =
-    init.then(startAndRunActivity1(1)).then(pause(1)).then(tw1Replay(1, 1, 0)).fail()
+    n2Paused.then(tw1Replay(2, 1, 0)).fail()
+  run pausedSettledActivityNotClaimedTest =
+    n2Paused.then(handler(1, 1, "succeeded")).then(all { keepPrev, TW3_Revoked(1, 1, 3, now) })
+      .then(tw1Replay(2, 1, 0)).fail()
+  // replay: a recorded reconcile that settled an expired paused (cancelling) row -> pending at tnow
+  action n2PausedExpired: bool = n2Paused.then(all { keepPrev, Crash(1) }).then(tick).then(tick).then(tick)
+  run n2ReconcileReplaySettlesTest =
+    n2PausedExpired
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 3, revoked: true }], Map("t" -> 0), [], []) })
+      .expect(db.act.get(1).status == "pending" and db.act.get(1).availableAt == 3 and not(db.att.get(1).get(1).open) and safety)
+  run n2ReconcileReplayNotRevokedRejectedTest =
+    n2PausedExpired
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 3, revoked: false }], Map("t" -> 0), [], []) })
+      .fail()
 
   // a paused parent still gets its child's outcome (stays paused, wait cleared); resume -> ready
   run pausedParentWokenTest =
@@ -499,7 +568,7 @@ module durable_tests_drift {
       .then(all { keepPrev, TC2_RunActivity(1, 1, 1, 1, "t", MAX_ATTEMPTS, false, false, 0, 0) })
       .then(all { keepPrev, TW1_Claim(1, 0, Map("t" -> 1), [], Map("t" -> 0), [], [{ a: 1, tok: 2, leaseExp: 3 }]) })
       .then(tick).then(tick).then(tick)                                // t=3: DB lease expired, local deadline 4
-      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 3 }], Map("t" -> 0), [], [{ a: 1, tok: 3, leaseExp: 6 }]) })
+      .then(all { keepPrev, TW1_Claim(2, 3, Map("t" -> 1), [{ a: 1, exhausted: false, availableAt: 3, revoked: false }], Map("t" -> 0), [], [{ a: 1, tok: 3, leaseExp: 6 }]) })
       .expect(not(inv_S13_oneHandler) and inv_S17_capAtClaim)
 }
 

@@ -907,11 +907,48 @@ pub(crate) async fn cancel_activities(
         .await?;
     for activity in activities {
         crate::trace::touch_act(activity.id);
-        match activity.status {
-            ActivityStatus::Running => {
-                close_attempt(connection, &activity, attempt_outcome, reason, now).await?;
+        let changed = match activity.status {
+            // The handler may still be executing: the row keeps its lease,
+            // topic slot and open attempt until the handler stops or the
+            // lease expires (`settle_revoked`, N2).
+            ActivityStatus::Running | ActivityStatus::Cancelling => {
+                let lease_token = activity.lease_token.as_deref().ok_or_else(|| {
+                    DurableError::InvalidState(format!(
+                        "{} activity {} has no lease token",
+                        activity.status, activity.id
+                    ))
+                })?;
+                diesel::update(
+                    durable_activity::table
+                        .find(activity.id)
+                        .filter(durable_activity::status.eq(activity.status))
+                        .filter(durable_activity::attempt_count.eq(activity.attempt_count))
+                        .filter(durable_activity::lease_token.eq(lease_token)),
+                )
+                .set((
+                    durable_activity::status.eq(ActivityStatus::Cancelling),
+                    durable_activity::last_error_category.eq(Some(attempt_outcome.to_string())),
+                    durable_activity::last_error_message.eq(Some(reason.to_string())),
+                    durable_activity::updated_at.eq(now),
+                ))
+                .execute(connection)
+                .await?
             }
-            ActivityStatus::Pending => {}
+            ActivityStatus::Pending => {
+                diesel::update(
+                    durable_activity::table
+                        .find(activity.id)
+                        .filter(durable_activity::status.eq(ActivityStatus::Pending)),
+                )
+                .set((
+                    durable_activity::status.eq(ActivityStatus::Cancelled),
+                    persistence::LeaseCleared::new(),
+                    durable_activity::updated_at.eq(now),
+                    durable_activity::completed_at.eq(Some(now)),
+                ))
+                .execute(connection)
+                .await?
+            }
             ActivityStatus::Succeeded
             | ActivityStatus::DeadLettered
             | ActivityStatus::Cancelled => {
@@ -920,20 +957,7 @@ pub(crate) async fn cancel_activities(
                     activity.id, activity.status
                 )));
             }
-        }
-        let changed = diesel::update(
-            durable_activity::table
-                .find(activity.id)
-                .filter(durable_activity::status.eq(&activity.status)),
-        )
-        .set((
-            durable_activity::status.eq(ActivityStatus::Cancelled),
-            persistence::LeaseCleared::new(),
-            durable_activity::updated_at.eq(now),
-            durable_activity::completed_at.eq(Some(now)),
-        ))
-        .execute(connection)
-        .await?;
+        };
         ensure_cancel_changed(changed)?;
     }
     Ok(())

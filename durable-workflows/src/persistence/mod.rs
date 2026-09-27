@@ -158,6 +158,7 @@ string_status!(WorkflowStatus {
 string_status!(ActivityStatus {
     Pending => "pending",
     Running => "running",
+    Cancelling => "cancelling",
     Succeeded => "succeeded",
     DeadLettered => "dead_lettered",
     Cancelled => "cancelled",
@@ -280,25 +281,26 @@ status_set_matches_predicate!(WorkflowStatus::DEAD_LETTER_WAITERS == awaits_dead
 
 impl ActivityStatus {
     /// Statuses that count against the topic concurrency cap (they own an
-    /// open attempt).
-    pub(crate) const SLOT_HOLDERS: [Self; 1] = [Self::Running];
+    /// open attempt). A `cancelling` row keeps its slot until its revoked
+    /// handler stops (N2).
+    pub(crate) const SLOT_HOLDERS: [Self; 2] = [Self::Running, Self::Cancelling];
     /// Statuses whose row carries a lease that heartbeats renew and that
     /// lease-expiry reconciliation recovers.
-    pub(crate) const LEASE_HOLDERS: [Self; 1] = [Self::Running];
+    pub(crate) const LEASE_HOLDERS: [Self; 2] = [Self::Running, Self::Cancelling];
     /// Statuses a row may still leave: the activity can still run, and
     /// workflow cancellation must settle it.
-    pub(crate) const NON_TERMINAL: [Self; 2] = [Self::Pending, Self::Running];
+    pub(crate) const NON_TERMINAL: [Self; 3] = [Self::Pending, Self::Running, Self::Cancelling];
 
     pub(crate) const fn holds_slot(self) -> bool {
         match self {
-            Self::Running => true,
+            Self::Running | Self::Cancelling => true,
             Self::Pending | Self::Succeeded | Self::DeadLettered | Self::Cancelled => false,
         }
     }
 
     pub(crate) const fn holds_lease(self) -> bool {
         match self {
-            Self::Running => true,
+            Self::Running | Self::Cancelling => true,
             Self::Pending | Self::Succeeded | Self::DeadLettered | Self::Cancelled => false,
         }
     }
@@ -308,7 +310,7 @@ impl ActivityStatus {
     pub(crate) const fn is_terminal(self) -> bool {
         match self {
             Self::Succeeded | Self::DeadLettered | Self::Cancelled => true,
-            Self::Pending | Self::Running => false,
+            Self::Pending | Self::Running | Self::Cancelling => false,
         }
     }
 

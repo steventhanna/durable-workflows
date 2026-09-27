@@ -314,8 +314,20 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         .first::<ActivityAttemptRow>(&mut connection)
         .await
         .expect("attempt");
-    assert!(attempt.finished_at.is_some());
-    assert_eq!(attempt.outcome.as_deref(), Some("application_cancelled"));
+    // N2: the revoked attempt stays open, holding its lease and topic slot,
+    // until its handler stops or its lease expires.
+    assert!(attempt.finished_at.is_none());
+    let revoked = durable_activity::table
+        .find(activity_id)
+        .select(ActivityRow::as_select())
+        .first::<ActivityRow>(&mut connection)
+        .await
+        .expect("activity");
+    assert_eq!(revoked.status.as_str(), "cancelling");
+    assert_eq!(
+        revoked.last_error_category.as_deref(),
+        Some("application_cancelled")
+    );
     let events = durable_workflow_event::table
         .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
         .filter(durable_workflow_event::event_type.eq("workflow_cancelled"))
@@ -347,6 +359,27 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         worker.heartbeat(&claim).await,
         Err(DurableError::FencedWrite)
     ));
+    assert!(worker
+        .claim_one("capture")
+        .await
+        .expect("claim while revoked")
+        .is_none());
+    // This claim has no handler, so lease expiry settles the revoke. The
+    // trace records that no handler holds it (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "cleanup-worker",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set(durable_activity::lease_expires_at.eq(Some(1_i64)))
+        .execute(&mut connection)
+        .await
+        .expect("expire lease");
+    drop(connection);
     let next_claim = worker
         .claim_one("capture")
         .await
@@ -356,6 +389,23 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         next_claim.activity_id().expect("next id").get(),
         next_activity_id
     );
+    let mut connection = pool.get().await.expect("connection");
+    let attempt = durable_activity_attempt::table
+        .find((activity_id, 1))
+        .select(ActivityAttemptRow::as_select())
+        .first::<ActivityAttemptRow>(&mut connection)
+        .await
+        .expect("attempt");
+    assert!(attempt.finished_at.is_some());
+    assert_eq!(attempt.outcome.as_deref(), Some("lease_expired"));
+    let settled = durable_activity::table
+        .find(activity_id)
+        .select(ActivityRow::as_select())
+        .first::<ActivityRow>(&mut connection)
+        .await
+        .expect("activity");
+    assert_eq!(settled.status.as_str(), "cancelled");
+    drop(connection);
 
     let (pending_workflow, pending_activity) =
         schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;

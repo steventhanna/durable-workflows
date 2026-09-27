@@ -17,7 +17,9 @@ use diesel_async::SimpleAsyncConnection;
 use durable_workflows::{
     admin::{AdminControlService, Operator},
     persistence::{database_now_millis, find_activity_by_id, find_workflow_by_id, WorkflowRow},
-    schema::{durable_activity, durable_workflow, durable_workflow_event},
+    schema::{
+        durable_activity, durable_activity_attempt, durable_workflow, durable_workflow_event,
+    },
     ActivityContext, ActivityError, ActivityHandler, ActivityId, ActivityRegistry, ActivityTopic,
     ActivityWorker, CoordinatorConfig, DurableActivity, DurableError, DurableFlow, DurablePool,
     DurableRuntime, DurableStore, DurableWorkflow, RetryPolicy, RuntimeConfig, StartOptions,
@@ -2118,13 +2120,239 @@ async fn n2_cap_holds_after_revoke(revoke: N2Revoke) {
 }
 
 #[tokio::test]
-#[ignore = "confirms N2: application cancel frees the cap-1 slot while the cancelled handler still executes"]
 async fn n2_application_cancel_keeps_topic_slot_until_handler_stops() {
     n2_cap_holds_after_revoke(N2Revoke::ApplicationCancel).await;
 }
 
 #[tokio::test]
-#[ignore = "confirms N2: operator pause frees the cap-1 slot while the paused handler still executes"]
 async fn n2_operator_pause_keeps_topic_slot_until_handler_stops() {
     n2_cap_holds_after_revoke(N2Revoke::OperatorPause).await;
+}
+
+/// Starts one `N2Flow` and activates it, returning the workflow and its activity.
+async fn n2_start(
+    store: &DurableStore,
+    coordinator: &mut WorkflowCoordinator<N2Context>,
+    pool: &DurablePool,
+) -> (WorkflowId, i64) {
+    let workflow_id = store
+        .start(&N2Flow {}, StartOptions::default())
+        .await
+        .expect("workflow starts")
+        .workflow_id;
+    coordinator
+        .activate_one()
+        .await
+        .expect("workflow activates")
+        .expect("workflow claim");
+    let activity_id = load(pool, workflow_id)
+        .await
+        .wait_reference_id
+        .expect("activity wait");
+    (workflow_id, activity_id)
+}
+
+fn n2_coordinator(pool: &DurablePool, context: Arc<N2Context>) -> WorkflowCoordinator<N2Context> {
+    WorkflowCoordinator::new(
+        pool.clone(),
+        context,
+        n2_workflows(),
+        n2_activities(),
+        "n2-coordinator",
+        CoordinatorConfig::default(),
+    )
+    .expect("coordinator is valid")
+}
+
+async fn n2_activity(pool: &DurablePool, activity_id: i64) -> (String, i32, i32, Option<String>) {
+    let mut connection = pool.get().await.expect("test connection");
+    durable_activity::table
+        .find(activity_id)
+        .select((
+            durable_activity::status,
+            durable_activity::attempt_count,
+            durable_activity::max_attempts,
+            durable_activity::lease_token,
+        ))
+        .first(&mut connection)
+        .await
+        .expect("activity row")
+}
+
+async fn n2_attempt(pool: &DurablePool, activity_id: i64, attempt: i32) -> (Option<String>, bool) {
+    let mut connection = pool.get().await.expect("test connection");
+    let (outcome, finished_at) = durable_activity_attempt::table
+        .find((activity_id, attempt))
+        .select((
+            durable_activity_attempt::outcome,
+            durable_activity_attempt::finished_at,
+        ))
+        .first::<(Option<String>, Option<i64>)>(&mut connection)
+        .await
+        .expect("attempt row");
+    (outcome, finished_at.is_some())
+}
+
+#[tokio::test]
+async fn n2_pause_then_resume_does_not_claim_the_next_attempt_until_the_old_one_settles() {
+    let Some(pool) = support::fresh_pool_with_max_size(8).await else {
+        return;
+    };
+    let context = Arc::new(N2Context::default());
+    let store = DurableStore::new(pool.clone());
+    let mut coordinator = n2_coordinator(&pool, context.clone());
+    let (w1, a1) = n2_start(&store, &mut coordinator, &pool).await;
+    let r1 = n2_worker(&pool, context.clone(), "n2-r1");
+    let r1_task = tokio::spawn(async move { r1.run_one("gap_n2").await });
+    context
+        .entered
+        .acquire()
+        .await
+        .expect("entered semaphore")
+        .forget();
+
+    let admin = AdminControlService::new(pool.clone(), n2_workflows(), n2_activities());
+    admin
+        .pause_workflow(w1, &operator("operator pauses w1"))
+        .await
+        .expect("w1 pauses");
+    let resumed = admin
+        .resume_workflow(w1, &operator("operator resumes w1"))
+        .await
+        .expect("w1 resumes");
+    assert_eq!(resumed.status, "waiting_activity");
+    assert_eq!(n2_activity(&pool, a1).await.0, "cancelling");
+
+    let r2 = n2_worker(&pool, context.clone(), "n2-r2");
+    assert!(
+        r2.claim_one("gap_n2").await.expect("claim").is_none(),
+        "attempt 2 was claimed while attempt 1's handler was executing"
+    );
+    assert_eq!(context.executing(), 1);
+
+    tokio::time::timeout(CONDITION_TIMEOUT, r1_task)
+        .await
+        .expect("r1 returns")
+        .expect("r1 task joins")
+        .expect("r1 settles the revoked attempt");
+    assert_eq!(context.executing(), 0);
+    assert_eq!(
+        n2_attempt(&pool, a1, 1).await,
+        (Some("operator_paused".to_string()), true)
+    );
+    let second = r2
+        .claim_one("gap_n2")
+        .await
+        .expect("claim")
+        .expect("attempt 2 is claimable once attempt 1 settled");
+    assert_eq!(second.activity_id().expect("id").get(), a1);
+    assert_eq!(second.attempt_number().expect("attempt"), 2);
+}
+
+#[tokio::test]
+async fn n2_settled_paused_activity_is_pending_with_one_more_attempt() {
+    let Some(pool) = support::fresh_pool_with_max_size(8).await else {
+        return;
+    };
+    let context = Arc::new(N2Context::default());
+    let store = DurableStore::new(pool.clone());
+    let mut coordinator = n2_coordinator(&pool, context.clone());
+    let (w1, a1) = n2_start(&store, &mut coordinator, &pool).await;
+    let r1 = n2_worker(&pool, context.clone(), "n2-r1");
+    let r1_task = tokio::spawn(async move { r1.run_one("gap_n2").await });
+    context
+        .entered
+        .acquire()
+        .await
+        .expect("entered semaphore")
+        .forget();
+    AdminControlService::new(pool.clone(), n2_workflows(), n2_activities())
+        .pause_workflow(w1, &operator("operator pauses w1"))
+        .await
+        .expect("w1 pauses");
+    let (status, _, max_attempts, token) = n2_activity(&pool, a1).await;
+    assert_eq!(status, "cancelling");
+    assert!(token.is_some(), "the revoked attempt keeps its lease");
+    assert_eq!(max_attempts, 4);
+
+    tokio::time::timeout(CONDITION_TIMEOUT, r1_task)
+        .await
+        .expect("r1 returns")
+        .expect("r1 task joins")
+        .expect("r1 settles the revoked attempt");
+    let (status, attempt_count, max_attempts, token) = n2_activity(&pool, a1).await;
+    assert_eq!(
+        (status.as_str(), attempt_count, max_attempts),
+        ("pending", 1, N2HeldActivity::MAX_ATTEMPTS as i32 + 1)
+    );
+    assert!(token.is_none());
+    assert_eq!(
+        n2_attempt(&pool, a1, 1).await,
+        (Some("operator_paused".to_string()), true)
+    );
+    assert_eq!(load(&pool, w1).await.status.as_str(), "paused");
+    let mut connection = pool.get().await.expect("test connection");
+    let settled = durable_workflow_event::table
+        .filter(durable_workflow_event::workflow_id.eq(w1.get()))
+        .filter(durable_workflow_event::event_type.eq("activity_revoke_settled"))
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("history");
+    assert_eq!(settled, 1);
+}
+
+#[tokio::test]
+async fn n2_crash_while_cancelling_settles_by_lease_reconciliation() {
+    let Some(pool) = support::fresh_pool_with_max_size(8).await else {
+        return;
+    };
+    let context = Arc::new(N2Context::default());
+    let store = DurableStore::new(pool.clone());
+    let mut coordinator = n2_coordinator(&pool, context.clone());
+    let (w1, a1) = n2_start(&store, &mut coordinator, &pool).await;
+    let (_w2, a2) = n2_start(&store, &mut coordinator, &pool).await;
+    // A claim with no executor: its worker crashed.
+    let crashed = n2_worker(&pool, context.clone(), "n2-crashed");
+    let claim = crashed
+        .claim_one("gap_n2")
+        .await
+        .expect("claim")
+        .expect("a1 claim");
+    assert_eq!(claim.activity_id().expect("id").get(), a1);
+    let mut connection = pool.get().await.expect("test connection");
+    DurableStore::cancel_with_conn(&mut connection, w1, "application cancels w1")
+        .await
+        .expect("w1 cancels");
+    assert_eq!(n2_activity(&pool, a1).await.0, "cancelling");
+    let r2 = n2_worker(&pool, context.clone(), "n2-r2");
+    assert!(r2.claim_one("gap_n2").await.expect("claim").is_none());
+
+    // The trace records that no handler holds the claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "n2-crashed",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
+    diesel::update(durable_activity::table.find(a1))
+        .set(durable_activity::lease_expires_at.eq(Some(1_i64)))
+        .execute(&mut connection)
+        .await
+        .expect("expire a1's lease");
+    drop(connection);
+    let second = r2
+        .claim_one("gap_n2")
+        .await
+        .expect("claim")
+        .expect("reconciliation frees the slot");
+    assert_eq!(second.activity_id().expect("id").get(), a2);
+    let (status, _, _, token) = n2_activity(&pool, a1).await;
+    assert_eq!(status, "cancelled");
+    assert!(token.is_none());
+    assert_eq!(
+        n2_attempt(&pool, a1, 1).await,
+        (Some("lease_expired".to_string()), true)
+    );
 }

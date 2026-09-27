@@ -15,16 +15,32 @@ use crate::{
         WorkflowStatus,
     },
     schema::{durable_activity, durable_activity_attempt, durable_topic_lock, durable_workflow},
+    store::close_attempt,
     ActivityContext, ActivityDispatchError, ActivityError, ActivityId, ActivityRegistry,
     ActivityResult, DurableError, DurablePool, ProgressReporter, RetryPolicy, TopicRegistry,
     WorkflowEvent, WorkflowId,
 };
 
+/// T-W3 writes of a handler outcome. Only a `running` row takes one;
+/// `finish_on_connection` settles a `cancelling` row with `settle_revoked`
+/// before it reaches these writes.
 macro_rules! fenced_activity {
     ($claim:expr) => {
         durable_activity::table
             .find($claim.row.id)
             .filter(durable_activity::status.eq(ActivityStatus::Running))
+            .filter(durable_activity::attempt_count.eq($claim.attempt_number))
+            .filter(durable_activity::lease_token.eq(&$claim.lease_token))
+    };
+}
+
+/// The claim's attempt while it still holds its lease: `running`, or
+/// `cancelling` after a revoke whose handler has not stopped yet (N2).
+macro_rules! leased_activity {
+    ($claim:expr) => {
+        durable_activity::table
+            .find($claim.row.id)
+            .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
             .filter(durable_activity::attempt_count.eq($claim.attempt_number))
             .filter(durable_activity::lease_token.eq(&$claim.lease_token))
     };
@@ -596,16 +612,23 @@ where
         self.execute_claim(claim).instrument(span).await
     }
 
+    /// Renews the claim's lease. Returns [`DurableError::FencedWrite`] once
+    /// the claim no longer authorizes work: its lease was lost, or its
+    /// workflow was cancelled or paused (the row is `cancelling` and the lease
+    /// is renewed so the caller can stop; lease expiry then settles it).
     pub async fn heartbeat(&self, claim: &ActivityClaim) -> Result<(), DurableError> {
-        heartbeat_once(
+        match heartbeat_once(
             &self.pool,
             claim,
             &self.worker_id,
             crate::trace::next_heartbeat_id(),
             &std::sync::atomic::AtomicBool::new(false),
         )
-        .await
-        .map(|_| ())
+        .await?
+        {
+            Renewed::Held(_) => Ok(()),
+            Renewed::Revoked(_) => Err(DurableError::FencedWrite),
+        }
     }
 
     async fn execute_claim(&self, claim: ActivityClaim) -> Result<(), DurableError> {
@@ -717,6 +740,40 @@ where
                     ));
                 }
                 result = &mut heartbeat, if !heartbeat_stopped => {
+                    if let Ok(HeartbeatEnd::Revoked { lease_deadline }) = result {
+                        // Cancelled or paused (N2): the row keeps its slot
+                        // until this handler stops, so stop it within the
+                        // shutdown grace and the lease, then settle.
+                        child_cancellation.cancel();
+                        heartbeat_stopped = true;
+                        timeout_cleanup_pending = false;
+                        if !execution_finished {
+                            let deadline = if shutdown_requested {
+                                shutdown_deadline.deadline()
+                            } else {
+                                tokio::time::Instant::now() + self.config.shutdown_grace
+                            }.min(lease_deadline);
+                            if deadline > tokio::time::Instant::now() {
+                                tokio::select! {
+                                    biased;
+                                    _ = self.forced_cancellation.cancelled() => {
+                                        forced_shutdown_requested = true;
+                                    }
+                                    _ = wait_for_lease_deadline(deadline) => {
+                                        tracing::warn!("revoked activity cleanup grace elapsed");
+                                    }
+                                    result = &mut execution => {
+                                        execution_finished = true;
+                                        if let Err(cleanup_error) = result {
+                                            tracing::warn!(%cleanup_error, "revoked activity cleanup returned an error");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        requested_outcome = Some(ExecutionOutcome::Revoked);
+                        continue;
+                    }
                     if let Err(failure) = result {
                         child_cancellation.cancel();
                         heartbeat_stop.cancel();
@@ -780,6 +837,12 @@ where
         let mut connection = self.pool.get().await?;
         let finished = claim.clone();
         let actor = self.worker_id.as_str();
+        let revoked = match outcome {
+            ExecutionOutcome::Revoked => true,
+            ExecutionOutcome::Succeeded(_)
+            | ExecutionOutcome::Retryable(_)
+            | ExecutionOutcome::Permanent(_) => false,
+        };
         let result = crate::dialect::transaction(&mut connection, async move |connection| {
             crate::trace::actor(actor);
             finish_on_connection(connection, &finished, outcome).await
@@ -788,6 +851,10 @@ where
         drop(connection);
         if matches!(result, Err(DurableError::FencedWrite)) {
             record_execution_step(&self.pool, &self.worker_id, claim, "TW3_FenceMiss", None).await;
+            if revoked {
+                // Lease reconciliation already settled the revoked attempt.
+                return Ok(());
+            }
         }
         result
     }
@@ -796,6 +863,26 @@ where
 struct HeartbeatFailure {
     error: DurableError,
     lease_deadline: tokio::time::Instant,
+}
+
+/// How a heartbeat loop that kept its lease ended.
+enum HeartbeatEnd {
+    /// The executor stopped it.
+    Stopped,
+    /// A renewal found the attempt revoked (`cancelling`, N2): the handler
+    /// must stop before `lease_deadline`.
+    Revoked {
+        lease_deadline: tokio::time::Instant,
+    },
+}
+
+/// A committed lease renewal, with the new local lease deadline.
+enum Renewed {
+    /// The attempt is still `running`.
+    Held(tokio::time::Instant),
+    /// The attempt was cancelled or paused (`cancelling`): the lease was
+    /// renewed so the handler can stop, but its outcome will not be applied.
+    Revoked(tokio::time::Instant),
 }
 
 async fn wait_for_lease_deadline(deadline: tokio::time::Instant) {
@@ -818,7 +905,7 @@ async fn heartbeat_loop(
     heartbeat_interval: Duration,
     stop: CancellationToken,
     actor: String,
-) -> Result<(), HeartbeatFailure> {
+) -> Result<HeartbeatEnd, HeartbeatFailure> {
     let mut lease_deadline = claim.lease_deadline;
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + heartbeat_interval,
@@ -828,7 +915,7 @@ async fn heartbeat_loop(
     loop {
         tokio::select! {
             biased;
-            _ = stop.cancelled() => return Ok(()),
+            _ = stop.cancelled() => return Ok(HeartbeatEnd::Stopped),
             _ = wait_for_lease_deadline(lease_deadline) => {
                 if crate::trace::ENABLED {
                     // Detached: the deadline can pass because the pool is exhausted,
@@ -864,7 +951,12 @@ async fn heartbeat_loop(
             record_heartbeat_step(&pool, &actor, "TW2_Drop", hb).await;
         }
         match renewal {
-            Ok(deadline) => lease_deadline = deadline,
+            Ok(Renewed::Held(deadline)) => lease_deadline = deadline,
+            Ok(Renewed::Revoked(deadline)) => {
+                return Ok(HeartbeatEnd::Revoked {
+                    lease_deadline: deadline,
+                })
+            }
             Err(error) => {
                 return Err(HeartbeatFailure {
                     error,
@@ -881,7 +973,7 @@ async fn heartbeat_once(
     actor: &str,
     hb: u64,
     sent: &std::sync::atomic::AtomicBool,
-) -> Result<tokio::time::Instant, DurableError> {
+) -> Result<Renewed, DurableError> {
     let checkout_pool = pool.clone();
     // A bb8 checkout cancelled during validation can return a half-used connection to the pool.
     // Only checkout outlives lease cancellation; no renewal query runs in this task.
@@ -916,7 +1008,14 @@ async fn heartbeat_once(
         let lease_expires_at = now
             .checked_add(claim.row.lease_duration_millis)
             .ok_or_else(|| DurableError::InvalidState("activity lease overflow".to_string()))?;
-        let changed = diesel::update(fenced_activity!(claim))
+        let status = leased_activity!(claim)
+            .for_update()
+            .select(durable_activity::status)
+            .first::<ActivityStatus>(connection)
+            .await
+            .optional()?
+            .ok_or(DurableError::FencedWrite)?;
+        let changed = diesel::update(leased_activity!(claim))
             .set((
                 durable_activity::lease_expires_at.eq(Some(lease_expires_at)),
                 durable_activity::updated_at.eq(now),
@@ -945,7 +1044,19 @@ async fn heartbeat_once(
                 }),
             )
         });
-        lease_deadline_from_sample(lease_sample_started, claim.row.lease_duration_millis)
+        let deadline =
+            lease_deadline_from_sample(lease_sample_started, claim.row.lease_duration_millis)?;
+        match status {
+            ActivityStatus::Running => Ok(Renewed::Held(deadline)),
+            ActivityStatus::Cancelling => Ok(Renewed::Revoked(deadline)),
+            ActivityStatus::Pending
+            | ActivityStatus::Succeeded
+            | ActivityStatus::DeadLettered
+            | ActivityStatus::Cancelled => Err(DurableError::InvalidState(format!(
+                "lease renewal fenced activity {} in status {status}, which holds no lease",
+                claim.row.id
+            ))),
+        }
     })
     .await;
     // A fence miss rolled back cleanly. Other errors may have broken the
@@ -976,6 +1087,9 @@ enum ExecutionOutcome {
     Succeeded(String),
     Retryable(ActivityError),
     Permanent(ActivityError),
+    /// A heartbeat found the attempt revoked (N2); the handler has stopped
+    /// or its grace elapsed. T-W3 settles the revoke (`settle_revoked`).
+    Revoked,
 }
 
 impl ExecutionOutcome {
@@ -985,6 +1099,7 @@ impl ExecutionOutcome {
             Self::Succeeded(_) => "succeeded",
             Self::Retryable(_) => "retryable",
             Self::Permanent(_) => "permanent",
+            Self::Revoked => "revoked",
         }
     }
 }
@@ -1052,6 +1167,26 @@ async fn reconcile_expired(
         // Each lease holder needs its own expiry transition.
         match row.status {
             ActivityStatus::Running => {}
+            ActivityStatus::Cancelling => {
+                let settled = settle_revoked(
+                    connection,
+                    &row,
+                    "lease_expired",
+                    "activity lease expired",
+                    now,
+                )
+                .await?;
+                if crate::trace::ENABLED {
+                    reconciled.push(serde_json::json!({
+                        "activity_id": row.id,
+                        "exhausted": false,
+                        "workflow_blocked": false,
+                        "available_at": settled.available_at,
+                        "revoked": true,
+                    }));
+                }
+                continue;
+            }
             ActivityStatus::Pending
             | ActivityStatus::Succeeded
             | ActivityStatus::DeadLettered
@@ -1154,6 +1289,66 @@ async fn reconcile_expired(
     Ok(reconciled)
 }
 
+/// Where a settled revoke left its row.
+struct SettledRevoke {
+    available_at: i64,
+}
+
+/// Closes the open attempt of a `cancelling` row whose handler stopped (T-W3)
+/// or whose lease expired (reconciliation), and releases its lease and topic
+/// slot (N2): `cancelled` when its workflow is terminal, else `pending` and
+/// claimable at once. The caller holds the workflow and the row `FOR UPDATE`.
+async fn settle_revoked(
+    connection: &mut crate::DurableConnection,
+    row: &ActivityRow,
+    attempt_outcome: &str,
+    message: &str,
+    now: i64,
+) -> Result<SettledRevoke, DurableError> {
+    let lease_token = row.lease_token.as_deref().ok_or_else(|| {
+        DurableError::InvalidState(format!("cancelling activity {} has no lease token", row.id))
+    })?;
+    let workflow_status = durable_workflow::table
+        .find(row.workflow_id)
+        .select(durable_workflow::status)
+        .first::<WorkflowStatus>(connection)
+        .await?;
+    close_attempt(connection, row, attempt_outcome, message, now).await?;
+    let (settled_status, available_at) = if workflow_status.is_terminal() {
+        (ActivityStatus::Cancelled, row.available_at)
+    } else {
+        (ActivityStatus::Pending, now)
+    };
+    let changed = diesel::update(
+        durable_activity::table
+            .find(row.id)
+            .filter(durable_activity::status.eq(ActivityStatus::Cancelling))
+            .filter(durable_activity::attempt_count.eq(row.attempt_count))
+            .filter(durable_activity::lease_token.eq(lease_token)),
+    )
+    .set((
+        durable_activity::status.eq(settled_status),
+        durable_activity::available_at.eq(available_at),
+        persistence::LeaseCleared::new(),
+        durable_activity::updated_at.eq(now),
+        durable_activity::completed_at.eq(workflow_status.is_terminal().then_some(now)),
+    ))
+    .execute(connection)
+    .await?;
+    ensure_fenced(changed)?;
+    append_activity_history(
+        connection,
+        row,
+        "activity_revoke_settled",
+        Some(message.to_string()),
+        now,
+    )
+    .await?;
+    crate::trace::touch_act(row.id);
+    crate::trace::touch_att(row.id, row.attempt_count);
+    Ok(SettledRevoke { available_at })
+}
+
 /// Dead-letters a pending row the claim cannot run (G10) and blocks its
 /// workflow, which the caller already holds `FOR UPDATE`. An operator
 /// `retry_activity` replaces the row from the registered definition.
@@ -1239,8 +1434,44 @@ async fn finish_on_connection(
         .first::<i64>(connection)
         .await?;
     let now = persistence::database_now_millis(connection).await?;
-    match outcome {
-        ExecutionOutcome::Succeeded(output) => {
+    let row = leased_activity!(claim)
+        .for_update()
+        .select(ActivityRow::as_select())
+        .first::<ActivityRow>(connection)
+        .await
+        .optional()?
+        .ok_or(DurableError::FencedWrite)?;
+    match (row.status, outcome) {
+        // Revoked (N2): whatever the handler returned is not applied.
+        (ActivityStatus::Cancelling, _) => {
+            let outcome = row.last_error_category.clone().ok_or_else(|| {
+                DurableError::InvalidState(format!(
+                    "cancelling activity {} records no revoke outcome",
+                    row.id
+                ))
+            })?;
+            let message = row.last_error_message.clone().unwrap_or_default();
+            let settled = settle_revoked(connection, &row, &outcome, &message, now).await?;
+            declare_finish(claim, "revoked", Some(settled.available_at));
+            Ok(())
+        }
+        (ActivityStatus::Running, ExecutionOutcome::Revoked) => {
+            Err(DurableError::InvalidState(format!(
+                "activity {} attempt {} finished as revoked but is still running",
+                row.id, claim.attempt_number
+            )))
+        }
+        (
+            ActivityStatus::Pending
+            | ActivityStatus::Succeeded
+            | ActivityStatus::DeadLettered
+            | ActivityStatus::Cancelled,
+            _,
+        ) => Err(DurableError::InvalidState(format!(
+            "finish fenced activity {} in status {}, which holds no lease",
+            row.id, row.status
+        ))),
+        (ActivityStatus::Running, ExecutionOutcome::Succeeded(output)) => {
             let changed = diesel::update(fenced_activity!(claim))
                 .set((
                     durable_activity::status.eq(ActivityStatus::Succeeded),
@@ -1267,7 +1498,7 @@ async fn finish_on_connection(
             declare_finish(claim, "succeeded", None);
             wake_workflow(connection, claim, output, now).await
         }
-        ExecutionOutcome::Retryable(error) => {
+        (ActivityStatus::Running, ExecutionOutcome::Retryable(error)) => {
             let (category, message) = activity_error_parts(error);
             if claim.attempt_number >= claim.row.max_attempts {
                 declare_finish(claim, "retryable", None);
@@ -1316,7 +1547,7 @@ async fn finish_on_connection(
                 .await
             }
         }
-        ExecutionOutcome::Permanent(error) => {
+        (ActivityStatus::Running, ExecutionOutcome::Permanent(error)) => {
             let (category, message) = activity_error_parts(error);
             declare_finish(claim, "permanent", None);
             dead_letter(connection, claim, &category, &message, now).await

@@ -17,7 +17,7 @@ use crate::{
         durable_activity, durable_approval, durable_schedule_run, durable_schedule_state,
         durable_workflow,
     },
-    store::{cancel_activities, cancel_approvals, close_attempt},
+    store::{cancel_activities, cancel_approvals},
     ActivityId, ActivityRegistry, ApprovalId, ApprovalResult, DurableError, DurablePool,
     DurableStore, ScheduleRunId, StartOptions, WorkflowEvent, WorkflowId, WorkflowRegistry,
     MAX_EVENT_METADATA_BYTES,
@@ -914,35 +914,43 @@ async fn pause_activity(
     let Some(activity) = activity else {
         return Ok(());
     };
-    if activity.status != ActivityStatus::Running {
-        return Ok(());
+    match activity.status {
+        ActivityStatus::Running => {}
+        // A `cancelling` row was already revoked (a pause that a resume
+        // overtook, or a cancel): its attempt is already accounted for.
+        ActivityStatus::Pending
+        | ActivityStatus::Cancelling
+        | ActivityStatus::Succeeded
+        | ActivityStatus::DeadLettered
+        | ActivityStatus::Cancelled => return Ok(()),
     }
+    let lease_token = activity.lease_token.as_deref().ok_or_else(|| {
+        DurableError::InvalidState(format!(
+            "running activity {} has no lease token",
+            activity.id
+        ))
+    })?;
     crate::trace::touch_act(activity.id);
     crate::trace::note("paused_activity", || serde_json::json!(activity.id));
-    close_attempt(
-        connection,
-        &activity,
-        "operator_paused",
-        operator.reason(),
-        now,
-    )
-    .await?;
     let max_attempts = activity.max_attempts.checked_add(1).ok_or_else(|| {
         DurableError::InvalidState(
             "activity attempt limit overflow after operator pause".to_string(),
         )
     })?;
+    // S36: the handler is told at its next heartbeat; the row keeps its lease,
+    // topic slot and open attempt until the handler stops (N2).
     let changed = diesel::update(
         durable_activity::table
             .find(activity.id)
             .filter(durable_activity::status.eq(ActivityStatus::Running))
-            .filter(durable_activity::lease_token.eq(activity.lease_token)),
+            .filter(durable_activity::attempt_count.eq(activity.attempt_count))
+            .filter(durable_activity::lease_token.eq(lease_token)),
     )
     .set((
-        durable_activity::status.eq(ActivityStatus::Pending),
-        durable_activity::available_at.eq(now),
+        durable_activity::status.eq(ActivityStatus::Cancelling),
         durable_activity::max_attempts.eq(max_attempts),
-        persistence::LeaseCleared::new(),
+        durable_activity::last_error_category.eq(Some("operator_paused".to_string())),
+        durable_activity::last_error_message.eq(Some(operator.reason().to_string())),
         durable_activity::updated_at.eq(now),
     ))
     .execute(connection)
@@ -973,7 +981,9 @@ async fn resume_status(
                     )
                 })?;
             match status {
-                ActivityStatus::Pending | ActivityStatus::Running => {
+                // A `cancelling` row is not claimable until its revoked
+                // attempt settles to `pending`.
+                ActivityStatus::Pending | ActivityStatus::Running | ActivityStatus::Cancelling => {
                     Ok(WorkflowStatus::WaitingActivity)
                 }
                 ActivityStatus::DeadLettered => Ok(WorkflowStatus::Blocked),

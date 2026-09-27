@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use diesel::{QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
-    persistence::WorkflowRow, schema::durable_workflow, ActivityCommand, ActivityContext,
-    ActivityError, ActivityHandler, ActivityTopic, CoordinatorConfig, DurableActivity,
-    DurableStore, DurableWorkflow, RetryPolicy, StartOptions, WorkerConfig, WorkflowContext,
-    WorkflowEvent, WorkflowHandler, WorkflowTransition,
+    persistence::WorkflowRow,
+    schema::{durable_activity, durable_activity_attempt, durable_workflow},
+    ActivityCommand, ActivityContext, ActivityError, ActivityHandler, ActivityTopic,
+    CoordinatorConfig, DurableActivity, DurableStore, DurableWorkflow, RetryPolicy, StartOptions,
+    WorkerConfig, WorkflowContext, WorkflowEvent, WorkflowHandler, WorkflowTransition,
 };
 
 #[derive(Clone, Copy)]
@@ -1113,12 +1114,12 @@ async fn crash_then_recovery() {
 }
 
 #[tokio::test]
-async fn cancel_while_running_fence_miss() {
+async fn cancel_while_running_settles_the_revoked_attempt() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let gate_name = "cancel_while_running_fence_miss";
-    let (id, _) = start_activity(
+    let gate_name = "cancel_while_running_settles_the_revoked_attempt";
+    let (id, activity_id) = start_activity(
         &pool,
         &HoldFlow {
             gate: gate_name.to_string(),
@@ -1136,9 +1137,30 @@ async fn cancel_while_running_fence_miss() {
         .expect("cancels");
     drop(connection);
     gate.release.add_permits(1);
+    // N2: the cancel revoked the attempt (`cancelling`); T-W3 settles it
+    // instead of applying the handler's result.
     assert!(matches!(
         run.await.expect("joins"),
-        Err(durable_workflows::DurableError::FencedWrite)
+        Ok(Some(ran)) if ran.get() == activity_id
     ));
     assert_eq!(status(&pool, id).await, "cancelled");
+    let mut connection = pool.get().await.expect("connection");
+    let activity_status = durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<String>(&mut connection)
+        .await
+        .expect("activity row");
+    assert_eq!(activity_status, "cancelled");
+    let (outcome, finished_at) = durable_activity_attempt::table
+        .find((activity_id, 1))
+        .select((
+            durable_activity_attempt::outcome,
+            durable_activity_attempt::finished_at,
+        ))
+        .first::<(Option<String>, Option<i64>)>(&mut connection)
+        .await
+        .expect("attempt row");
+    assert!(finished_at.is_some(), "the revoked attempt is closed");
+    assert_eq!(outcome.as_deref(), Some("application_cancelled"));
 }

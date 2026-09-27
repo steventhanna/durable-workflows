@@ -93,8 +93,11 @@ No transition leaves a terminal status (see S6).
 
 ### 1.2 Activity (`durable_activity`, M:65-104)
 
-Statuses (`src/persistence/mod.rs:144-150`): `pending`, `running`,
-`succeeded`, `dead_lettered`, `cancelled`. Unique
+Statuses (`src/persistence/mod.rs`): `pending`, `running`, `cancelling`,
+`succeeded`, `dead_lettered`, `cancelled`. `cancelling` is a revoked
+`running` attempt whose handler may still execute: it keeps its lease, its
+open attempt and its topic slot until the handler stops (T-W3) or the lease
+expires (reconcile), which settles it (N2). Unique
 `(workflowId, commandSequence, replacementNumber)` (M:94); `maxAttempts > 0`
 (M:103).
 
@@ -106,11 +109,14 @@ Statuses (`src/persistence/mod.rs:144-150`): `pending`, `running`,
 | running | succeeded | finish success | activity worker | `src/runtime/activity_worker.rs:1015-1042` |
 | running | pending | retryable failure, attempts left (backoff) | activity worker | `src/runtime/activity_worker.rs:1043-1091` |
 | running | pending | expired lease, attempts left (backoff) | activity worker (claim txn) | `src/runtime/activity_worker.rs:913-937` |
-| running | pending | pause of the waiting workflow; `maxAttempts+1` | admin | `src/admin/control.rs:888-938` |
+| running | cancelling | pause of the waiting workflow; `maxAttempts+1`, `lastErrorCategory=operator_paused`; lease and open attempt kept | admin | `src/admin/control.rs` `pause_activity` |
+| running, cancelling | cancelling | workflow cancel / restart; `lastErrorCategory` = `application_cancelled` or `operator_cancelled`; lease and open attempt kept | app, admin | `src/store.rs` `cancel_activities` |
+| cancelling | pending | revoke settled (handler stopped, or lease expired) while the workflow is not terminal; `availableAt = now` | activity worker | `src/runtime/activity_worker.rs` `settle_revoked` |
+| cancelling | cancelled | revoke settled while the workflow is terminal | activity worker | `src/runtime/activity_worker.rs` `settle_revoked` |
 | running | dead_lettered | permanent failure, or retryable on last attempt | activity worker | `src/runtime/activity_worker.rs:1099-1131` |
 | running | dead_lettered | expired lease on last attempt | activity worker (claim txn) | `src/runtime/activity_worker.rs:898-937` |
 | pending | dead_lettered | quarantine at claim: attempt cap reached or invalid timeout/lease bounds (`invalid_row`, G10) | activity worker (claim txn) | `src/runtime/activity_worker.rs` `quarantine_candidate` |
-| pending, running | cancelled | workflow cancel / restart | app, admin | `src/store.rs:578-614` |
+| pending | cancelled | workflow cancel / restart | app, admin | `src/store.rs` `cancel_activities` |
 | dead_lettered | cancelled | recoverable start of a blocked/failed lineage | app | `src/store.rs:241-255` |
 
 ### 1.3 Activity attempt (`durable_activity_attempt`, M:106-122)
@@ -124,8 +130,11 @@ Primary key `(activityId, attemptNumber)`, `attemptNumber > 0`. States: open
 |---|---|
 | `succeeded`, `retryable_failure`, `dead_lettered` | `src/runtime/activity_worker.rs:1133-1158` |
 | `lease_expired` | `src/runtime/activity_worker.rs:938-952` |
-| `operator_paused` | `src/admin/control.rs:907-914` via `src/store.rs:616-644` |
-| `operator_cancelled`, `application_cancelled` | `src/store.rs:593-595`, `616-644` |
+| `operator_paused`, `operator_cancelled`, `application_cancelled` (the row's `lastErrorCategory`) | when the revoked handler stops: `src/runtime/activity_worker.rs` `settle_revoked` via `finish_on_connection` |
+| `lease_expired` for a `cancelling` row | `src/runtime/activity_worker.rs` `reconcile_expired` → `settle_revoked` |
+
+A `cancelling` row's attempt stays open: the revoke only records its outcome
+in `lastErrorCategory`/`lastErrorMessage` (N2).
 
 Heartbeats update `heartbeatAt` on the open attempt only
 (`src/runtime/activity_worker.rs:805-814`). Progress events (≤100 per attempt,
@@ -609,8 +618,10 @@ repeated crashes while a workflow is claimed stay unbounded.
 
 **S9. At most one live lease per activity.** Only `pending → running` issues a
 token, fenced on `status=pending ∧ attemptCount=k` under
-`FOR UPDATE SKIP LOCKED` (`src/runtime/activity_worker.rs:437-493`); every
-exit from `running` clears it. **ENFORCED**.
+`FOR UPDATE SKIP LOCKED` (`src/runtime/activity_worker.rs:437-493`). A
+`running` or `cancelling` row holds a lease (`ActivityStatus::holds_lease`);
+`running → cancelling` keeps it, and every exit from those two clears it.
+**ENFORCED**.
 
 **S10. A stale activity lease cannot commit, heartbeat, or report progress.**
 All such writes are fenced on `status=running ∧ attemptCount=k ∧ leaseToken=t`
@@ -620,10 +631,11 @@ All such writes are fenced on `status=running ∧ attemptCount=k ∧ leaseToken=
 test expiry, so a heartbeat can revive an expired but unreconciled lease
 (`src/runtime/activity_worker.rs:797-804`; see G7).
 
-**S11. Running ⇔ exactly one open attempt.** `activity.status=running ⇔`
-attempt `(id, attemptCount)` exists with `finishedAt IS NULL` and the same
-`leaseToken`; each attempt closes exactly once. **ENFORCED**: every exit from
-`running` closes the attempt in the same transaction with a
+**S11. Running or cancelling ⇔ exactly one open attempt.**
+`activity.status ∈ {running, cancelling} ⇔` attempt `(id, attemptCount)`
+exists with `finishedAt IS NULL` and the same `leaseToken`; each attempt
+closes exactly once. **ENFORCED**: `running → cancelling` keeps the attempt
+open, and every exit from those two closes it in the same transaction with a
 `finishedAt IS NULL` fence (§1.3 table).
 
 **S12. Attempts are monotonic and bounded.** Per activity row,
@@ -643,7 +655,9 @@ the process monotonic clock not running slower than the DB clock; the DB
 clock not jumping forward; handlers yielding so the dropped future stops; and
 no detached tasks inside handlers. Across attempts, activities are
 at-least-once: a result committed after the lease was reconciled is rejected
-and the activity runs again.
+and the activity runs again. A cancel or pause does not free the row for a
+new attempt while the revoked handler may still execute: the row is
+`cancelling` until it stops or its lease expires (N2, fixed).
 
 **S14. Activity terminal states.** `succeeded` and `cancelled` are absorbing;
 `dead_lettered` can only move to `cancelled`, via T-X2
@@ -651,10 +665,13 @@ and the activity runs again.
 
 **S15. Activity/workflow coupling.** `activity.status ∈ {pending, running}` ⇒
 its workflow waits on it (`waiting_activity`, or `paused` with the activity
-`pending`); `workflow.status=blocked` ⇒ it waits on a `dead_lettered`
+`pending`); `activity.status = cancelling` ⇒ its workflow is terminal, or
+waits on it (`waiting_activity` after a resume, or `paused`);
+`workflow.status=blocked` ⇒ it waits on a `dead_lettered`
 activity. Claims require the wait (`src/runtime/activity_worker.rs:240-241`,
 `424-436`); success and dead-letter roll back without it (`1176-1178`,
-`1227-1241`); pause converts `running` to `pending` (`src/admin/control.rs:888-938`).
+`1227-1241`); pause converts `running` to `cancelling`, which settles to
+`pending` (`src/admin/control.rs` `pause_activity`, `settle_revoked`).
 **ENFORCED** by construction.
 
 **S16. Activity success is delivered at most once.** Success, attempt close,
@@ -662,7 +679,9 @@ event append, and workflow wake are one transaction under the workflow lock,
 and the wake clears the wait. **ENFORCED**.
 
 **S17. Topic concurrency cap at claim time.** When T-W1/`claim_one` commits,
-`|{running ∧ leaseExpiresAt > now}|` on the topic ≤ `maxConcurrency`. Claims on
+`|{(running ∨ cancelling) ∧ leaseExpiresAt > now}|` on the topic ≤
+`maxConcurrency` (`ActivityStatus::SLOT_HOLDERS`; a revoked handler keeps
+its slot until it stops, N2). Claims on
 a topic serialize on its lock row, and reconcile runs first in the same
 transaction. **ENFORCED**, with one exception by one (G7).
 
@@ -737,8 +756,10 @@ model `inv_S24_parentWakes` in `safety`; tests
 `recoverable_start_at_a_new_version_fails_the_waiting_parent_as_superseded`).
 
 **S25. Cancellation is atomic for the workflow's own work.** One transaction
-cancels the workflow, its pending/running activities (closing attempts), its
-pending approvals, and wakes waiting parents (`src/store.rs:503-568`).
+cancels the workflow and its pending activities, moves its running ones to
+`cancelling` (their attempts close when the revoked handler stops or the
+lease expires, and the row then becomes `cancelled`), cancels its pending
+approvals, and wakes waiting parents (`src/store.rs` `cancel_locked_workflow`).
 `cancel_with_conn` is idempotent on terminal workflows; admin cancel returns
 Conflict. **ENFORCED**.
 
@@ -823,11 +844,14 @@ policy skips that bound, and `delay_for_attempt` then saturates at
 `u64::MAX` seconds instead of wrapping (the jitter overflow, fixed).
 
 **S36. Operator pause fences in-flight work.** Pausing a running workflow
-invalidates the coordinator's token; pausing while an activity runs closes its
-attempt, returns it to `pending`, and invalidates the worker token, with
-`maxAttempts+1` so the paused attempt does not consume the budget.
-**ENFORCED** (tests `pause_fences_a_workflow_transition_claimed_before_the_operator_action`,
-`pausing_the_final_activity_attempt_preserves_one_execution_attempt`).
+invalidates the coordinator's token; pausing while an activity runs moves it
+to `cancelling` with `maxAttempts+1` so the paused attempt does not consume
+the budget. The worker's next heartbeat learns of the revoke and stops the
+handler; its result is never applied. The attempt closes (`operator_paused`)
+and the row returns to `pending` when the handler stops or the lease expires
+(N2). **ENFORCED** (tests `pause_fences_a_workflow_transition_claimed_before_the_operator_action`,
+`pausing_the_final_activity_attempt_preserves_one_execution_attempt`,
+`n2_settled_paused_activity_is_pending_with_one_more_attempt`).
 
 ### Rejected candidates
 
@@ -908,9 +932,12 @@ never terminates, for example in a wait cycle through keyed rows that are not
 ancestors of each other (G8). **ENFORCED**.
 
 **L12. Cancellation, pause, or restart stops an in-flight activity handler
-within `heartbeat interval + min(shutdown_grace, remaining lease)`**, through
-the heartbeat fence (`src/runtime/activity_worker.rs:658-687`). Cooperative
-(F4). **ENFORCED**.
+within `heartbeat interval + min(shutdown_grace, remaining lease)`**: the
+heartbeat renews a `cancelling` row and reports it revoked
+(`Renewed::Revoked`), the executor cancels the handler, waits at most
+`min(shutdown_grace, lease deadline)`, and settles the revoke
+(`ExecutionOutcome::Revoked`). Until then the row keeps its topic slot (N2).
+Cooperative (F4). **ENFORCED**.
 
 **L13. Graceful shutdown finishes within `deadline + forced_shutdown_timeout`**
 (`src/runtime/supervisor.rs:259-301`). Leases left behind are recovered by
@@ -1020,8 +1047,9 @@ non-terminating child are stable states that need an operator.
 Status: G4 is closed for library transactions (P4, READ COMMITTED).
 G1, G2, G3, G6, G8, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
 is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixed;
-their tests in `tests/gaps.rs` run un-ignored. G11 and the model
-finding N2 are confirmed by ignored tests in `tests/gaps.rs`.
+their tests in `tests/gaps.rs` run un-ignored. The model finding N2 is fixed
+(see its entry at the end of this section). G11 is confirmed by an ignored
+test in `tests/gaps.rs`.
 
 Each item below was traced from the code; the status line above records
 which ones a test has since confirmed or closed.
@@ -1241,6 +1269,14 @@ override; the tests do not cover a paused or active schedule. Intent is
 UNCLEAR.
 
 ---
+
+**N2. A cancel or pause freed the topic slot while the revoked handler still
+ran (FIXED).** Cancel and pause closed the attempt and cleared the lease at
+once; the handler learned of it only at its next heartbeat and could clean
+up for `shutdown_grace`, so a cap-1 topic could run two handlers. Fixed with
+the `cancelling` status (§1.2): the revoked row keeps its lease, open attempt
+and topic slot until its handler stops or its lease expires
+(`settle_revoked`). Tests `n2_*` in `tests/gaps.rs`.
 
 ## 7. Modeling notes
 

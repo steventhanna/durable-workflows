@@ -19,7 +19,10 @@ system can make the violation fail to compile. In order of preference:
 
 1. **Unrepresentable.** Model the domain so the bad state has no value: an
    enum instead of a combination of `Option` fields, a newtype instead of a
-   raw `i64`/`String`, a parsed type instead of a validated one.
+   raw `i64`/`String`, a parsed type instead of a validated one, an outcome
+   enum instead of a flag (a lease renewal returns `Renewed::Held` or
+   `Renewed::Revoked`; a revoked execution finishes as
+   `ExecutionOutcome::Revoked`).
 2. **Uncompilable.** Make the wrong use a compile error: a borrow guard
    (`WorkflowCoordinator::claim_one(&mut self)` returns a `WorkflowClaim<'_, C>`,
    so a second claim while one is alive is E0499), a method that consumes

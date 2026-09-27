@@ -451,16 +451,21 @@ async fn pause_fences_a_running_activity_and_resume_reopens_the_wait() {
         .first::<ActivityRow>(&mut connection)
         .await
         .expect("activity");
-    assert_eq!(activity.status.as_str(), "pending");
-    assert!(activity.lease_token.is_none());
+    // N2: the revoked attempt keeps its lease and stays open until its
+    // handler stops or its lease expires.
+    assert_eq!(activity.status.as_str(), "cancelling");
+    assert_eq!(activity.lease_token.as_deref(), Some(claim.lease_token()));
+    assert_eq!(
+        activity.last_error_category.as_deref(),
+        Some("operator_paused")
+    );
     let attempt = durable_activity_attempt::table
         .find((activity_id, 1))
         .select(ActivityAttemptRow::as_select())
         .first::<ActivityAttemptRow>(&mut connection)
         .await
         .expect("attempt");
-    assert_eq!(attempt.outcome.as_deref(), Some("operator_paused"));
-    assert!(attempt.finished_at.is_some());
+    assert!(attempt.finished_at.is_none());
     drop(connection);
 
     let resumed = service
@@ -468,6 +473,33 @@ async fn pause_fences_a_running_activity_and_resume_reopens_the_wait() {
         .await
         .expect("resume");
     assert_eq!(resumed.status, "waiting_activity");
+
+    // This claim has no handler, so lease expiry settles the revoke.
+    expire_activity_lease(&pool, activity_id).await;
+    let replacement = worker
+        .claim_one("control_external")
+        .await
+        .expect("replacement claim")
+        .expect("the settled activity is claimable again");
+    assert_eq!(replacement.attempt_number().expect("attempt"), 2);
+    let mut connection = pool.get().await.expect("connection");
+    let attempt = durable_activity_attempt::table
+        .find((activity_id, 1))
+        .select(ActivityAttemptRow::as_select())
+        .first::<ActivityAttemptRow>(&mut connection)
+        .await
+        .expect("attempt");
+    assert_eq!(attempt.outcome.as_deref(), Some("lease_expired"));
+    assert!(attempt.finished_at.is_some());
+}
+
+async fn expire_activity_lease(pool: &durable_workflows::DurablePool, activity_id: i64) {
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .execute(&mut connection)
+        .await
+        .expect("expire lease");
 }
 
 #[tokio::test]
@@ -510,6 +542,23 @@ async fn pausing_the_final_activity_attempt_preserves_one_execution_attempt() {
         .resume_workflow(workflow_id, &operator("resume final attempt"))
         .await
         .expect("resume");
+
+    // N2: attempt 2 waits until the revoked attempt 1 settles.
+    assert!(worker
+        .claim_one("control_external")
+        .await
+        .expect("claim while revoked")
+        .is_none());
+    let mut connection = pool.get().await.expect("connection");
+    let (status, max_attempts) = durable_activity::table
+        .find(activity_id)
+        .select((durable_activity::status, durable_activity::max_attempts))
+        .first::<(String, i32)>(&mut connection)
+        .await
+        .expect("activity");
+    assert_eq!((status.as_str(), max_attempts), ("cancelling", 2));
+    drop(connection);
+    expire_activity_lease(&pool, activity_id).await;
 
     let replacement_claim = worker
         .claim_one("control_external")
