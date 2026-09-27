@@ -12,10 +12,10 @@ use durable_workflows::{
         durable_activity, durable_activity_attempt, durable_workflow, durable_workflow_event,
     },
     ActivityContext, ActivityError, ActivityHandler, ActivityRegistry, ActivityTopic,
-    ActivityWorker, CoordinatorConfig, DurableActivity, DurableError, DurableStore,
-    DurableWorkflow, RetryPolicy, StartOptions, TopicRegistry, WorkerConfig, WorkflowContext,
-    WorkflowCoordinator, WorkflowError, WorkflowEvent, WorkflowHandler, WorkflowId,
-    WorkflowRegistry, WorkflowTransition,
+    ActivityWorker, CoordinatorConfig, DurableActivity, DurableError, DurableFlow, DurableStore,
+    DurableWorkflow, RetryPolicy, StartOptions, TopicRegistry, WfCtx, WfError, WorkerConfig,
+    WorkflowContext, WorkflowCoordinator, WorkflowError, WorkflowEvent, WorkflowHandler,
+    WorkflowId, WorkflowRegistry, WorkflowTransition,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1222,4 +1222,143 @@ async fn recoverable_start_at_a_new_version_fails_the_waiting_parent_as_supersed
         metadata.to_string().contains("child_superseded"),
         "unexpected child_failed metadata: {metadata}"
     );
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CascadeChild {}
+
+impl DurableWorkflow for CascadeChild {
+    const KIND: &'static str = "control_cascade_child";
+    const VERSION: i32 = 1;
+}
+
+#[async_trait]
+impl DurableFlow for CascadeChild {
+    type Context = ();
+    type Output = i32;
+
+    async fn run(&self, ctx: &mut WfCtx<'_, ()>) -> Result<i32, WfError> {
+        ctx.run(&ControlActivityV1 { value: 1 }).await
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CascadeParent {}
+
+impl DurableWorkflow for CascadeParent {
+    const KIND: &'static str = "control_cascade_parent";
+    const VERSION: i32 = 1;
+}
+
+#[async_trait]
+impl DurableFlow for CascadeParent {
+    type Context = ();
+    type Output = i32;
+
+    async fn run(&self, ctx: &mut WfCtx<'_, ()>) -> Result<i32, WfError> {
+        ctx.child(&CascadeChild {}).await
+    }
+}
+
+/// G11 through T-A5: restarting a paused (non-terminal) parent supersedes it
+/// and cancels the child it owns with that child's pending activity.
+#[tokio::test]
+async fn restart_supersession_cancels_the_owned_child() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let workflows = Arc::new(
+        durable_workflows::register_durable_workflows!((); CascadeParent, CascadeChild)
+            .expect("workflow registry"),
+    );
+    let (_, activities, _) = registries();
+    let activities = Arc::new(activities);
+    let parent = DurableStore::new(pool.clone())
+        .start(&CascadeParent {}, StartOptions::default())
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    let mut coordinator = WorkflowCoordinator::new(
+        pool.clone(),
+        Arc::new(()),
+        workflows.clone(),
+        activities.clone(),
+        "cascade-coordinator",
+        CoordinatorConfig::default(),
+    )
+    .expect("coordinator");
+    assert_eq!(
+        coordinator.activate_one().await.expect("parent"),
+        Some(parent)
+    );
+    let mut connection = pool.get().await.expect("connection");
+    let load = async |connection: &mut durable_workflows::DurableConnection, id: i64| {
+        durable_workflow::table
+            .find(id)
+            .select(WorkflowRow::as_select())
+            .first::<WorkflowRow>(connection)
+            .await
+            .expect("workflow loads")
+    };
+    let child = load(&mut connection, parent.get())
+        .await
+        .wait_reference_id
+        .expect("child reference");
+    assert_eq!(
+        coordinator
+            .activate_one()
+            .await
+            .expect("child")
+            .map(|id| id.get()),
+        Some(child)
+    );
+    let activity_id = load(&mut connection, child)
+        .await
+        .wait_reference_id
+        .expect("activity reference");
+
+    let service = AdminControlService::new(pool.clone(), workflows, activities);
+    service
+        .pause_workflow(parent, &operator("pause the parent"))
+        .await
+        .expect("parent pauses");
+    let restarted = service
+        .restart_workflow(parent, &operator("restart the parent"))
+        .await
+        .expect("parent restarts");
+
+    assert_eq!(
+        load(&mut connection, parent.get()).await.status.as_str(),
+        "cancelled"
+    );
+    assert_eq!(
+        load(&mut connection, restarted.workflow_id.get())
+            .await
+            .status
+            .as_str(),
+        "ready"
+    );
+    assert_eq!(
+        load(&mut connection, child).await.status.as_str(),
+        "cancelled"
+    );
+    let activity_status = durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<String>(&mut connection)
+        .await
+        .expect("activity status");
+    assert_eq!(activity_status, "cancelled");
+    let cancelled = durable_workflow_event::table
+        .filter(durable_workflow_event::workflow_id.eq(child))
+        .filter(durable_workflow_event::event_type.eq("workflow_cancelled"))
+        .select(WorkflowEventRow::as_select())
+        .first::<WorkflowEventRow>(&mut connection)
+        .await
+        .expect("child workflow_cancelled event");
+    assert_eq!(
+        cancelled.reason.as_deref(),
+        Some(format!("parent workflow {parent} cancelled: restart the parent").as_str())
+    );
+    assert_eq!(cancelled.actor_type.as_deref(), Some("operator"));
 }

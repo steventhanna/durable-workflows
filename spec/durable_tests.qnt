@@ -263,14 +263,47 @@ module durable_tests {
       .then(all { keepPrev, TX2_RecoverableStart("C", DOMAIN_KEY, 2, 3, true, db.nextWf, now) })
       .fail()
 
-  // G11: cancelling a parent leaves its child running
+  // G11 (fixed): cancelling a parent cancels the child it owns
   run g11CancelTest =
     init
       .then(start(NO_KEY))
       .then(claim(1, 1))
       .then(runChild(1, nextAutoKey(1)))
       .then(all { keepPrev, TX3_Cancel(1, now) })
-      .expect(db.wf.get(2).status == "ready" and not(inv_G11_cancelReachesChildren) and safety)
+      .expect(db.wf.get(1).status == "cancelled" and db.wf.get(2).status == "cancelled"
+              and inv_G11_cancelReachesChildren and safety)
+  // the cascade reaches a grandchild and its pending activity
+  run g11GrandchildTest =
+    init
+      .then(start(NO_KEY))
+      .then(claim(1, 1)).then(runChild(1, nextAutoKey(1)))
+      .then(claim(1, 2)).then(runChild(1, nextAutoKey(1)))
+      .then(claim(1, 3)).then(runAct(1))
+      .expect(db.wf.get(3).status == "waiting_activity" and db.act.get(1).status == "pending")
+      .then(all { keepPrev, TX3_Cancel(1, now) })
+      .expect(Set(1, 2, 3).forall(w => db.wf.get(w).status == "cancelled")
+              and db.act.get(1).status == "cancelled" and safety)
+  // the cascade reaches the T-X2 successor of a blocked owned child (G2 re-attached the parent)
+  run g11SuccessorTest =
+    init
+      .then(start(NO_KEY))
+      .then(claim(1, 1)).then(runChild(1, nextAutoKey(1)))
+      .then(claim(1, 2)).then(runAct(1))
+      .then(tw1Claim(1, 1))
+      .then(handler(1, 1, "permanent")).then(finish(1, 1, "permanent"))
+      .expect(db.wf.get(2).status == "blocked")
+      .then(all { keepPrev, TX2_RecoverableStart("C", autoKey(1, 1), 2, 2, true, db.nextWf, now) })
+      .expect(db.wf.get(3).status == "ready" and db.wf.get(3).restartedFrom == 2 and db.wf.get(1).waitRef == 3)
+      .then(all { keepPrev, TX3_Cancel(1, now) })
+      .expect(db.wf.get(1).status == "cancelled" and db.wf.get(3).status == "cancelled" and safety)
+  // a domain-keyed child is not owned and keeps running
+  run g11DomainKeyedChildTest =
+    init
+      .then(start(NO_KEY))
+      .then(claim(1, 1))
+      .then(runChild(1, DOMAIN_KEY))
+      .then(all { keepPrev, TX3_Cancel(1, now) })
+      .expect(db.wf.get(1).status == "cancelled" and db.wf.get(2).status == "ready" and safety)
 
   // S2/S3: a stale coordinator (lease expired and recovered, row re-claimed) cannot commit
   run staleCoordinatorTest =
@@ -441,14 +474,15 @@ module durable_tests {
       .then(pause(1)).then(resume(1))
       .expect(db.wf.get(1).status == "waiting_child" and db.wf.get(1).waitRef == 2 and safety)
 
-  // G11 via the operator: admin cancel of the parent leaves its child live
+  // G11 via the operator (fixed): admin cancel of the parent cancels its child
   run g11AdminCancelTest =
     init
       .then(start(NO_KEY))
       .then(claim(1, 1))
       .then(runChild(1, nextAutoKey(1)))
       .then(all { keepPrev, AdminCancel(1, now) })
-      .expect(lastAction == "AdminCancel" and db.wf.get(2).status == "ready" and not(inv_G11_cancelReachesChildren) and safety)
+      .expect(lastAction == "AdminCancel" and db.wf.get(2).status == "cancelled"
+              and inv_G11_cancelReachesChildren and safety)
   // admin cancel of a paused workflow with a pending activity cancels both
   run adminCancelPausedTest =
     init.then(startAndRunActivity1(1)).then(pause(1)).then(all { keepPrev, AdminCancel(1, now) })

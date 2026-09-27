@@ -317,6 +317,111 @@ gap_flow!(G11Parent {}, "gap_g11_parent", 1, |_this, ctx| {
     ctx.child(&G11Child {}).await
 });
 
+/// Starts an owned (auto-keyed) child that blocks, for the G11 restart
+/// generation test.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct G11RecoveringParent {}
+
+impl DurableWorkflow for G11RecoveringParent {
+    const KIND: &'static str = "gap_g11_recovering_parent";
+    const VERSION: i32 = 1;
+}
+
+#[async_trait]
+impl DurableFlow for G11RecoveringParent {
+    type Context = GapContext;
+    type Output = i32;
+
+    async fn run(&self, ctx: &mut WfCtx<'_, GapContext>) -> Result<i32, WfError> {
+        ctx.child(&G2RecoveringChild {
+            fail: true,
+            value: 1,
+        })
+        .await
+    }
+}
+
+gap_flow!(G11Grandparent {}, "gap_g11_grandparent", 1, |_this, ctx| {
+    ctx.child(&G11Parent {}).await
+});
+
+gap_flow!(
+    G11KeyedParent {},
+    "gap_g11_keyed_parent",
+    1,
+    |_this, ctx| {
+        let key = "g11-shared-child";
+        ctx.child_with_key(&G11Child {}, key).await
+    }
+);
+
+/// Signals `entered` when it starts and again when its cancellation token
+/// fires, then waits for `release`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct G11HeldActivity;
+
+impl DurableActivity for G11HeldActivity {
+    type Topic = GapTopic;
+
+    const KIND: &'static str = "gap_g11_held";
+    const VERSION: i32 = 1;
+    const MAX_ATTEMPTS: u32 = 3;
+    const TIMEOUT: Duration = Duration::from_secs(20);
+    const LEASE_DURATION: Duration = Duration::from_secs(30);
+
+    fn topic() -> Self::Topic {
+        GapTopic::G11
+    }
+
+    fn retry_policy() -> RetryPolicy {
+        RetryPolicy::fixed(1).expect("test policy is valid")
+    }
+}
+
+#[async_trait]
+impl ActivityHandler for G11HeldActivity {
+    type Context = GapContext;
+    type Output = ();
+
+    async fn execute(&self, context: ActivityContext<'_, GapContext>) -> Result<(), ActivityError> {
+        let application = context.application();
+        application.entered.add_permits(1);
+        context
+            .cancellation_token()
+            .expect("executions carry a cancellation token")
+            .cancelled()
+            .await;
+        application.entered.add_permits(1);
+        application
+            .release
+            .acquire()
+            .await
+            .expect("release semaphore is open")
+            .forget();
+        Ok(())
+    }
+}
+
+gap_flow!(
+    G11RunningChild {},
+    "gap_g11_running_child",
+    1,
+    |_this, ctx| {
+        let activity = G11HeldActivity;
+        ctx.run(&activity).await
+    }
+);
+
+gap_flow!(
+    G11RunningParent {},
+    "gap_g11_running_parent",
+    1,
+    |_this, ctx| {
+        let child = G11RunningChild {};
+        ctx.child(&child).await
+    }
+);
+
 fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
     Arc::new(
         durable_workflows::register_durable_workflows!(
@@ -341,7 +446,12 @@ fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
             N4Gated,
             N4GatedChild,
             G11Child,
-            G11Parent
+            G11Parent,
+            G11Grandparent,
+            G11KeyedParent,
+            G11RunningChild,
+            G11RunningParent,
+            G11RecoveringParent
         )
         .expect("workflow registry is valid"),
     )
@@ -354,7 +464,8 @@ fn activities() -> Arc<ActivityRegistry<GapContext>> {
             G2FailingActivity,
             G10ActivityA,
             G10ActivityB,
-            G11UnservedActivity
+            G11UnservedActivity,
+            G11HeldActivity
         )
         .expect("activity registry is valid"),
     )
@@ -800,7 +911,6 @@ async fn d4_child_with_key_after_recovery_attaches_to_the_newest_generation() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "confirms G11: cancelling a parent leaves its child waiting_activity with a pending activity"]
 async fn g11_parent_cancellation_cancels_child_workflow() {
     let Some(pool) = support::fresh_pool().await else {
         return;
@@ -849,6 +959,237 @@ async fn g11_parent_cancellation_cancels_child_workflow() {
         ("cancelled", "cancelled"),
         "child workflow and its activity outlive the cancelled parent"
     );
+}
+
+async fn activity_status(pool: &DurablePool, activity_id: i64) -> String {
+    let mut connection = pool.get().await.expect("test connection");
+    durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<String>(&mut connection)
+        .await
+        .expect("activity status")
+}
+
+async fn cancelled_reason(pool: &DurablePool, workflow_id: WorkflowId) -> Option<String> {
+    let mut connection = pool.get().await.expect("test connection");
+    durable_workflow_event::table
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::event_type.eq("workflow_cancelled"))
+        .select(durable_workflow_event::reason)
+        .first::<Option<String>>(&mut connection)
+        .await
+        .expect("workflow_cancelled event")
+}
+
+/// Activates the ready workflow `parent` to its child wait and returns the child.
+async fn activate_to_child(
+    pool: &DurablePool,
+    coordinator: &mut WorkflowCoordinator<GapContext>,
+    parent: WorkflowId,
+) -> WorkflowId {
+    assert_eq!(
+        coordinator.activate_one().await.expect("parent activates"),
+        Some(parent)
+    );
+    let row = load(pool, parent).await;
+    assert_eq!(row.status.as_str(), "waiting_child");
+    id(row.wait_reference_id.expect("child reference"))
+}
+
+#[tokio::test]
+async fn g11_cancel_reaches_grandchildren() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let top = DurableStore::new(pool.clone())
+        .start(&G11Grandparent {}, StartOptions::default())
+        .await
+        .expect("grandparent starts")
+        .workflow_id;
+    let mut coordinator = coordinator(&pool, context, CoordinatorConfig::default());
+    let middle = activate_to_child(&pool, &mut coordinator, top).await;
+    let leaf = activate_to_child(&pool, &mut coordinator, middle).await;
+    assert_eq!(
+        coordinator.activate_one().await.expect("leaf activates"),
+        Some(leaf)
+    );
+    let activity_id = load(&pool, leaf)
+        .await
+        .wait_reference_id
+        .expect("activity reference");
+
+    let mut connection = pool.get().await.expect("test connection");
+    DurableStore::cancel_with_conn(&mut connection, top, "cancel the grandparent")
+        .await
+        .expect("grandparent cancels");
+
+    for workflow_id in [top, middle, leaf] {
+        assert_eq!(load(&pool, workflow_id).await.status.as_str(), "cancelled");
+    }
+    assert_eq!(activity_status(&pool, activity_id).await, "cancelled");
+    assert_eq!(
+        cancelled_reason(&pool, middle).await.as_deref(),
+        Some(format!("parent workflow {top} cancelled: cancel the grandparent").as_str())
+    );
+    assert_eq!(
+        cancelled_reason(&pool, leaf).await.as_deref(),
+        Some(
+            format!(
+                "parent workflow {middle} cancelled: parent workflow {top} cancelled: cancel the grandparent"
+            )
+            .as_str()
+        )
+    );
+}
+
+/// A parent's cancel reaches every generation of its owned children: the
+/// T-X2 successor of a blocked auto-keyed child, to which G2 re-attached the
+/// parent, is cancelled with the cascade reason.
+#[tokio::test]
+async fn g11_cancel_reaches_the_restart_successor_of_an_owned_child() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let (parent_id, child_id) =
+        block_keyed_child(&pool, &context, &mut coordinator, &G11RecoveringParent {}).await;
+    let key = load(&pool, child_id)
+        .await
+        .deduplication_key
+        .expect("owned child has the generated key");
+    assert!(key.starts_with(&format!("child:{parent_id}:")), "{key}");
+
+    let successor = DurableStore::new(pool.clone())
+        .start_or_restart_recoverable(
+            &G2RecoveringChild {
+                fail: false,
+                value: 7,
+            },
+            StartOptions::default().with_deduplication_key(key),
+        )
+        .await
+        .expect("recoverable start");
+    assert!(successor.inserted);
+    assert_eq!(load(&pool, child_id).await.status.as_str(), "cancelled");
+    assert_eq!(
+        load(&pool, parent_id).await.wait_reference_id,
+        Some(successor.workflow_id.get())
+    );
+
+    control(&pool)
+        .cancel_workflow(parent_id, &operator("cancel the parent"))
+        .await
+        .expect("parent cancels");
+
+    assert_eq!(load(&pool, parent_id).await.status.as_str(), "cancelled");
+    assert_eq!(
+        load(&pool, successor.workflow_id).await.status.as_str(),
+        "cancelled"
+    );
+    assert_eq!(
+        cancelled_reason(&pool, successor.workflow_id)
+            .await
+            .as_deref(),
+        Some(format!("parent workflow {parent_id} cancelled: cancel the parent").as_str())
+    );
+}
+
+#[tokio::test]
+async fn g11_domain_keyed_child_survives_parent_cancellation() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let parent = DurableStore::new(pool.clone())
+        .start(&G11KeyedParent {}, StartOptions::default())
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    let mut coordinator = coordinator(&pool, context, CoordinatorConfig::default());
+    let child = activate_to_child(&pool, &mut coordinator, parent).await;
+    assert_eq!(
+        coordinator.activate_one().await.expect("child activates"),
+        Some(child)
+    );
+    let activity_id = load(&pool, child)
+        .await
+        .wait_reference_id
+        .expect("activity reference");
+
+    control(&pool)
+        .cancel_workflow(parent, &operator("cancel the parent"))
+        .await
+        .expect("parent cancels");
+
+    assert_eq!(load(&pool, parent).await.status.as_str(), "cancelled");
+    assert_eq!(load(&pool, child).await.status.as_str(), "waiting_activity");
+    assert_eq!(activity_status(&pool, activity_id).await, "pending");
+}
+
+#[tokio::test]
+async fn g11_cascade_revokes_a_running_child_activity() {
+    let Some(pool) = support::fresh_pool_with_max_size(8).await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let parent = DurableStore::new(pool.clone())
+        .start(&G11RunningParent {}, StartOptions::default())
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let child = activate_to_child(&pool, &mut coordinator, parent).await;
+    assert_eq!(
+        coordinator.activate_one().await.expect("child activates"),
+        Some(child)
+    );
+    let activity_id = load(&pool, child)
+        .await
+        .wait_reference_id
+        .expect("activity reference");
+    let runner = worker(&pool, context.clone());
+    let run = tokio::spawn(async move { runner.run_one("gap_g11").await });
+    let entered = || async {
+        tokio::time::timeout(CONDITION_TIMEOUT, context.entered.acquire())
+            .await
+            .expect("handler signals")
+            .expect("entered semaphore")
+            .forget();
+    };
+    entered().await;
+
+    control(&pool)
+        .cancel_workflow(parent, &operator("cancel the parent"))
+        .await
+        .expect("parent cancels");
+    assert_eq!(load(&pool, child).await.status.as_str(), "cancelled");
+    // The heartbeat learns of the revoke and cancels the handler's token; the
+    // row keeps its lease and open attempt until the handler returns.
+    entered().await;
+    assert_eq!(activity_status(&pool, activity_id).await, "cancelling");
+
+    context.release.add_permits(1);
+    tokio::time::timeout(CONDITION_TIMEOUT, run)
+        .await
+        .expect("worker returns")
+        .expect("worker task joins")
+        .expect("worker settles the revoked attempt");
+    assert_eq!(activity_status(&pool, activity_id).await, "cancelled");
+    let mut connection = pool.get().await.expect("test connection");
+    let (outcome, finished_at) = durable_activity_attempt::table
+        .find((activity_id, 1))
+        .select((
+            durable_activity_attempt::outcome,
+            durable_activity_attempt::finished_at,
+        ))
+        .first::<(Option<String>, Option<i64>)>(&mut connection)
+        .await
+        .expect("attempt row");
+    assert_eq!(outcome.as_deref(), Some("operator_cancelled"));
+    assert!(finished_at.is_some());
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 use crate::tx::Tx;
 use chrono::{DateTime, Utc};
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, QueryDsl, SelectableHelper, TextExpressionMethods};
 use diesel_async::RunQueryDsl;
 
 use crate::{
@@ -78,6 +78,13 @@ impl DurableStore {
 
     /// Cancels application-owned work atomically with the caller's state changes.
     /// Repeated cancellation and cancellation of terminal workflows are no-ops.
+    ///
+    /// The cancel reaches the child workflows this workflow started without a
+    /// key ([`WfCtx::child`](crate::WfCtx::child)), every recovery generation of
+    /// them, and their children in turn; children started
+    /// with [`WfCtx::child_with_key`](crate::WfCtx::child_with_key) keep running.
+    /// A child that finishes at the same moment can deadlock with the cascade;
+    /// retry the transaction when the error [`is_transient`](DurableError::is_transient).
     ///
     /// Runs in the caller's transaction; see the `*_with_conn` contract on
     /// [`DurableStore`].
@@ -724,19 +731,26 @@ pub(crate) async fn lock_newest_generation<'tx>(
     row: Locked<'tx, WorkflowRow>,
 ) -> Result<Locked<'tx, WorkflowRow>, DurableError> {
     let mut current = row;
-    while let Some(successor) = tx::lock_optional(
-        connection,
-        current.scope(),
-        durable_workflow::table
-            .filter(durable_workflow::restarted_from_workflow_id.eq(Some(current.id)))
-            .for_update()
-            .select(WorkflowRow::as_select()),
-    )
-    .await?
-    {
+    while let Some(successor) = lock_successor(connection, current.as_ref()).await? {
         current = successor;
     }
     Ok(current)
+}
+
+/// Locks the successor of `row` (locked by the caller), if it has one.
+async fn lock_successor<'tx>(
+    connection: &mut DurableConnection,
+    row: Locked<'tx, &WorkflowRow>,
+) -> Result<Option<Locked<'tx, WorkflowRow>>, DurableError> {
+    Ok(tx::lock_optional(
+        connection,
+        row.scope(),
+        durable_workflow::table
+            .filter(durable_workflow::restarted_from_workflow_id.eq(Some(row.id)))
+            .for_update()
+            .select(WorkflowRow::as_select()),
+    )
+    .await?)
 }
 
 /// T-X2 supersedes the blocked row `superseded` with `successor`. Parents that
@@ -845,8 +859,106 @@ fn validate_options(options: &StartOptions) -> Result<(), DurableError> {
     Ok(())
 }
 
-/// Cancels `workflow`, which the caller locked in this transaction.
+/// Cancels `workflow`, which the caller locked in this transaction, and the
+/// children it owns (G11, [`cancel_owned_descendants`]).
 pub(crate) async fn cancel_locked_workflow<'tx>(
+    connection: &mut DurableConnection,
+    workflow: Locked<'tx, &WorkflowRow>,
+    reason: &str,
+    operator_id: Option<&str>,
+    now: i64,
+) -> Result<(), DurableError> {
+    cancel_one_workflow(connection, workflow, reason, operator_id, now).await?;
+    cancel_owned_descendants(connection, workflow, reason, operator_id, now).await
+}
+
+/// G11: a parent's cancel reaches every generation of its owned children.
+/// `parent` was cancelled or superseded in this transaction. A child is owned
+/// when it carries the key the engine generated for it,
+/// `child:{parent}:{parent_command_sequence}` (`commit_child`, no
+/// `child_with_key`); its generations are the rows on its
+/// `restarted_from_workflow_id` chain (T-X2 and T-A5 successors, which carry
+/// no key and no parent). A child started with a domain key may be shared
+/// with other parents and keeps running.
+///
+/// For each owned child (siblings in id order) the cascade locks the child
+/// with `lock_workflow_by_id`, then each successor on its chain, oldest first,
+/// and cancels every non-terminal generation like T-X3 with the reason
+/// `parent workflow {p} cancelled: {reason}`; each cancelled generation's own
+/// owned children follow. The cascade locks parent before descendant, the
+/// reverse of the child-terminal order (INVARIANTS §2.8): a child that commits
+/// a terminal transition at the same moment can deadlock with it. The
+/// database aborts one of the two transactions with an error for which
+/// [`DurableError::is_transient`] holds; the aborted side retries. The work
+/// list keeps the recursion out of the async call graph.
+pub(crate) async fn cancel_owned_descendants<'tx>(
+    connection: &mut DurableConnection,
+    parent: Locked<'tx, &WorkflowRow>,
+    reason: &str,
+    operator_id: Option<&str>,
+    now: i64,
+) -> Result<(), DurableError> {
+    let scope = parent.scope();
+    let mut parents = vec![(parent.id, reason.to_string())];
+    while let Some((parent_id, parent_reason)) = parents.pop() {
+        let reason = crate::error::truncate_utf8(
+            format!("parent workflow {parent_id} cancelled: {parent_reason}"),
+            crate::MAX_ERROR_REASON_BYTES,
+        );
+        for child_id in owned_children(connection, parent_id).await? {
+            let mut generation =
+                persistence::lock_workflow_by_id(connection, scope, WorkflowId::new(child_id)?)
+                    .await?;
+            loop {
+                if !generation.status.is_terminal() {
+                    cancel_one_workflow(connection, generation.as_ref(), &reason, operator_id, now)
+                        .await?;
+                    parents.push((generation.id, reason.clone()));
+                }
+                match lock_successor(connection, generation.as_ref()).await? {
+                    Some(successor) => generation = successor,
+                    None => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The children `parent_id` owns (see [`cancel_owned_descendants`]), in id
+/// order, terminal ones included: a terminal child's successor may be live. A
+/// locking read, so it sees children committed after the caller's snapshot;
+/// the `LIKE` keeps it from locking domain-keyed children.
+async fn owned_children(
+    connection: &mut DurableConnection,
+    parent_id: i64,
+) -> Result<Vec<i64>, DurableError> {
+    let children = durable_workflow::table
+        .filter(durable_workflow::parent_workflow_id.eq(Some(parent_id)))
+        .filter(durable_workflow::deduplication_key.like(format!("child:{parent_id}:%")))
+        .order(durable_workflow::id.asc())
+        .for_update()
+        .select((
+            durable_workflow::id,
+            durable_workflow::deduplication_key,
+            durable_workflow::parent_command_sequence,
+        ))
+        .load::<(i64, Option<String>, Option<i32>)>(connection)
+        .await?;
+    Ok(children
+        .into_iter()
+        .filter(|(_, key, command)| {
+            command.is_some_and(|command| {
+                key.as_deref() == Some(format!("child:{parent_id}:{command}").as_str())
+            })
+        })
+        .map(|(id, _, _)| id)
+        .collect())
+}
+
+/// Cancels `workflow` alone: its activities and approvals, the fenced status
+/// update, history, and the wake of its waiting parents.
+async fn cancel_one_workflow<'tx>(
     connection: &mut DurableConnection,
     workflow: Locked<'tx, &WorkflowRow>,
     reason: &str,

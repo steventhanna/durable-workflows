@@ -14,7 +14,7 @@ notifications, document delivery and scheduled jobs.
 > **Status:** pre-1.0. MySQL (8.0.16+ and 8.4) and PostgreSQL (14+) are both
 > supported, and CI runs the full suite on MySQL 8.0 and 8.4 and on Postgres
 > 14 and 17. The storage schema may still change before 1.0. See
-> [Known issues](#known-issues) for the confirmed protocol gaps.
+> [Known issues](#known-issues).
 
 To learn how the engine works, start with
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -227,13 +227,11 @@ self-test, since each must show its invariant violation.
 
 ## Known issues
 
-These gaps are confirmed by ignored tests in
-[`tests/gaps.rs`](durable-workflows/tests/gaps.rs). Details and interleavings
-are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
-[`spec/README.md`](spec/README.md).
-
-- **G11** — Cancelling a parent workflow does not cancel its children; they
-  keep running.
+No confirmed protocol gap is open. The behaviors that are documented as
+intended, such as a child started with a domain key outliving its cancelled
+parent, are listed in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps);
+[`tests/gaps.rs`](durable-workflows/tests/gaps.rs) keeps the reproduction
+test of each fixed gap as a regression test.
 
 ## Contributing
 

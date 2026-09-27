@@ -158,6 +158,9 @@ where
         .await
     }
 
+    /// Cancels the workflow and, as [`DurableStore::cancel_with_conn`] does,
+    /// the child workflows it owns. Returns `Conflict` for a terminal workflow;
+    /// retry when the error [`is_transient`](DurableError::is_transient).
     pub async fn cancel_workflow(
         &self,
         workflow_id: WorkflowId,
@@ -314,6 +317,14 @@ where
                         "child_superseded".to_string(),
                         operator.reason().to_string(),
                     )),
+                    now,
+                )
+                .await?;
+                crate::store::cancel_owned_descendants(
+                    connection,
+                    source.as_ref(),
+                    operator.reason(),
+                    Some(operator.actor_id()),
                     now,
                 )
                 .await?;

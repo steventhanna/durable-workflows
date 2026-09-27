@@ -36,7 +36,6 @@ run durable_mc_rr inv_S17_capAlways violate       # G7
 run durable_mc_act_rr inv_S17_capAlways violate   # G7
 run durable_mc_act_rr inv_S17_capAtClaim violate  # G7
 # suspected gaps (expected to be violated)
-run durable_mc inv_G11_cancelReachesChildren violate
 run durable_mc_drift inv_S13_oneHandler violate   # S13 clock assumption
 run durable_mc_env wit_quarantined violate        # G10 fixed: an invalid row is quarantined (non-vacuity)
 # witnesses (non-vacuity; expected to be violated)

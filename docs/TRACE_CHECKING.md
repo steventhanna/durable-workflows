@@ -59,7 +59,7 @@ The steps by hand:
 ```sh
 F=durable-workflows/mysql,durable-workflows/fake-clock,durable-workflows/trace-model
 cargo test -p durable-workflows --no-default-features --features $F --test trace_model
-cargo test -p durable-workflows --no-default-features --features $F --test gaps -- --ignored g11_ n2_
+cargo test -p durable-workflows --no-default-features --features $F --test gaps   # plus `-- --ignored <prefix>` per spec/traces/gaps.yaml key (none open today)
 cargo run -p durable-trace --no-default-features --features $F -- \
     dump --server "$DURABLE_WORKFLOWS_TEST_DATABASE_URL" --out target/traces-mysql
 cargo run -p durable-trace --no-default-features --features $F -- \

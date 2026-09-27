@@ -81,7 +81,9 @@
  *   G2  fixed: T-X2 re-points the superseded row's waiting parents to its successor (S24 in `safety`)
  *   G7  inv_S17_capAlways (RR_SNAPSHOT only)
  *   G10 fixed: TW1_QuarantineRow (an invalid row no longer aborts every topic's claims)
- *   G11 inv_G11_cancelReachesChildren
+ *   G11 fixed: T-X3/T-A4 cancel every generation of the owned auto-keyed children, recursively
+ *       (cancelTargets; inv_G11_cancelReachesChildren, inv_G11_cancelReachesGenerations in `safety`).
+ *       Domain-keyed children keep running (intended). T-A5 is unmodeled.
  *   N1  fixed: T-X2's newest generation is the end of the keyed row's restartedFrom chain (tx2Latest)
  *   D4  TC2_RunChild attaches to the newest generation of the keyed row (newestGen)
  *   G8  fixed: TC2_RunChild never attaches to the caller or an ancestor (inv_G8_noAncestorWait, in `safety`)
@@ -417,17 +419,43 @@ module durable {
     }
   }
 
-  // store.rs cancel_locked_workflow (T-X3 and T-A4): cancel_activities, fenced workflow ->
-  // cancelled (wait and lease cleared), wake waiting parents with child_cancelled
+  // G11: store.rs cancel_owned_descendants. r is owned by p when its key is the one
+  // commit_child generated for it, child:{p}:{cmd} (autoKey(p, cmd), cmd < 10); a
+  // domain-keyed child (child_with_key) is not owned.
+  pure def ownedBy(r: WfRow, p: int): bool =
+    p != 0 and r.parent == p and r.dedup >= autoKey(p, 0) and r.dedup < autoKey(p + 1, 0)
+  // g and the rows it was restarted from (its restartedFrom chain back to the first
+  // generation); MAX_WF rounds reach the start of any chain
+  pure def restartOrigins(d: Db, g: int): Set[int] =
+    WF_IDS.fold(Set(g), (acc, i) => acc.union(acc.map(x => d.wf.get(x).restartedFrom).filter(x => x != 0)))
+  // g is a generation of a child that p owns (the child itself or a T-X2/T-A5 successor)
+  pure def ownedGenOf(d: Db, g: int, p: int): bool =
+    d.wf.get(g).status != "none" and restartOrigins(d, g).exists(c => ownedBy(d.wf.get(c), p))
+  // w and, recursively, every live generation of a child owned by a target. The chain walk
+  // passes terminal generations; the recursion into a generation's own children needs it to
+  // be cancelled here (a target). MAX_WF rounds reach every depth.
+  pure def cancelTargets(d: Db, w: int): Set[int] =
+    WF_IDS.fold(Set(w), (acc, i) =>
+      acc.union(WF_IDS.filter(g => isLive(d.wf.get(g).status) and acc.exists(p => ownedGenOf(d, g, p)))))
+
+  // store.rs cancel_locked_workflow (T-X3 and T-A4): for w and each target of the cascade:
+  // cancel_activities, fenced workflow -> cancelled (wait and lease cleared); wake the
+  // parents waiting on w with child_cancelled. The parents waiting on a descendant are
+  // its owner, cancelled in the same step, so their wake is empty. The cascade waits for
+  // every lock a T-W1 holds on a target or its activities.
   def cancelOk(w: int): bool = all {
     WF_IDS.contains(w),
     isLive(db.wf.get(w).status),
-    not(wfLocked(proc, w)),
-    not(ACT_IDS.exists(a => db.act.get(a).wf == w and actLocked(proc, a))),
+    cancelTargets(db, w).forall(x => all {
+      not(wfLocked(proc, x)),
+      not(ACT_IDS.exists(a => db.act.get(a).wf == x and actLocked(proc, a))),
+    }),
   }
-  pure def cancelWrite(d: Db, w: int): Db =
+  pure def cancelOne(d: Db, w: int): Db =
     setWf(cancelActivities(d, w), w,
           d.wf.get(w).with("status", "cancelled").with("waitKind", "").with("waitRef", 0).with("token", 0).with("leaseExp", 0))
+  pure def cancelWrite(d: Db, w: int): Db =
+    cancelTargets(d, w).fold(d, (acc, x) => cancelOne(acc, x))
 
   // T-X3: cancel_with_conn; on a terminal row it is a no-op (not a step)
   action TX3_Cancel(w: int, tnow: int): bool = all {
@@ -1104,8 +1132,8 @@ module durable {
     }
   }
 
-  // T-A4 cancel_workflow: terminal -> Conflict; else cancel_locked_workflow as T-X3. Children
-  // are not cancelled (G11).
+  // T-A4 cancel_workflow: terminal -> Conflict; else cancel_locked_workflow as T-X3, which
+  // cancels the owned subtree (G11 fixed).
   action AdminCancel(w: int, tnow: int): bool = all {
     cancelOk(w),
     wakeParentsOk(cancelWrite(db, w), w),
@@ -1446,9 +1474,16 @@ module durable {
     }
   })
 
-  // G11 (spec gap): cancelling a parent reaches its children
+  // G11 (fixed): a cancelled workflow owns no live child. Domain-keyed children are not owned
+  // and may outlive it (intended).
   val inv_G11_cancelReachesChildren = WF_IDS.forall(p => db.wf.get(p).status == "cancelled" implies
-    WF_IDS.forall(c => (db.wf.get(c).parent == p and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
+    WF_IDS.forall(c => (ownedBy(db.wf.get(c), p) and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
+  // G11 (fixed), generations: a cancel step (T-X3, T-A4) leaves no live generation of a child
+  // owned by any row it cancelled. An action property: a later T-X2 or T-A5 may restart a
+  // terminal child of a cancelled parent on purpose.
+  val inv_G11_cancelReachesGenerations = Set("TX3_Cancel", "AdminCancel").contains(lastAction) implies
+    WF_IDS.forall(p => (db.wf.get(p).status == "cancelled" and prevWf.get(p) != "cancelled") implies
+      WF_IDS.forall(g => ownedGenOf(db, g, p) implies isTerminal(db.wf.get(g).status)))
 
   // G8 (fixed): no workflow waits on itself or an ancestor. Cycles through non-ancestors
   // (two keyed rows that name each other) are not guarded.
@@ -1464,14 +1499,14 @@ module durable {
   val inv_G1_noSelfCancelFromOperator = RUNTIMES.forall(r => ghost.coordErrors.get(r) == 0)
 
   // conjunction of the invariants expected to hold. Checked separately: S17 (G7 under the
-  // historical RR snapshot), G11.
+  // historical RR snapshot).
   val safety = and {
     inv_S1_wfLease, inv_S2_noStaleWfCommit, inv_S5_delivery, inv_S5_noEventError, inv_S6_wfTerminalAbsorbing,
     inv_S7_waitCoupling, inv_S8_activationBounded, inv_S9_actLease, inv_S10_noStaleActCommit,
     inv_S11_openAttempt, inv_S12_attemptsBounded, inv_S13_oneHandler, inv_S13_topicConcurrency, inv_S14_actTerminal,
     inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor, inv_S19_sourceTerminal,
     inv_S23_childOnce, inv_S24_parentWakes, inv_S25_cancelAtomic, inv_G1_noSelfCancelFromOperator,
-    inv_G8_noAncestorWait,
+    inv_G8_noAncestorWait, inv_G11_cancelReachesChildren, inv_G11_cancelReachesGenerations,
   }
   // safety plus S17 (expected to hold under READ COMMITTED)
   val safetyRc = safety and inv_S17_capAtClaim and inv_S17_capAlways

@@ -248,6 +248,24 @@ Changes in v5 (from v4):
   `executing(e)` includes phase `revoking`; `inv_S13_topicConcurrency` is
   part of `safety`. `wit_pausedActivity` no longer reads the workflow of an
   unused activity row (a QNT507 runtime error).
+- G11 fixed: `TX3_Cancel(w, tnow)` and `AdminCancel(w, tnow)` keep their
+  parameters; their write `cancelWrite` now cancels every row of
+  `cancelTargets(db, w)`: `w` and, recursively, each live generation of a
+  row owned by a target (`ownedBy`: `parent == p` and `dedup` =
+  `autoKey(p, cmd)` for some `cmd < 10`; a generation is the owned row or a
+  successor on its `restartedFrom` chain, `ownedGenOf`/`restartOrigins`;
+  `store.rs` `cancel_owned_descendants`), each with `cancelActivities`. The
+  chain walk passes terminal generations; recursion into a generation's own
+  children happens only for generations the cascade cancels. `cancelOk` requires no T-W1 lock on any target or its
+  activities. Domain-keyed children are not owned. The recorder already
+  touches every cascaded workflow, activity and attempt row in the same
+  record (`cancel_locked_workflow` calls `touch_wf`/`touch_act` per row), so
+  `durable-trace gen` is unchanged. `inv_G11_cancelReachesChildren` is
+  restricted to owned children and is part of `safety`, with the new action
+  property `inv_G11_cancelReachesGenerations` (a cancel step leaves no live
+  generation of an owned child of any row it cancelled; a later T-X2 or T-A5
+  may restart one on purpose, so it is not a state invariant). The T-A5 cascade is
+  not modeled (T-A5 stays `Unmodeled`).
 - D4: `TC2_RunChild`'s `existing` is the newest generation of the row with
   `(kind, key)` (`store.rs` `insert_child` locks the keyed row and walks its
   chain), so a parent that starts a keyed child after a recovery waits on the
@@ -391,7 +409,7 @@ Rules:
   count it saw was right is judged by `inv_S17_capAtClaim`
   (`tw1ReplayDetectsCapTest`).
 - **Stable invariant names:** `safety`, `safetyRc`, `inv_S17_capAtClaim`,
-  `inv_S17_capAlways`, `inv_S24_parentWakes`, `inv_G11_cancelReachesChildren`,
+  `inv_S17_capAlways`, `inv_S24_parentWakes`, `inv_G11_cancelReachesChildren`, `inv_G11_cancelReachesGenerations` (both in `safety`),
   `inv_S13_topicConcurrency`,
   `inv_S19_sourceTerminal`, `inv_G1_noSelfCancelFromOperator`.
 
@@ -457,7 +475,7 @@ All 56 pass (`durable_tests` 49, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `g2ReattachTest` | RC | G2 (fixed): T-X2 cancels the blocked keyed child and re-points its waiting parent to the successor (S24 holds); the successor's completion wakes the parent. |
 | `d4AttachNewestTest`, `d4AttachKeyedRowRejectedTest` | RC | D4: a later `RunChild` on the key attaches to the newest generation; attaching to the cancelled keyed row is not a step. |
 | `n1WrongLineageTest`, `n1SiblingNotSupersededTest` | RC | N1 (fixed): T-X2 on a child key whose keyed row succeeded returns that row and leaves the blocked auto-keyed sibling alone; superseding the sibling is not a step. |
-| `g11CancelTest` | RC | G11: a cancelled parent leaves its child `ready`. |
+| `g11CancelTest`, `g11GrandchildTest`, `g11SuccessorTest`, `g11DomainKeyedChildTest` | RC | G11 (fixed): T-X3 on a parent cancels its owned child, a grandchild with its pending activity, and the T-X2 successor of a blocked owned child (the parent re-attached to it); a domain-keyed child stays `ready`. |
 | `staleCoordinatorTest` | RC | S2/S3: the stale coordinator loses the fence. |
 | `activitySuccessTest` | RC | Happy path with the replay form of T-W1. |
 | `startSemanticsTest` | RC | T-X1: dedup hit returns the row; restart-key collision → `Conflict`, no row. |
@@ -475,7 +493,7 @@ All 56 pass (`durable_tests` 49, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `n2PauseResumeWaitsForSettleTest`, `pausedActivityNotClaimedTest`, `pausedSettledActivityNotClaimedTest` | RC | Pause then resume while the handler runs: attempt k+1 is not claimed until attempt k settles. A paused workflow's activity is not claimable, `cancelling` or settled. |
 | `n2ReconcileReplaySettlesTest`, `n2ReconcileReplayNotRevokedRejectedTest` | RC | Replay: a recorded reconcile of an expired paused `cancelling` row with `revoked: true` settles it to `pending` at `tnow`; the same entry with `revoked: false` is not a step. |
 | `pausedParentWokenTest`, `pausedParentResumesWaitingTest` | RC | A paused parent gets its child's outcome and stays paused (wait cleared), then resumes to `ready`; resumed before the child ends → `waiting_child`. |
-| `g11AdminCancelTest`, `adminCancelPausedTest` | RC | G11 through the operator cancel; admin cancel of a paused workflow cancels its pending activity. |
+| `g11AdminCancelTest`, `adminCancelPausedTest` | RC | G11 (fixed) through the operator cancel: the owned child is cancelled; admin cancel of a paused workflow cancels its pending activity. |
 | `continuationPriorityTest`, `continuationPriorityNowRejectedTest`, `noPriorityEarlyRejectedTest` | RC | A continuation-priority activity is inserted at `CONTINUATION_READY_AT` (0 < `tnow`) and claimed; `prio` with `availableAt = now`, or no `prio` with `availableAt < tnow`, is not a step. |
 | `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`, `n1ReturnOwnRowTest` | RC | N1, second variant (fixed): T-X2 on the child key returns the keyed row, not a newer live sibling (returning the sibling is not a step); `TX2_ReturnLatest` of a top-level keyed row. |
 | `g10InvalidRowNotClaimedTest`, `g10WrongReasonTest`, `g10ReplayTest` | RC, `ENABLE_ENV_EDITS` | The invalid row cannot be claimed; a replayed quarantine with the `attempt_cap` reason does not match it; the replay form quarantines a1 and claims a2 in one `TW1_Claim`. |
@@ -496,7 +514,6 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 | `durable_mc_rr`, `durable_mc_act_rr` | `inv_S17_capAlways`, `inv_S17_capAtClaim` (G7, historical) | violate | not found at this budget; found by `g7CapExceededTest` |
 | `durable_mc_env` | `safety` (external writes and invalid-bounds commands on) | hold | no violation |
 | `durable_mc_env` | `wit_quarantined` (G10 fixed; non-vacuity) | violate | see `results/summary.txt` |
-| `durable_mc` | `inv_G11_cancelReachesChildren` | violate | violated (11 states) |
 | `durable_mc_drift` | `inv_S13_oneHandler` | violate | not found at 40 or 80 steps; found by `driftTwoHandlersTest` |
 | `durable_mc` | witnesses S3, blocked, child succeeded, activity succeeded, coordinator fence miss, reconcile row, commit inside an open T-W1 | violate | all violated (reachable) |
 | `durable_mc` | `wit_revivedLease` | violate | not found at 40 or 80 steps; reached in `g7ClosedUnderRcTest` |
@@ -540,7 +557,7 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 | G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 3 (the depth-4 run stopped with no violation); `g7CapExceededTest` (RR) |
 | G8 (child key resolving to the caller or an ancestor) | **Fixed**: `TC2_RunChild` never attaches to the caller or an ancestor; `inv_G8_noAncestorWait` is part of `safety`. Non-ancestor wait cycles stay unguarded (intended) | `g8SelfKeyRejectedTest`, `g8SelfKeyActivationFailureTest`, `g8GrandparentKeyRejectedTest`; the G8 gap tests' traces pass |
 | G10 (one invalid row aborts every topic's claims) | **Fixed** (interface v5): a claimable row past its attempt cap or with invalid bounds is quarantined (`TW1_QuarantineRow`; `quarantined` in `TW1_Claim`): dead-lettered, its workflow blocked, and the T-W1 goes on. `TW1_Error` and `inv_G10_noClaimAbort` are gone | `g10InvalidBoundsTest`, `g10ReplayTest`, `g10WrongReasonTest`; `durable_mc_env` `safety` and `wit_quarantined`; the G10 gap tests' traces pass |
-| G11 (cancel does not reach children) | Reproduces through T-X3 and the operator cancel (T-A4) | `g11CancelTest`, `g11AdminCancelTest`, simulation, the recorded G11 gap test |
+| G11 (cancel does not reach children) | **Fixed**: T-X3 and T-A4 cancel every generation of the owned children, recursively (`cancelTargets`); `inv_G11_cancelReachesChildren` (owned children) and `inv_G11_cancelReachesGenerations` are part of `safety`. Domain-keyed children keep running (intended) | `g11CancelTest`, `g11GrandchildTest`, `g11SuccessorTest`, `g11DomainKeyedChildTest`, `g11AdminCancelTest`, simulation; the G11 gap tests' traces pass |
 | N1 (T-X2 lineage on a child key) | **Fixed**: `tx2Latest` is the end of the keyed row's restart chain, so neither variant is a step; `inv_N1_tx2OwnLineage` is gone | `n1WrongLineageTest`, `n1SiblingNotSupersededTest`, `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`; both N1 gap tests' traces pass |
 | D4 (keyed child after a recovery) | `TC2_RunChild` attaches to the newest generation of the keyed row | `d4AttachNewestTest`, `d4AttachKeyedRowRejectedTest` |
 | N2 (revoke frees the slot, cap exceeded in execution) | **Fixed**: cancel and pause revoke a running activity to `cancelling`, which keeps its lease, open attempt and topic slot until `TW3_Revoked` or reconcile settles it; `inv_S13_topicConcurrency` is part of `safety` | `n2CancelKeepsSlotTest`, `n2PauseKeepsSlotTest`, `n2RevokeThenSettleTest`, `n2ReconcileSettlesCancellingTest`, simulation; both N2 gap tests' traces pass |
@@ -580,7 +597,7 @@ is terminal) did not. The field and `root_workflow_id` are now crate-private
 
 ## Counterexamples (unchanged from the first iteration)
 
-G11 and the drift case follow the same steps as before (see the
+The drift case follows the same steps as before (see the
 directed tests); only the T-W1 steps are now statement groups. G7 now needs
 `RR_SNAPSHOT = true`.
 

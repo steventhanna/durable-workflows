@@ -501,7 +501,8 @@ async fn stale_coordinator_fence_miss() {
     assert_eq!(status(&pool, id).await, "succeeded");
 }
 
-/// G11: cancelling a parent leaves its child live (`inv_G11_cancelReachesChildren`).
+/// G11: cancelling a parent cancels the child it owns in the same transaction,
+/// and the child's pending activity with it (`inv_G11_cancelReachesChildren`).
 #[tokio::test]
 async fn cancel_parent_with_running_child() {
     let Some(pool) = support::fresh_pool().await else {
@@ -523,12 +524,27 @@ async fn cancel_parent_with_running_child() {
         .expect("child runs its activity")
         .expect("child claimed");
     let mut connection = pool.get().await.expect("connection");
+    let activity_id = durable_workflow::table
+        .find(child.get())
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(&mut connection)
+        .await
+        .expect("child row")
+        .wait_reference_id
+        .expect("child waits on its activity");
     DurableStore::cancel_with_conn(&mut connection, parent, "trace cancel")
         .await
         .expect("parent cancels");
-    drop(connection);
     assert_eq!(status(&pool, parent).await, "cancelled");
-    assert_eq!(status(&pool, child).await, "waiting_activity");
+    assert_eq!(status(&pool, child).await, "cancelled");
+    // Never claimed, so the N2 path cancels it at once (no `cancelling`).
+    let activity_status = durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<String>(&mut connection)
+        .await
+        .expect("activity row");
+    assert_eq!(activity_status, "cancelled");
 }
 
 #[tokio::test]

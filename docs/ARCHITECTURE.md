@@ -273,9 +273,14 @@ transaction wakes every parent that waits on it with `child_succeeded` or
 `child_failed` (L11). Both paths lock the child before the parent (G9, fixed;
 [INVARIANTS §2.8](INVARIANTS.md#28-lock-order-summary)). A parent that
 attaches to a child that is already terminal wakes itself in its own commit
-(S24). **There is no cancel cascade:** cancelling or superseding a parent does
-not cancel its children, and the parent drops their later outcomes (G11,
-[INVARIANTS §6](INVARIANTS.md#6-suspected-gaps)).
+(S24). **Cancel cascades to owned children:** cancelling a parent (T-X3, T-A4)
+or superseding a non-terminal one (T-A5) cancels, in the same transaction,
+every live generation of the children it owns (the child and the T-X2/T-A5
+successors on its restart chain), and theirs (`cancel_owned_descendants`, G11
+fixed). A child is owned when its key is the generated
+`child:{parent}:{command}`; a child started with a domain key may be shared
+with other parents and keeps running (intended). The cascade locks parent before child, the reverse of the
+child-terminal order; see §7.
 
 **Schedules.** Each schedule key has one runtime task. At spawn and on each
 tick, T-S1 inserts or upgrades the `durable_schedule_state` row; a new version
@@ -320,8 +325,12 @@ each is fenced on `status = pending`, so exactly one of them wins (S20).
 - **Lock order.** Claims: topic rows, then workflow, then activity, then the
   attempt insert. Finish, reconcile, pause, cancel and retry: workflow, then
   activity, then attempt. A child's terminal commit and a parent that attaches
-  to an existing child both lock child, then parent. Schedules: state, then
-  run rows, then new workflows. Details in
+  to an existing child both lock child, then parent. The cancel cascade (G11)
+  is the one exception: it locks parent, then each owned child (siblings in id
+  order) and the later generations on its restart chain, so it can deadlock with a child's terminal commit. The database
+  aborts one of the two; a coordinator treats that as benign (G1), and a
+  cancel caller gets an error for which `DurableError::is_transient` holds
+  and retries. Schedules: state, then run rows, then new workflows. Details in
   [INVARIANTS §2.8](INVARIANTS.md#28-lock-order-summary).
 - **Lock witnesses.** Every library transaction callback receives a
   `tx::Tx { connection, scope }`. The `scope` token brands the transaction.

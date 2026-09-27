@@ -536,7 +536,18 @@ old cursor, version, and fingerprint (`193-214`).
   `application_cancelled` (T-X3) or `operator_cancelled` (T-A4); a
   `cancelling` row keeps its lease and open attempt, which only T-W3 or
   reconcile close (`settle_revoked`, N2); cancel pending approvals, fenced workflow → `cancelled` (wait and lease
-  cleared), history, wake waiting parents with `child_cancelled`.
+  cleared), history, wake waiting parents with `child_cancelled`. Then
+  `cancel_owned_descendants` (G11): a locking read of the parent's
+  children whose key is `child:{parent}:{parentCommandSequence}` (the key
+  `commit_child` generates when the flow gives none), terminal ones
+  included, in id order; each is locked with `lock_workflow_by_id`, then each
+  successor on its `restartedFromWorkflowId` chain (T-X2 and T-A5
+  generations), oldest first. Every non-terminal generation is cancelled the
+  same way (its activities, approvals, status, history `workflow_cancelled`
+  with reason `parent workflow {p} cancelled: {reason}`, its waiting
+  parents), then its own owned children, to any depth (a work list, not
+  async recursion). Domain-keyed children are not touched. Descendants are
+  locked after their parent (§2.8).
 
 ### 2.7 Admin control (`src/admin/control.rs`)
 
@@ -555,12 +566,15 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
 - **T-A3 resume** (`103-146`): status derived from the wait
   (`940-1020`); `availableAt=now` only when resuming to `ready`.
 - **T-A4 cancel** (`148-180`): terminal → Conflict; else
-  `cancel_locked_workflow`.
+  `cancel_locked_workflow`, which cascades to the owned children as in T-X3
+  (actor `operator`, attempt outcome `operator_cancelled`).
 - **T-A5 restart / correct-and-restart** (`200-344`): source must be
   terminal, paused, or blocked and have no successor; insert successor (same
   schedule run, same root); a non-terminal source is cancelled with its
-  activities and approvals (wait fields kept) and its waiting parents get
-  `child_superseded`; transfer the schedule run's `workflowId`.
+  activities and approvals (wait fields kept), its waiting parents get
+  `child_superseded`, and `cancel_owned_descendants` cancels the children it
+  owns (G11); transfer the schedule run's `workflowId`. The successor starts
+  its own children under new keys.
 - **T-A6 retry / correct-and-retry activity** (`368-510`): workflow must be
   `blocked` on this `dead_lettered` activity; insert replacement
   (`replacementNumber+1`, same `commandSequence`, same operation key unless
@@ -588,6 +602,23 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
   `waitReferenceId`, so the scan can lock many rows; UNCLEAR how many).
 - `RunChild` commit attaching to an existing child: child → parent, the same
   order as the previous line (G9, fixed; it was parent → child).
+- Cancel cascade (T-X3, T-A4, T-A5; G11): parent → each owned child (siblings
+  in id order) → each later generation on its restart chain, oldest first
+  (the order T-X2 uses) → each cancelled generation's activities and
+  approvals → its owned children. This is
+  the reverse of the two lines above, on purpose: the callers lock the target
+  first to decide whether it is terminal, and the owned subtree is found
+  from the parent. A child that commits a terminal transition (or is
+  cancelled on its own) while its parent's cancel runs can deadlock with it.
+  The database aborts one of the two transactions; either outcome is correct
+  (the child ends terminal). An aborted coordinator commit is benign (G1): the
+  row waits for lease recovery, whose commit then misses the fence. An
+  aborted cancel returns `DurableError::Database`, for which
+  `DurableError::is_transient()` holds; the caller retries the transaction.
+  Locking the subtree leaf-first before the parent was considered and not
+  done: it needs an unlocked read of the tree before the parent lock, so a
+  child committed in that window is still locked parent-first, and it moves
+  the first lock of T-X3, T-A4 and T-A5.
 - Progress: activity only. Schedules: state → run rows → new workflow rows.
 
 **Type enforcement.** N4 and G9 are enforced by the compiler
@@ -599,7 +630,7 @@ command row cannot be inserted before its workflow is locked (N4).
 `commit_child`'s fenced parent update needs the `ChildStart` from
 `insert_child`, whose `Existing` arm is the locked child, so the parent
 cannot be locked before an existing child (G9). The helpers that need an
-earlier lock (`cancel_locked_workflow`, `wake_waiting_parents_on_child_terminal`,
+earlier lock (`cancel_locked_workflow`, `cancel_owned_descendants`, `wake_waiting_parents_on_child_terminal`,
 `hand_waiting_parents_to_successor`, `settle_revoked`, `quarantine_candidate`,
 `block_workflow`, `MaterializedFloor::load`, `active_workflow_count`) take a
 witness too. The types do not prove which row was locked (a witness for
@@ -823,13 +854,24 @@ model `inv_S24_parentWakes` in `safety`; tests
 `admin_controls.rs`
 `recoverable_start_at_a_new_version_fails_the_waiting_parent_as_superseded`).
 
-**S25. Cancellation is atomic for the workflow's own work.** One transaction
-cancels the workflow and its pending activities, moves its running ones to
-`cancelling` (their attempts close when the revoked handler stops or the
-lease expires, and the row then becomes `cancelled`), cancels its pending
-approvals, and wakes waiting parents (`src/store.rs` `cancel_locked_workflow`).
+**S25. Cancellation is atomic for the workflow's own work and for the
+children it owns.** One transaction cancels the workflow and its pending
+activities, moves its running ones to `cancelling` (their attempts close when
+the revoked handler stops or the lease expires, and the row then becomes
+`cancelled`), cancels its pending approvals, and wakes waiting parents
+(`src/store.rs` `cancel_locked_workflow`). The same transaction does the same
+for every live generation of every child the workflow owns (key
+`child:{parent}:{command}`, and the T-X2/T-A5 successors on its restart
+chain), and for theirs (G11 fixed: a parent's cancel reaches every
+generation of its owned children); a T-A5 supersession of a non-terminal
+source does it for the source's owned children. A child started with a domain key is not
+owned and keeps running (intended: the key may be shared by other parents).
 `cancel_with_conn` is idempotent on terminal workflows; admin cancel returns
-Conflict. **ENFORCED**.
+Conflict. **ENFORCED** (model `inv_S25_cancelAtomic` and
+`inv_G11_cancelReachesChildren` and `inv_G11_cancelReachesGenerations` in
+`safety`; tests `g11_*` in
+`tests/gaps.rs`, `admin_controls.rs`
+`restart_supersession_cancels_the_owned_child`).
 
 ### Schedules
 
@@ -937,11 +979,15 @@ and the row returns to `pending` when the handler stops or the lease expires
 
 ### Rejected candidates
 
-- **"Cancellation eventually stops all descendants."** Rejected.
-  `cancel_locked_workflow` cancels only the workflow's own activities and
-  approvals (`src/store.rs:516-517`). Child workflows keep running;
-  `parentWorkflowId` is never read. A later child outcome is dropped because
-  the parent no longer waits (S23). The same holds for restart supersession.
+- **"Cancellation eventually stops all descendants."** Accepted for owned
+  descendants since G11 (S25): cancel and restart supersession cancel every
+  generation of the owned children, recursively, in their transaction, and
+  L12 bounds how long a revoked handler runs on. Rejected for the rest, on
+  purpose: a child started with a domain key (`child_with_key`) may be
+  shared by other parents and keeps running; its later outcome is dropped
+  because the cancelled parent no longer waits (S23). A generation that an
+  operator (T-A5) or the application (T-X2) creates after the cancel is a
+  new decision and is not cancelled.
 - **"Child results are delivered exactly once."** Holds as S23 + S24 only
   (per wait; a re-attached parent receives the successor's outcome).
 - **"Operation keys are idempotent."** The engine does not enforce this (S34).
@@ -1011,7 +1057,9 @@ workflow becomes terminal (blocked or paused ones block it indefinitely).
 terminal** (same transaction; after a T-X2 re-attach, when the successor
 becomes terminal). Not guaranteed if the child
 never terminates, for example in a wait cycle through keyed rows that are not
-ancestors of each other (G8). **ENFORCED**.
+ancestors of each other (G8). A child cancelled by the cascade (G11) wakes no
+one in its owner: the owner is already cancelled in the same transaction and
+no longer waits. **ENFORCED**.
 
 **L12. Cancellation, pause, or restart stops an in-flight activity handler
 within `heartbeat interval + min(shutdown_grace, remaining lease)`**: the
@@ -1141,8 +1189,8 @@ is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixe
 their tests in `tests/gaps.rs` run un-ignored. The model finding N2 is fixed
 (see its entry at the end of this section). G5 and G12 are fixed; their tests
 are in `tests/schedule_state.rs`, `tests/props_schedule.rs` and
-`tests/schedule_overlap.rs`. G11 is confirmed by an ignored
-test in `tests/gaps.rs`.
+`tests/schedule_overlap.rs`. G11 is fixed; its tests in `tests/gaps.rs` run
+un-ignored. No suspected gap is open; `spec/traces/gaps.yaml` lists none.
 
 Each item below was traced from the code; the status line above records
 which ones a test has since confirmed or closed.
@@ -1382,6 +1430,26 @@ row in `TW1_Claim.quarantined` (interface v5). Tests:
 **G11. Parent cancellation does not reach descendants** (specification gap).
 See the rejected candidate in §3. Child workflows and their external side
 effects continue after the parent is cancelled or superseded.
+**Fixed** for owned children: `cancel_locked_workflow` (T-X3, T-A4) and the
+T-A5 supersession of a non-terminal source call `cancel_owned_descendants`,
+which cancels every live generation of every child whose key is
+`child:{parent}:{command}` (the child and the T-X2/T-A5 successors on its
+restart chain, to which G2 may have re-attached the parent), and their owned
+children, in the same transaction (S25; lock order in §2.8). Rule: a
+parent's cancel reaches every generation of its owned children. The child's
+history records `workflow_cancelled` with reason
+`parent workflow {p} cancelled: {reason}`, and its running activities become
+`cancelling` (N2). Documented as intended: a child started with a domain key
+is not owned and keeps running. Model: `cancelWrite` cancels
+`cancelTargets`; `inv_G11_cancelReachesChildren` (owned children) and the
+action property `inv_G11_cancelReachesGenerations` are in `safety`. Tests:
+`g11_parent_cancellation_cancels_child_workflow`,
+`g11_cancel_reaches_grandchildren`,
+`g11_cancel_reaches_the_restart_successor_of_an_owned_child`,
+`g11_domain_keyed_child_survives_parent_cancellation`,
+`g11_cascade_revokes_a_running_child_activity` (`tests/gaps.rs`) and
+`restart_supersession_cancels_the_owned_child` (`tests/admin_controls.rs`),
+`cancel_parent_with_running_child` (`tests/trace_model.rs`).
 
 **G12. Run-now ignores the schedule pause and the overlap policy**
 (`src/admin/control.rs:742-820`). **Fixed**: run-now applies the overlap

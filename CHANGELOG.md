@@ -30,6 +30,9 @@ production on MySQL since August 2026.
   schedule pause/resume/run-now) and metrics
   services; a health scanner with a pluggable alert sink; readiness
   reporting; graceful shutdown.
+- `DurableError::is_transient`: whether the database aborted the
+  transaction with a deadlock, serialization failure or lock wait timeout
+  that a retry of the whole transaction can clear.
 - Two database backends, one per build, selected with mutually exclusive
   cargo features: `postgres` (default; PostgreSQL 14+) and `mysql`
   (MySQL 8.0.16+ and 8.4, InnoDB). CI runs the full suite on MySQL 8.0 and
@@ -82,6 +85,18 @@ Compared with the production-internal version it was extracted from:
 - A start that collides on the restart key (`uq_durable_workflow_restart`)
   returns `DurableError::Conflict` and leaves the caller's transaction
   usable (it returned `InvalidState`).
+- Cancelling a workflow cancels every generation of the child workflows it
+  owns (the child and its recovery or restart successors), and theirs, in
+  the same transaction (G11): `DurableStore::cancel_with_conn`,
+  `AdminControlService::cancel_workflow`, and an admin restart that
+  supersedes a paused or blocked source. A child is owned when the flow
+  started it with `WfCtx::child` (key `child:{parent}:{command}`); a child
+  started with `WfCtx::child_with_key` may be shared and keeps running. The
+  child's history records `workflow_cancelled` with the reason
+  `parent workflow {id} cancelled: {reason}`, and its running activities are
+  revoked to `cancelling` like any cancel. The cascade locks parent before
+  child, so it can deadlock with a child that finishes at the same moment;
+  the database aborts one side, and the error `is_transient()`: retry it.
 - `StartOptions::restarted_from_workflow_id` and `StartOptions::root_workflow_id`
   are crate-private (N3): only a recoverable start and the admin restart set
   a restart source, so an application can no longer start a "successor" of a
@@ -192,10 +207,5 @@ Compared with the production-internal version it was extracted from:
   when the upgrade changes the timezone; a new earlier slot still runs (daily
   08:00 changed to 07:00 at 05:00 runs today at 07:00).
 - G12: admin run-now respects the schedule's overlap policy (see Changed).
-
-### Known issues
-
-The confirmed protocol gap G11 has an
-ignored reproduction test in `durable-workflows/tests/gaps.rs` and reproduce
-on both backends. See the "Known issues" section of the README and
-`docs/INVARIANTS.md` §6.
+- G11: cancelling or superseding a parent no longer leaves the children it
+  owns running (see Changed).

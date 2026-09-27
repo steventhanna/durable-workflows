@@ -82,6 +82,17 @@ pub enum DurableError {
     },
 }
 
+impl DurableError {
+    /// Whether the database aborted the transaction for a reason that a retry
+    /// of the whole transaction can clear: a deadlock, a serialization failure
+    /// or a lock wait timeout. A cancel that cascades to owned children locks
+    /// parent before child, so it can deadlock with a child that finishes at
+    /// the same moment (INVARIANTS §2.8); retry it when this holds.
+    pub fn is_transient(&self) -> bool {
+        crate::dialect::is_transient_error(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{category}: {message}")]
 pub struct WorkflowError {

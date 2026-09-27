@@ -132,14 +132,20 @@ if printf '%s\n' "${suites[@]}" | grep -qx gaps; then
   patterns=()
   while IFS= read -r key; do patterns+=("${key%%\**}"); done < <(
     sed -nE 's/^([A-Za-z0-9_*]+):.*/\1/p' spec/traces/gaps.yaml)
-  phase "recording ignored gap tests: ${patterns[*]}"
-  cargo_test --test gaps -- --ignored "${patterns[@]}" >"$logs/gaps.log" 2>&1 || true
-  if ! grep -qE '^test result:' "$logs/gaps.log"; then
-    tail -n 60 "$logs/gaps.log"
-    echo "trace-pipeline: the gap tests did not run (see $logs/gaps.log)" >&2
-    exit 1
+  # With no open gap, run no ignored test: an empty filter would run them all
+  # (and "${patterns[@]}" on an empty array fails under bash 3.2 `set -u`).
+  if [ "${#patterns[@]}" -eq 0 ]; then
+    phase "no open gaps in spec/traces/gaps.yaml: no ignored gap tests to record"
+  else
+    phase "recording ignored gap tests: ${patterns[*]}"
+    cargo_test --test gaps -- --ignored "${patterns[@]}" >"$logs/gaps.log" 2>&1 || true
+    if ! grep -qE '^test result:' "$logs/gaps.log"; then
+      tail -n 60 "$logs/gaps.log"
+      echo "trace-pipeline: the gap tests did not run (see $logs/gaps.log)" >&2
+      exit 1
+    fi
+    grep -E '^test .* (ok|FAILED)$' "$logs/gaps.log" | sed 's/^/   /'
   fi
-  grep -E '^test .* (ok|FAILED)$' "$logs/gaps.log" | sed 's/^/   /'
 fi
 
 # --- 4. dump and generate ---------------------------------------------------
