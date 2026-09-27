@@ -19,7 +19,7 @@ module durable_tests {
   action runAct(r: int): bool = all { keepPrev, TC2_RunActivity(r, cw(r), ct(r), db.nextAct, "t", MAX_ATTEMPTS, false, false, now, now) }
   action complete(r: int): bool = all { keepPrev, TC2_Complete(r, cw(r), ct(r), now) }
   action runChild(r: int, k: int): bool = {
-    val ex = anyOf(rowsWithKey(db, "C", k))
+    val ex = newestGen(db, anyOf(rowsWithKey(db, "C", k)))
     all { keepPrev, TC2_RunChild(r, cw(r), ct(r), "C", k, ex, if (ex == 0) db.nextWf else 0, now) }
   }
   def nextAutoKey(r: int): int = autoKey(cw(r), db.wf.get(cw(r)).cmdSeq + 1)
@@ -133,17 +133,41 @@ module durable_tests {
       .then(handler(1, 1, "permanent"))
       .then(finish(1, 1, "permanent"))
 
-  // G2: T-X2 cancels the blocked child without waking its parent
-  run g2StrandedParentTest =
+  // G2 (fixed): T-X2 cancels the blocked child and re-points its waiting parent to the
+  // successor; the parent is woken by the successor's completion
+  run g2ReattachTest =
     blockedKeyedChild
       .expect(db.wf.get(2).status == "blocked" and db.wf.get(1).status == "waiting_child")
       .then(tx2("C", true))
       .expect(db.wf.get(2).status == "cancelled" and db.wf.get(3).restartedFrom == 2
-              and not(inv_S24_parentWakes) and inv_N1_tx2OwnLineage and safety)
+              and db.wf.get(1).status == "waiting_child" and db.wf.get(1).waitRef == 3
+              and inv_S24_parentWakes and safety)
+      .then(claim(1, 3))
+      .then(complete(1))                                               // w3 succeeded, w1 woken
+      .expect(db.wf.get(1).status == "ready"
+              and db.events.get(1).exists(e => e.typ == "child_succeeded" and e.ref == 3) and safety)
 
-  // N1: the keyed child succeeded; a later auto-keyed sibling of the same kind is blocked.
-  // T-X2(C, "k") resolves root = parent's root and supersedes the SIBLING.
-  run n1WrongLineageTest =
+  // D4: a later RunChild on the same key attaches to the newest generation (w3), not the
+  // cancelled keyed row w2
+  run d4AttachNewestTest =
+    blockedKeyedChild
+      .then(tx2("C", true))                                            // w3 successor of w2
+      .then(start(NO_KEY))                                             // w4
+      .then(claim(1, 4))
+      .then(runChild(1, DOMAIN_KEY))
+      .expect(lastAction == "TC2_RunChild_Attach" and db.wf.get(4).waitRef == 3 and safety)
+  run d4AttachKeyedRowRejectedTest =
+    blockedKeyedChild
+      .then(tx2("C", true))
+      .then(start(NO_KEY))
+      .then(claim(1, 4))
+      .then(all { keepPrev, TC2_RunChild(1, 4, ct(1), "C", DOMAIN_KEY, 2, 0, now) })
+      .fail()
+
+  // N1 (fixed): the keyed child succeeded; a later auto-keyed sibling of the same kind is
+  // blocked. T-X2(C, "k") follows the keyed row's own restart chain: it returns w2 and
+  // leaves the sibling alone (superseding the sibling is not a step)
+  action n1BlockedSibling: bool =
     init
       .then(start(NO_KEY))
       .then(claim(1, 1))
@@ -158,9 +182,16 @@ module durable_tests {
       .then(handler(1, 1, "permanent"))
       .then(finish(1, 1, "permanent"))
       .expect(db.wf.get(3).status == "blocked" and db.wf.get(2).status == "succeeded")
-      .then(tx2("C", true))
-      .expect(not(inv_N1_tx2OwnLineage) and db.wf.get(3).status == "cancelled"
-              and db.wf.get(4).restartedFrom == 3 and not(inv_S24_parentWakes))
+  run n1WrongLineageTest =
+    n1BlockedSibling
+      .expect(tx2Latest(db, "C", DOMAIN_KEY) == 2)
+      .then(tx2("C", false))
+      .expect(lastAction == "TX2_ReturnLatest" and db.wf.get(3).status == "blocked"
+              and db.nextWf == 4 and safety)
+  run n1SiblingNotSupersededTest =
+    n1BlockedSibling
+      .then(all { keepPrev, TX2_RecoverableStart("C", DOMAIN_KEY, 2, 3, true, db.nextWf, now) })
+      .fail()
 
   // G11: cancelling a parent leaves its child running
   run g11CancelTest =
@@ -213,17 +244,16 @@ module durable_tests {
       .then(all { keepPrev, TX1_Start(2, "P", DOMAIN_KEY, 1, true, now) })
       .fail()
 
-  // N3: the public restart field accepts a live source
+  // N3 (fixed): a successor of a live source is not a step (the restart field is crate-private)
   run n3LiveSourceTest =
     init
       .then(start(NO_KEY))
       .then(all { keepPrev, TX1_Start(2, "P", NO_KEY, 1, true, now) })
-      .expect(db.wf.get(1).status == "ready" and db.wf.get(2).restartedFrom == 1
-              and not(inv_S19_sourceTerminal) and safety)
+      .fail()
 
-  // T-X2 restart-key collision: an application start already took w1's restart key, so the
-  // recovery's successor insert conflicts and the savepoint rolls back the whole T-X2
-  run tx2ConflictTest =
+  // T-X2 after a restart of w1 outside T-X2 (w2 restartedFrom w1, root 0): w2 is the newest
+  // generation on w1's restart chain, so T-X2 returns it (N1 fixed; it used to Conflict)
+  run tx2ReturnsNewestGenerationTest =
     init
       .then(tx2("P", false))                                           // no original: w1 (P, "k")
       .expect(lastAction == "TX2_StartNew")
@@ -233,8 +263,9 @@ module durable_tests {
       .then(all { keepPrev, TC3_ActivationFailure(1, 1, ct(1), 2, MAX_ACTIVATION, now, now) })  // w1 failed
       .expect(db.wf.get(1).status == "failed")
       .then(all { keepPrev, TX1_Start(2, "P", NO_KEY, 1, true, now) }) // w2 restartedFrom w1, root 0
+      .expect(tx2Latest(db, "P", DOMAIN_KEY) == 2)
       .then(tx2("P", false))
-      .expect(lastAction == "TX2_Conflict" and db.nextWf == 3 and db.wf.get(1).status == "failed" and safety)
+      .expect(lastAction == "TX2_ReturnLatest" and db.nextWf == 3 and db.wf.get(1).status == "failed" and safety)
 
   //---------------------------------------------------------------- operator actions
   action pause(w: int): bool = all { keepPrev, AdminPause(w, now) }
@@ -347,9 +378,9 @@ module durable_tests {
     init.then(tick).then(start(NO_KEY)).then(claim(1, 1))
       .then(all { keepPrev, TC2_RunActivity(1, 1, ct(1), 1, "t", 1, false, false, 0, now) }).fail()
 
-  // N1 (ReturnLatest): the keyed child succeeded, a live auto-keyed sibling is newer; T-X2(C, "k")
-  // returns the sibling
-  run n1ReturnLatestTest =
+  // N1 (ReturnLatest, fixed): the keyed child succeeded, a live auto-keyed sibling is newer;
+  // T-X2(C, "k") returns the keyed row, not the sibling
+  action n1LiveSibling: bool =
     init
       .then(start(NO_KEY))
       .then(claim(1, 1))
@@ -358,12 +389,19 @@ module durable_tests {
       .then(complete(1))
       .then(claim(1, 1))
       .then(runChild(1, nextAutoKey(1)))                               // w3 = C auto key, ready
+  run n1ReturnLatestTest =
+    n1LiveSibling
+      .expect(tx2Latest(db, "C", DOMAIN_KEY) == 2)
       .then(tx2("C", false))
-      .expect(lastAction == "TX2_ReturnLatest" and not(inv_N1_tx2OwnLineage) and safety)
-  // ReturnLatest of the keyed row itself stays inside the lineage
+      .expect(lastAction == "TX2_ReturnLatest" and db.wf.get(3).status == "ready" and safety)
+  run n1ReturnSiblingRejectedTest =
+    n1LiveSibling
+      .then(all { keepPrev, TX2_RecoverableStart("C", DOMAIN_KEY, 2, 3, false, 0, now) })
+      .fail()
+  // ReturnLatest of the keyed row itself
   run n1ReturnOwnRowTest =
     init.then(tx2("P", false)).then(tx2("P", false))
-      .expect(lastAction == "TX2_ReturnLatest" and inv_N1_tx2OwnLineage)
+      .expect(lastAction == "TX2_ReturnLatest" and tx2Latest(db, "P", DOMAIN_KEY) == 1 and safety)
 }
 
 // Historical: T-W1 plain reads use the InnoDB REPEATABLE READ snapshot (code before P4)

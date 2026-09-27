@@ -85,7 +85,7 @@ Actions, one per committed transaction (T-W1: one per statement group):
 | Action | T-id | Fences and checks modeled |
 |---|---|---|
 | `TX1_Start` | T-X1 | dedup hit returns the existing row; restart-key collision → `Conflict`, no row; both keys rejected |
-| `TX2_RecoverableStart` | T-X2 | lineage = same kind and (`id = root` or `rootWorkflowId = root`); only a `failed`/`blocked` newest row; blocked → cancelled with no parent wake; restart-key collision → `Conflict` (all rolled back) |
+| `TX2_RecoverableStart` | T-X2 | newest generation = end of the keyed row's `restartedFrom` chain (`tx2Latest`, N1 fixed); only a `failed`/`blocked` newest row; blocked → cancelled, its waiting parents re-pointed to the successor (G2 fixed); restart-key collision → `Conflict` (all rolled back) |
 | `TX3_Cancel` | T-X3 | cancels own activities (closes open attempts), wakes waiting parents |
 | `TC1_Claim` | T-C1 | at most one expired-lease recovery, then at most one ready claim, fresh token; SKIP LOCKED |
 | `LC1_NoEvent` | L-C1 | no deliverable event after `delivered` → task error |
@@ -195,6 +195,28 @@ Changes in v5 (from v4):
   trigger-captured `EnvSetAct`. New witness `wit_quarantined`.
 - `missing_definition` is a skip (`Ok(None)`), not a record; it stays
   unmodeled (F3).
+- N1 fixed: `TX2_RecoverableStart`'s `latest` is the newest generation of
+  `orig`, the end of its `restartedFrom` chain (`newestGen`, `tx2Latest`;
+  `store.rs` `lock_newest_generation`), no longer the newest row of the same
+  kind under `orig`'s root. Removed: `ghost.tx2OutsideLineage`,
+  `inv_N1_tx2OwnLineage`.
+- G2 fixed: the superseded branch re-points every parent waiting on a blocked
+  `latest` (`waiting_child`, or `paused` with a child wait) to `sNew`
+  (`reattachParents`). The code re-attaches only when the successor runs
+  `latest`'s version and otherwise wakes the parents with `child_failed`
+  (`child_superseded`); versions are not modeled, so the model always
+  re-attaches and a recorded version change is excluded (`versions:<kind>`).
+  The history row `child_wait_reattached` has no delivery sequence and is not
+  recorded. Removed: `inv_S24_exceptTX2`; `inv_S24_parentWakes` is part of
+  `safety`.
+- N3 fixed: `StartOptions::restarted_from_workflow_id` and `root_workflow_id`
+  are crate-private; only the admin restart (T-A5, recorded as `Unmodeled`)
+  sets them. `TX1_Start` with `from != 0` needs a terminal source, so
+  `inv_S19_sourceTerminal` is part of `safety`.
+- D4: `TC2_RunChild`'s `existing` is the newest generation of the row with
+  `(kind, key)` (`store.rs` `insert_child` locks the keyed row and walks its
+  chain), so a parent that starts a keyed child after a recovery waits on the
+  successor.
 
 Changes in v4 (from v3):
 
@@ -217,7 +239,7 @@ Changes in v4 (from v3):
   CONTINUATION_READY_AT` (0, `transition.rs` `CONTINUATION_READY_AT_MILLIS`);
   otherwise `availableAt >= tnow`.
 - `TX2_ReturnLatest` sets `ghost.tx2OutsideLineage` when the returned row is
-  not on the keyed row's restart chain (N1, second variant).
+  not on the keyed row's restart chain (N1, second variant; removed in v5).
 - `crashLoses(r)`: `Crash(r)`'s guard (the runtime holds a claim, an
   execution or an in-flight T-W1). A trace checker replays the recorded crash
   of an idle runtime as a stutter, `commit(db, proc, ghost, "Crash")`: it
@@ -326,7 +348,7 @@ Rules:
   (`tw1ReplayDetectsCapTest`).
 - **Stable invariant names:** `safety`, `safetyRc`, `inv_S17_capAtClaim`,
   `inv_S17_capAlways`, `inv_S24_parentWakes`, `inv_G11_cancelReachesChildren`,
-  `inv_N1_tx2OwnLineage`, `inv_S13_topicConcurrency`,
+  `inv_S13_topicConcurrency`,
   `inv_S19_sourceTerminal`, `inv_G1_noSelfCancelFromOperator`.
 
 Views for state comparison (`durable.qnt`):
@@ -344,7 +366,7 @@ in-flight simulation T-W1, which block the action):
 | Action (parameters) | Code (file:function) | Reads | Writes |
 |---|---|---|---|
 | `TX1_Start(wNew, kind, key, from, inserted, tnow)` — `inserted=false`: dedup hit (`wNew` = existing row) or restart-key `Conflict` (`wNew = 0`); key and `from` both set is not a step | `store.rs:start_with_conn` → `insert_prepared` → `persistence/workflows.rs:insert_started` → `dialect/mysql.rs:insert_workflow` | `db.wf`, `db.nextWf`, locks | `db.wf[wNew]`, `db.events[wNew]`, `db.nextWf`, `now` |
-| `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` — `orig`/`latest` = rows locked (0 = none), `sNew` = inserted row (0 = none) | `store.rs:start_or_restart_recoverable_with_conn` | `db.wf`, `db.act`, locks | `db.act` (dead-lettered → cancelled), `db.wf[latest]`, `db.wf[sNew]`, `db.events[sNew]`, `db.nextWf`, `ghost.tx2OutsideLineage`, `now` |
+| `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` — `orig`/`latest` = rows locked (0 = none; `latest` = `tx2Latest`, the end of `orig`'s restart chain), `sNew` = inserted row (0 = none) | `store.rs:start_or_restart_recoverable_with_conn`, `lock_newest_generation`, `hand_waiting_parents_to_successor` | `db.wf`, `db.act`, locks | `db.act` (dead-lettered → cancelled), `db.wf[latest]`, parents waiting on `latest` (`waitRef` → `sNew`), `db.wf[sNew]`, `db.events[sNew]`, `db.nextWf`, `now` |
 | `TX3_Cancel(w, tnow)` — terminal `w` is not a step | `store.rs:cancel_with_conn`, `cancel_locked_workflow`, `cancel_activities`; `persistence/workflows.rs:wake_waiting_parents_on_child_terminal` | `db.wf`, `db.act`, `db.att`, `db.events`, locks | `db.wf[w]`, parents, `db.act`, `db.att`, parents' `db.events`, `now` |
 | `TC1_Claim(r, rec, cl, tok, leaseExp, tnow)` — `rec`/`cl` = 0 when absent | `runtime/coordinator.rs:claim_one` | `db.wf[rec, cl]`, `db.nextToken`, `proc.claims[r]`, locks | `db.wf[rec, cl]`, `db.nextToken`, `proc.claims[r]`, `ghost.lastIssuedWf`, `now` |
 | `LC1_NoEvent(r, w)` | `coordinator.rs:activate_claim_inner` | `proc.claims[r]`, `db.events[w]` | `proc.claims[r]`, `ghost.noEventError`, `ghost.taskErrors` |
@@ -376,7 +398,7 @@ in-flight simulation T-W1, which block the action):
 
 ### Directed scenarios (`quint test`)
 
-All 39 pass (`durable_tests` 32, `durable_tests_rr` 2, `durable_tests_drift` 1, `durable_tests_env` 4).
+All 43 pass (`durable_tests` 36, `durable_tests_rr` 2, `durable_tests_drift` 1, `durable_tests_env` 4).
 
 | Test | Module | Shows |
 |---|---|---|
@@ -384,15 +406,16 @@ All 39 pass (`durable_tests` 32, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `g7RcHeartbeatBlockedTest` | RC | The other order: the relock reconciles a1 (pending again after a 1-tick retry delay) and holds it; the heartbeat blocks, then misses the fence. S17 holds. |
 | `tw1ReplayDetectsCapTest` | RC | Replay form: a recorded T-W1 that under-counted `in_flight` violates `inv_S17_capAtClaim`. |
 | `n2CancelFreesSlotTest` | RC | N2: 2 handlers execute on a cap-1 topic after a cancel. |
-| `g2StrandedParentTest` | RC | G2: T-X2 strands the parent (S24). |
-| `n1WrongLineageTest` | RC | N1: T-X2 on a child key supersedes a sibling. |
+| `g2ReattachTest` | RC | G2 (fixed): T-X2 cancels the blocked keyed child and re-points its waiting parent to the successor (S24 holds); the successor's completion wakes the parent. |
+| `d4AttachNewestTest`, `d4AttachKeyedRowRejectedTest` | RC | D4: a later `RunChild` on the key attaches to the newest generation; attaching to the cancelled keyed row is not a step. |
+| `n1WrongLineageTest`, `n1SiblingNotSupersededTest` | RC | N1 (fixed): T-X2 on a child key whose keyed row succeeded returns that row and leaves the blocked auto-keyed sibling alone; superseding the sibling is not a step. |
 | `g11CancelTest` | RC | G11: a cancelled parent leaves its child `ready`. |
 | `staleCoordinatorTest` | RC | S2/S3: the stale coordinator loses the fence. |
 | `activitySuccessTest` | RC | Happy path with the replay form of T-W1. |
 | `startSemanticsTest` | RC | T-X1: dedup hit returns the row; restart-key collision → `Conflict`, no row. |
 | `startBothKeysRejectedTest` | RC | T-X1 with a key and a restart source is not a step. |
-| `n3LiveSourceTest` | RC | N3: a public start with `restarted_from_workflow_id` = a live row. |
-| `tx2ConflictTest` | RC | T-X2 restart-key collision → `Conflict`, nothing written. |
+| `n3LiveSourceTest` | RC | N3 (fixed): a start with `from` = a live row is not a step. |
+| `tx2ReturnsNewestGenerationTest` | RC | T-X2 after a restart of the failed keyed row outside T-X2 returns that successor, the newest generation on the chain (`TX2_ReturnLatest`). |
 | `g7CapExceededTest` | RR (historical) | G7: 2 live leases on a cap-1 topic under the RR snapshot. |
 | `g7NeedsSnapshotTest` | RR (historical) | Same schedule with the heartbeat before the snapshot: no violation. |
 | `driftTwoHandlersTest` | DRIFT=2 | S13 fails when the process clock lags DB time. |
@@ -404,7 +427,7 @@ All 39 pass (`durable_tests` 32, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `pausedParentWokenTest`, `pausedParentResumesWaitingTest` | RC | A paused parent gets its child's outcome and stays paused (wait cleared), then resumes to `ready`; resumed before the child ends → `waiting_child`. |
 | `g11AdminCancelTest`, `adminCancelPausedTest` | RC | G11 through the operator cancel; admin cancel of a paused workflow cancels its pending activity. |
 | `continuationPriorityTest`, `continuationPriorityNowRejectedTest`, `noPriorityEarlyRejectedTest` | RC | A continuation-priority activity is inserted at `CONTINUATION_READY_AT` (0 < `tnow`) and claimed; `prio` with `availableAt = now`, or no `prio` with `availableAt < tnow`, is not a step. |
-| `n1ReturnLatestTest`, `n1ReturnOwnRowTest` | RC | N1, second variant: T-X2 on the child key returns a newer live sibling (`TX2_ReturnLatest` flags it); returning the keyed row itself does not. |
+| `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`, `n1ReturnOwnRowTest` | RC | N1, second variant (fixed): T-X2 on the child key returns the keyed row, not a newer live sibling (returning the sibling is not a step); `TX2_ReturnLatest` of a top-level keyed row. |
 | `g10InvalidRowNotClaimedTest`, `g10WrongReasonTest`, `g10ReplayTest` | RC, `ENABLE_ENV_EDITS` | The invalid row cannot be claimed; a replayed quarantine with the `attempt_cap` reason does not match it; the replay form quarantines a1 and claims a2 in one `TW1_Claim`. |
 
 ### Random simulation (`quint run`, 20,000 samples, 40 steps; 80 steps where noted)
@@ -416,18 +439,14 @@ overloaded; `step` is about 3 times slower per sample with the new branches).
 
 | Instance | Property | Expected | Result |
 |---|---|---|---|
-| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity, S14-S16, S18, S19, S23, S24 except T-X2, S25, G1) | hold | no violation |
+| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity, S14-S16, S18, S19 incl. source terminal, S23, S24, S25, G1) | hold | no violation |
 | `durable_mc` | `safetyRc` (= `safety` + S17 at claim and between commits) | hold | no violation |
-| `durable_mc` | `inv_S24_exceptTX2` | hold | no violation |
 | `durable_mc_act` | `safetyRc` | hold | no violation |
 | `durable_mc_rr` | `safety` | hold | no violation |
 | `durable_mc_rr`, `durable_mc_act_rr` | `inv_S17_capAlways`, `inv_S17_capAtClaim` (G7, historical) | violate | not found at this budget; found by `g7CapExceededTest` |
 | `durable_mc_env` | `safety` (external writes and invalid-bounds commands on) | hold | no violation |
 | `durable_mc_env` | `wit_quarantined` (G10 fixed; non-vacuity) | violate | see `results/summary.txt` |
 | `durable_mc` | `inv_G11_cancelReachesChildren` | violate | violated (11 states) |
-| `durable_mc` | `inv_N1_tx2OwnLineage` (N1) | violate | violated (24 states; first time found by simulation) |
-| `durable_mc` | `inv_S19_sourceTerminal` (N3) | violate | violated (3 states) |
-| `durable_mc` | `inv_S24_parentWakes` (G2) | violate | not found at 40 or 80 steps; found by `g2StrandedParentTest` |
 | `durable_mc`, `durable_mc_act` | `inv_S13_topicConcurrency` (N2) | violate | not found at 40 (or 80) steps; found by `n2CancelFreesSlotTest` |
 | `durable_mc_drift` | `inv_S13_oneHandler` | violate | not found at 40 or 80 steps; found by `driftTwoHandlersTest` |
 | `durable_mc` | witnesses S3, blocked, child succeeded, activity succeeded, coordinator fence miss, reconcile row, commit inside an open T-W1 | violate | all violated (reachable) |
@@ -466,14 +485,15 @@ fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
 | Gap | Status in this model | Evidence |
 |---|---|---|
 | G1 (operator pause/cancel during a claim costs the restart budget) | **Fixed**: `CoordFenceMiss` is not a task error; `inv_G1_noSelfCancelFromOperator` (the coordinator never errors) is part of `safety` | `pauseResumeTest`, `g1NoSelfCancelTest`, `g1RuntimeStillClaimsTest`, `g1AppCancelFenceMissTest`, simulation; the G1 gap tests' traces pass |
-| G2 (T-X2 strands the parent) | Reproduces, unchanged | `g2StrandedParentTest` |
+| G2 (T-X2 strands the parent) | **Fixed**: T-X2 re-points the parents waiting on the superseded blocked row to its successor; `inv_S24_parentWakes` is part of `safety` and `inv_S24_exceptTX2` is gone | `g2ReattachTest`, `safety` in simulation; the G2 gap tests' traces pass |
 | G4 (stale `sequence`) | Not modeled; closed for library transactions by READ COMMITTED per INVARIANTS.md | — |
 | G7 (topic cap exceeded by one) | **Closed** under READ COMMITTED; reproduces only in the historical RR instance | `g7ClosedUnderRcTest`, `g7RcHeartbeatBlockedTest`, `safetyRc` holds in simulation and in Apalache at depth 4; `g7CapExceededTest` (RR) |
 | G10 (one invalid row aborts every topic's claims) | **Fixed** (interface v5): a claimable row past its attempt cap or with invalid bounds is quarantined (`TW1_QuarantineRow`; `quarantined` in `TW1_Claim`): dead-lettered, its workflow blocked, and the T-W1 goes on. `TW1_Error` and `inv_G10_noClaimAbort` are gone | `g10InvalidBoundsTest`, `g10ReplayTest`, `g10WrongReasonTest`; `durable_mc_env` `safety` and `wit_quarantined`; the G10 gap tests' traces pass |
 | G11 (cancel does not reach children) | Reproduces through T-X3 and the operator cancel (T-A4) | `g11CancelTest`, `g11AdminCancelTest`, simulation, the recorded G11 gap test |
-| N1 (T-X2 lineage on a child key) | Reproduces in both variants: supersession of a blocked sibling, and `TX2_ReturnLatest` of a live one | `n1WrongLineageTest`, `n1ReturnLatestTest`, simulation, both recorded N1 gap tests |
+| N1 (T-X2 lineage on a child key) | **Fixed**: `tx2Latest` is the end of the keyed row's restart chain, so neither variant is a step; `inv_N1_tx2OwnLineage` is gone | `n1WrongLineageTest`, `n1SiblingNotSupersededTest`, `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`; both N1 gap tests' traces pass |
+| D4 (keyed child after a recovery) | `TC2_RunChild` attaches to the newest generation of the keyed row | `d4AttachNewestTest`, `d4AttachKeyedRowRejectedTest` |
 | N2 (revoke frees the slot, cap exceeded in execution) | Reproduces through application cancel and operator pause | `n2CancelFreesSlotTest`, `n2PauseFreesSlotTest`, both recorded N2 gap tests |
-| N3 (new: public restart source not checked) | Reproduces | `n3LiveSourceTest`, simulation (3 states) |
+| N3 (public restart source not checked) | **Fixed**: the restart fields are crate-private; `TX1_Start` needs a terminal `from`; `inv_S19_sourceTerminal` is part of `safety` | `n3LiveSourceTest`, `safety` in simulation; trybuild `start_options_restart_field_private` |
 | S13 with clock drift | Reproduces, unchanged | `driftTwoHandlersTest` |
 
 ### Why G7 is closed under READ COMMITTED
@@ -496,19 +516,18 @@ the only writers), and (2) at most one heartbeat per claim is in flight. The
 lease can still be revived after it expired (`wit_revivedLease`), which costs
 the activity an attempt later but does not exceed the cap.
 
-### N3 (new): the public restart field accepts a live source
+### N3 (fixed): the public restart field accepted a live source
 
-`StartOptions.restarted_from_workflow_id` is public. `insert_prepared` stores
-it after only the restart-key uniqueness check, so an application can start a
-"successor" of a running workflow (`n3LiveSourceTest`). S19 as written in
-INVARIANTS.md (one successor per source) still holds; the model's stronger
-form (the source is terminal) does not. The same start can also take the
-restart key of a failed row outside its lineage, which then makes T-X2's
-recovery of that row return `Conflict` (`tx2ConflictTest`).
+`StartOptions.restarted_from_workflow_id` was public, and `insert_prepared`
+stored it after only the restart-key uniqueness check, so an application
+could start a "successor" of a running workflow. S19 as written in
+INVARIANTS.md (one successor per source) held; the stronger form (the source
+is terminal) did not. The field and `root_workflow_id` are now crate-private
+(a trybuild case keeps them so); only T-X2 and the admin restart set them.
 
 ## Counterexamples (unchanged from the first iteration)
 
-G2, N1, N2, G11 and the drift case follow the same steps as before (see the
+N2, G11 and the drift case follow the same steps as before (see the
 directed tests); only the T-W1 steps are now statement groups. G7 now needs
 `RR_SNAPSHOT = true`.
 
@@ -523,5 +542,5 @@ directed tests); only the T-W1 steps are now statement groups. G7 now needs
 4. `(kind, version)` for children (G6).
 5. Schedules (T-S1, T-S2, T-A8, T-A9); G5 and G12.
 6. A guided simulation (or TLC through the TLA+ transpiler) that reaches the
-   long schedules (G2, N2, drift) without directed tests.
+   long schedules (N2, drift) without directed tests.
 7. Trace checking with the replay interface above.

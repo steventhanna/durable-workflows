@@ -77,10 +77,7 @@ impl ScheduleHandler for ManualSchedule {
         Ok(DurableStore::start_with_conn(
             connection,
             &ApprovalWorkflow { value: 19 },
-            StartOptions {
-                schedule_run_id: Some(schedule_run_id),
-                ..StartOptions::default()
-            },
+            StartOptions::default().with_schedule_run_id(schedule_run_id),
         )
         .await?
         .workflow_id)

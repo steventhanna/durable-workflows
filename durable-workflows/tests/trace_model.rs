@@ -557,8 +557,7 @@ async fn cancel_waiting_activity() {
     assert_eq!(status(&pool, id).await, "cancelled");
 }
 
-/// T-X2 branches: StartNew, supersede a failed row, ReturnLatest, and the
-/// restart-key `Conflict` of both T-X2 and T-X1 after a public successor (N3).
+/// T-X2 branches: StartNew, supersede a failed row, ReturnLatest.
 #[tokio::test]
 async fn recoverable_start_after_failure() {
     let Some(pool) = support::fresh_pool().await else {
@@ -598,24 +597,6 @@ async fn recoverable_start_after_failure() {
         coordinator.activate_one().await.expect("fails"),
         Some(second.workflow_id)
     );
-    let from_second = || StartOptions {
-        restarted_from_workflow_id: Some(second.workflow_id),
-        ..StartOptions::default()
-    };
-    store
-        .start(&FailingFlow, from_second())
-        .await
-        .expect("public successor of a failed row");
-    assert!(matches!(
-        store
-            .start_or_restart_recoverable(&FailingFlow, keyed())
-            .await,
-        Err(durable_workflows::DurableError::Conflict(_))
-    ));
-    assert!(matches!(
-        store.start(&FailingFlow, from_second()).await,
-        Err(durable_workflows::DurableError::Conflict(_))
-    ));
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+error[E0451]: fields `root_workflow_id` and `restarted_from_workflow_id` of struct `StartOptions` are private
+  --> tests/ui/fail/start_options_restart_field_private.rs:8:9
+   |
+ 7 |     let _ = StartOptions {
+   |             ------------ in this type
+ 8 |         restarted_from_workflow_id: Some(source),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+ 9 |         root_workflow_id: Some(source),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+10 |         ..StartOptions::default()
+   |           ----------------------- fields  are private

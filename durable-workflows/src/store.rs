@@ -23,13 +23,28 @@ pub struct StartOptions {
     pub deduplication_key: Option<String>,
     pub available_at: Option<DateTime<Utc>>,
     pub schedule_run_id: Option<ScheduleRunId>,
-    pub root_workflow_id: Option<WorkflowId>,
-    pub restarted_from_workflow_id: Option<WorkflowId>,
+    /// Recovery lineage, set only by the engine (T-X2 recoverable start and
+    /// the admin restart), which checks that the source may be restarted.
+    pub(crate) root_workflow_id: Option<WorkflowId>,
+    pub(crate) restarted_from_workflow_id: Option<WorkflowId>,
 }
 
 impl StartOptions {
     pub fn with_deduplication_key(mut self, key: impl Into<String>) -> Self {
         self.deduplication_key = Some(key.into());
+        self
+    }
+
+    /// Starts the workflow no earlier than `available_at`.
+    pub fn with_available_at(mut self, available_at: DateTime<Utc>) -> Self {
+        self.available_at = Some(available_at);
+        self
+    }
+
+    /// Links the workflow to the schedule run that starts it
+    /// (`ScheduleHandler::start_occurrence`).
+    pub fn with_schedule_run_id(mut self, schedule_run_id: ScheduleRunId) -> Self {
+        self.schedule_run_id = Some(schedule_run_id);
         self
     }
 }
@@ -280,18 +295,8 @@ impl DurableStore {
                         return Ok(outcome);
                     };
                     let root_id = original.root_workflow_id.unwrap_or(original.id);
-                    let latest = durable_workflow::table
-                        .filter(durable_workflow::kind.eq(W::KIND))
-                        .filter(
-                            durable_workflow::id
-                                .eq(root_id)
-                                .or(durable_workflow::root_workflow_id.eq(Some(root_id))),
-                        )
-                        .order(durable_workflow::id.desc())
-                        .for_update()
-                        .select(WorkflowRow::as_select())
-                        .first::<WorkflowRow>(transaction)
-                        .await?;
+                    let original_id = original.id;
+                    let latest = lock_newest_generation(transaction, original).await?;
                     if !matches!(
                         latest.status,
                         WorkflowStatus::Failed | WorkflowStatus::Blocked
@@ -300,7 +305,7 @@ impl DurableStore {
                             W::KIND,
                             W::VERSION,
                             &key,
-                            Some((original.id, latest.id)),
+                            Some((original_id, latest.id)),
                             false,
                             latest.id,
                             false,
@@ -310,6 +315,45 @@ impl DurableStore {
                             inserted: false,
                         });
                     }
+
+                    // The successor goes in first: a restart-key `Conflict` then
+                    // rolls back before anything else is written, and a blocked
+                    // row's waiting parents can be re-pointed at it.
+                    let lineage = Some((original_id, latest.id));
+                    let outcome = Self::insert_prepared_untraced(
+                        transaction,
+                        W::KIND,
+                        W::VERSION,
+                        input_json,
+                        state_json,
+                        StartOptions {
+                            deduplication_key: None,
+                            root_workflow_id: Some(WorkflowId::new(root_id)?),
+                            restarted_from_workflow_id: Some(WorkflowId::new(latest.id)?),
+                            ..options
+                        },
+                    )
+                    .await;
+                    let successor = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            // The restart key already has a successor: everything rolls back.
+                            if matches!(error, DurableError::Conflict(_)) {
+                                crate::trace::declare_rollback(|| {
+                                    recoverable_start_action(
+                                        W::KIND,
+                                        W::VERSION,
+                                        &key,
+                                        lineage,
+                                        false,
+                                        0,
+                                        false,
+                                    )
+                                });
+                            }
+                            return Err(error);
+                        }
+                    };
 
                     let now = persistence::database_now_millis(transaction).await?;
                     if crate::trace::ENABLED {
@@ -380,48 +424,26 @@ impl DurableStore {
                             },
                         )
                         .await?;
+                        hand_waiting_parents_to_successor(
+                            transaction,
+                            &latest,
+                            successor.workflow_id,
+                            W::VERSION,
+                            now,
+                        )
+                        .await?;
                     }
 
-                    let lineage = Some((original.id, latest.id));
-                    let outcome = Self::insert_prepared_untraced(
-                        transaction,
+                    declare_recoverable_start(
                         W::KIND,
                         W::VERSION,
-                        input_json,
-                        state_json,
-                        StartOptions {
-                            deduplication_key: None,
-                            root_workflow_id: Some(WorkflowId::new(root_id)?),
-                            restarted_from_workflow_id: Some(WorkflowId::new(latest.id)?),
-                            ..options
-                        },
-                    )
-                    .await;
-                    match &outcome {
-                        Ok(outcome) => declare_recoverable_start(
-                            W::KIND,
-                            W::VERSION,
-                            &key,
-                            lineage,
-                            true,
-                            outcome.workflow_id.get(),
-                            outcome.inserted,
-                        ),
-                        // The restart key already has a successor: everything rolls back.
-                        Err(DurableError::Conflict(_)) => crate::trace::declare_rollback(|| {
-                            recoverable_start_action(
-                                W::KIND,
-                                W::VERSION,
-                                &key,
-                                lineage,
-                                false,
-                                0,
-                                false,
-                            )
-                        }),
-                        Err(_) => {}
-                    }
-                    outcome
+                        &key,
+                        lineage,
+                        true,
+                        successor.workflow_id.get(),
+                        successor.inserted,
+                    );
+                    Ok(successor)
                 })
                 .await
             })
@@ -578,10 +600,16 @@ impl DurableStore {
                 "child workflow deduplication key must contain 1 to {MAX_DEDUPLICATION_KEY_CHARS} characters"
             )));
         }
-        if let Some(existing) =
+        if let Some(keyed) =
             persistence::find_by_deduplication_key(connection, child.kind(), &deduplication_key)
                 .await?
         {
+            // Locking the keyed row first waits out a T-X2 that is superseding
+            // it, so the walk sees that T-X2's successor.
+            let keyed =
+                persistence::find_workflow_by_id_for_update(connection, WorkflowId::new(keyed.id)?)
+                    .await?;
+            let existing = lock_newest_generation(connection, keyed).await?;
             if existing.version != child.version() {
                 return Err(DurableError::DefinitionMismatch {
                     actual_kind: existing.kind,
@@ -635,6 +663,114 @@ impl DurableStore {
             inserted,
         })
     }
+}
+
+/// Follows the `restarted_from_workflow_id` chain from `row` (already locked by
+/// the caller) and returns its newest generation, locking each successor
+/// `FOR UPDATE` on the way. The unique restart key gives each row at most one
+/// successor, so the chain is linear.
+pub(crate) async fn lock_newest_generation(
+    connection: &mut DurableConnection,
+    row: WorkflowRow,
+) -> Result<WorkflowRow, DurableError> {
+    let mut current = row;
+    while let Some(successor) = durable_workflow::table
+        .filter(durable_workflow::restarted_from_workflow_id.eq(Some(current.id)))
+        .for_update()
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(connection)
+        .await
+        .optional()?
+    {
+        current = successor;
+    }
+    Ok(current)
+}
+
+/// T-X2 supersedes the blocked row `superseded` with `successor`. Parents that
+/// wait on it (`waiting_child`, or `paused` with a child wait) wait on the
+/// successor instead when it runs the same version; otherwise they receive
+/// `child_failed` with category `child_superseded`, as after an operator restart.
+async fn hand_waiting_parents_to_successor(
+    connection: &mut DurableConnection,
+    superseded: &WorkflowRow,
+    successor: WorkflowId,
+    successor_version: i32,
+    now: i64,
+) -> Result<(), DurableError> {
+    if successor_version != superseded.version {
+        return persistence::wake_waiting_parents_on_child_terminal(
+            connection,
+            superseded.id,
+            &superseded.kind,
+            superseded.version,
+            Err((
+                "child_superseded".to_string(),
+                format!(
+                    "child workflow {} was superseded by recovery generation {} at version {successor_version}",
+                    superseded.id,
+                    successor.get()
+                ),
+            )),
+            now,
+        )
+        .await;
+    }
+    let parents = durable_workflow::table
+        .filter(durable_workflow::wait_kind.eq("child"))
+        .filter(durable_workflow::wait_reference_id.eq(superseded.id))
+        .filter(
+            durable_workflow::status
+                .eq(WorkflowStatus::WaitingChild)
+                .or(durable_workflow::status.eq(WorkflowStatus::Paused)),
+        )
+        .for_update()
+        .select(WorkflowRow::as_select())
+        .load::<WorkflowRow>(connection)
+        .await?;
+    for parent in parents {
+        crate::trace::touch_wf(parent.id);
+        let changed = diesel::update(
+            durable_workflow::table
+                .find(parent.id)
+                .filter(durable_workflow::status.eq(&parent.status))
+                .filter(durable_workflow::wait_kind.eq("child"))
+                .filter(durable_workflow::wait_reference_id.eq(superseded.id)),
+        )
+        .set((
+            durable_workflow::wait_reference_id.eq(Some(successor.get())),
+            durable_workflow::updated_at.eq(now),
+        ))
+        .execute(connection)
+        .await?;
+        if changed != 1 {
+            return Err(DurableError::FencedWrite);
+        }
+        let parent_id = WorkflowId::new(parent.id)?;
+        let sequence = persistence::next_event_sequence(connection, parent_id).await?;
+        persistence::append_event(
+            connection,
+            NewWorkflowEventRow {
+                workflow_id: parent.id,
+                sequence,
+                delivery_sequence: None,
+                event_type: "child_wait_reattached".to_string(),
+                metadata_json: Some(
+                    serde_json::json!({ "from": superseded.id, "to": successor.get() }).to_string(),
+                ),
+                actor_type: Some("system".to_string()),
+                actor_id: None,
+                reason: Some(format!(
+                    "child workflow {} was superseded by recovery generation {}",
+                    superseded.id,
+                    successor.get()
+                )),
+                created_at: now,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn validate_definition<W: WorkflowHandler>() -> Result<(), DurableError> {

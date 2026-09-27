@@ -159,7 +159,10 @@ restores `sleeping` with the original `availableAt`,
 A child is an ordinary workflow row inserted in the parent's `RunChild` commit
 (`src/store.rs:409-479`) with deduplication key `child:{parentId}:{command}`
 or a caller-supplied domain key (`src/runtime/coordinator.rs:793-796`). A dedup
-hit reuses the existing row (any parent, any lineage). Parent-side states:
+hit reuses the newest recovery generation of the existing row (any parent):
+`insert_child` locks the keyed row and follows its `restartedFromWorkflowId`
+chain (`lock_newest_generation`, D4), then checks the version. Parent-side
+states:
 
 | parent state | meaning |
 |---|---|
@@ -171,9 +174,13 @@ Delivery happens in the child's terminal transaction through
 `wake_waiting_parents_on_child_terminal` (`src/persistence/workflows.rs:148-181`),
 called from: `Complete` (`src/runtime/coordinator.rs:581-589`), activation
 exhaustion (`482-492`), cancel (`src/store.rs:559-567`), admin restart
-supersession (`src/admin/control.rs:292-303`), and attach-to-already-terminal
-child (`src/runtime/coordinator.rs:835-873`). It is **not** called by
-recoverable-start supersession (`src/store.rs:256-293`; see G2).
+supersession (`src/admin/control.rs:292-303`), attach-to-already-terminal
+child (`src/runtime/coordinator.rs:835-873`), and recoverable-start
+supersession when the successor runs another version (`child_superseded`).
+When the successor runs the same version, recoverable-start supersession
+re-attaches the waiting parents to it instead (`src/store.rs`
+`hand_waiting_parents_to_successor`, history `child_wait_reattached`); the
+successor's terminal transaction then delivers the outcome (G2 fixed).
 
 ### 1.7 Schedule state and schedule run
 
@@ -450,13 +457,21 @@ old cursor, version, and fingerprint (`193-214`).
   event. Options with both a dedup key and a restart source are rejected
   (`InvalidDefinition`). Can run inside a caller transaction
   (`start_with_conn`).
-- **T-X2 start_or_restart_recoverable** (`169-311`): lock the row with
-  `(kind, dedupKey)` `FOR UPDATE`; lock the newest row of its lineage
-  (`id = root OR rootWorkflowId = root`) `FOR UPDATE`; if the newest is not
-  `failed`/`blocked`, return it; else cancel its `dead_lettered` activities,
-  move a `blocked` newest to `cancelled` (history
-  `workflow_superseded_by_recovery`; no parent wake; wait fields kept), and
-  insert a successor with no dedup key, same root, `restartedFromWorkflowId`.
+- **T-X2 start_or_restart_recoverable**: lock the row with
+  `(kind, dedupKey)` `FOR UPDATE`; follow its `restartedFromWorkflowId` chain,
+  locking each successor `FOR UPDATE`, to the newest generation
+  (`lock_newest_generation`; N1 fixed); if the newest is not
+  `failed`/`blocked`, return it; else insert a successor with no dedup key,
+  the original's root and `restartedFromWorkflowId` = the newest (a
+  restart-key collision returns `Conflict` before any other write), cancel the
+  newest's `dead_lettered` activities, and move a `blocked` newest to
+  `cancelled` (history `workflow_superseded_by_recovery`; its own wait fields
+  kept). The parents that wait on a blocked newest (`waiting_child`, or
+  `paused` with `waitKind=child`) are locked; when the successor runs the same
+  version (`W::VERSION`) their `waitReferenceId` moves to the successor
+  (status and `availableAt` unchanged; history `child_wait_reattached` with
+  `{from, to}`), otherwise they are woken with `child_failed`
+  (`child_superseded`) as after an operator restart (G2 fixed).
 - **T-X3 cancel_with_conn** (`58-93`): inside the caller's transaction; lock
   workflow `FOR UPDATE`; terminal → no-op; else `cancel_locked_workflow`
   (`503-568`): cancel pending/running activities (closing open attempts),
@@ -561,8 +576,10 @@ rows. **ENFORCED** (`src/runtime/coordinator.rs:446-451`, `562`;
 
 **S7. Wait coupling** (table in §1.1) holds for non-terminal rows. **ENFORCED**
 by construction; no DB constraint. Terminal rows cancelled through T-X2 or
-T-A5 keep stale wait fields (`src/store.rs:262-269`,
-`src/admin/control.rs:273-279`); all readers also filter on `status`.
+T-A5 keep stale wait fields (`src/store.rs` `start_or_restart_recoverable_with_conn`,
+`src/admin/control.rs:273-279`); all readers also filter on `status`. A
+parent that T-X2 re-attaches keeps `waitKind=child` with the successor as
+`waitReferenceId`, so S7 holds for it.
 
 **S8. Activation attempts are bounded for handler errors.** Each T-C3
 increments `activationAttempts`; at `min(maxActivationAttempts, config)` the
@@ -641,12 +658,24 @@ transaction. **ENFORCED**, with one exception by one (G7).
 
 **S19. One successor per source; one live generation per recovery root.** At
 most one row per `restartedFromWorkflowId` (M:34; admin pre-check
-`src/admin/control.rs:218-228`). A colliding start returns `Conflict` and
-leaves the caller's transaction usable (test
-`second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_usable`). T-X2 locks the original and the newest
-generation and restarts only a `failed`/`blocked` newest, so concurrent
-recoveries and admin retries leave one live generation. **ENFORCED** (test
-`recoverable_start_fences_dead_letter_retry_and_races_to_one_live_generation`).
+`src/admin/control.rs:218-228`). A second admin restart of a source returns
+`Conflict` (test
+`second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_usable`);
+a restart-key collision inside `insert_prepared` also returns `Conflict` and
+leaves the caller's transaction usable. Only the engine sets a restart
+source: `StartOptions::restarted_from_workflow_id` and `root_workflow_id` are
+crate-private (N3 fixed), and T-X2 and T-A5 restart only a terminal,
+`blocked` or (T-A5) `paused` source, cancelling a non-terminal one in the
+same transaction, so every source with a successor is terminal. T-X2 locks the original and the newest
+generation (the end of the original's `restartedFromWorkflowId` chain, each
+row locked on the way) and restarts only a `failed`/`blocked` newest, so
+concurrent recoveries and admin retries leave one live generation per chain,
+and a recovery of a keyed child never touches another row under the same
+root (N1 fixed). **ENFORCED** (tests
+`recoverable_start_fences_dead_letter_retry_and_races_to_one_live_generation`,
+`g2_keyed_child_lineage_after_two_recoveries`,
+`n1_recoverable_start_on_child_key_leaves_blocked_sibling_alone`,
+`n1_recoverable_start_on_child_key_returns_its_own_row`).
 
 ### Approvals and timers
 
@@ -673,14 +702,23 @@ restart budget runs out.
 **S23. A child outcome reaches each waiting parent at most once, and never a
 parent that stopped waiting.** The wake is fenced on
 `(status, waitKind, waitReferenceId)` and clears the wait
-(`src/persistence/workflows.rs:192-199`, `253-268`). **ENFORCED**.
+(`src/persistence/workflows.rs:192-199`, `253-268`). A T-X2 re-attach is
+fenced the same way and moves the wait to the successor, so the superseded
+row never delivers to that parent and the successor delivers once.
+**ENFORCED**.
 
 **S24. A child outcome reaches each parent that waits on it when the child
-becomes terminal, for every terminal transition except T-X2 supersession.**
-Covers the attach race: a parent that attaches to an existing child locks
-the child and wakes itself if it is already terminal
-(`src/runtime/coordinator.rs:835-873`). **ENFORCED** in that scope; T-X2
-violates it (G2).
+becomes terminal, for every terminal transition.** Covers the attach race: a
+parent that attaches to an existing child locks the child and wakes itself if
+it is already terminal (`src/runtime/coordinator.rs:835-873`). T-X2
+supersession of a blocked child either re-attaches its waiting parents to the
+successor (same version) or wakes them with `child_superseded` in the same
+transaction, so no parent waits on a terminal child. **ENFORCED** (G2 fixed;
+model `inv_S24_parentWakes` in `safety`; tests
+`g2_recoverable_start_wakes_parent_of_superseded_blocked_child`,
+`g2_reattached_parent_completes_with_the_successor_output`,
+`admin_controls.rs`
+`recoverable_start_at_a_new_version_fails_the_waiting_parent_as_superseded`).
 
 **S25. Cancellation is atomic for the workflow's own work.** One transaction
 cancels the workflow, its pending/running activities (closing attempts), its
@@ -782,8 +820,8 @@ attempt, returns it to `pending`, and invalidates the worker token, with
   approvals (`src/store.rs:516-517`). Child workflows keep running;
   `parentWorkflowId` is never read. A later child outcome is dropped because
   the parent no longer waits (S23). The same holds for restart supersession.
-- **"Child results are delivered exactly once."** Holds as S23 + S24 only;
-  T-X2 breaks the at-least-once half (G2).
+- **"Child results are delivered exactly once."** Holds as S23 + S24 only
+  (per wait; a re-attached parent receives the successor's outcome).
 - **"Operation keys are idempotent."** The engine does not enforce this (S34).
 
 ---
@@ -848,7 +886,8 @@ workflow becomes terminal (blocked or paused ones block it indefinitely).
 **ENFORCED**.
 
 **L11. A parent waiting on a child becomes ready when the child becomes
-terminal** (same transaction), except under G2. Not guaranteed if the child
+terminal** (same transaction; after a T-X2 re-attach, when the successor
+becomes terminal). Not guaranteed if the child
 never terminates (G8). **ENFORCED**.
 
 **L12. Cancellation, pause, or restart stops an in-flight activity handler
@@ -962,10 +1001,10 @@ non-terminating child are stable states that need an operator.
 ## 6. Suspected gaps
 
 Status: G4 is closed for library transactions (P4, READ COMMITTED).
-G1, G3, G9 and G10 are fixed, and N4 (found by the concurrent trace workload) is
-found and fixed; their tests in `tests/gaps.rs` run un-ignored. G2, G6, G8
-and G11, and the model findings N1 and N2 (`spec/README.md`), are
-confirmed by ignored tests in `tests/gaps.rs`.
+G1, G2, G3, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
+is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixed;
+their tests in `tests/gaps.rs` run un-ignored. G6, G8 and G11, and the model
+finding N2, are confirmed by ignored tests in `tests/gaps.rs`.
 
 Each item below was traced from the code; the status line above records
 which ones a test has since confirmed or closed.
@@ -1019,6 +1058,42 @@ application calls `start_or_restart_recoverable(CK, key "k")` → C
 forever; resuming P after a pause fails with Conflict
 (`src/admin/control.rs:988-991`). A later `child_with_key(..., "k")` resolves
 to C and fails at once.
+**Fixed**: T-X2 inserts the successor first, then locks the parents waiting on
+the blocked row (`waiting_child`, or `paused` with a child wait). When the
+successor runs the same version it re-points their wait to the successor
+(fenced; history `child_wait_reattached` `{from, to}`); otherwise it wakes
+them with `child_failed` (`child_superseded`), as T-A5 does. A later
+`child_with_key(..., "k")` resolves to the newest generation (D4). The model
+always re-attaches (versions are not modeled). Tests:
+`g2_recoverable_start_wakes_parent_of_superseded_blocked_child`,
+`g2_reattached_parent_completes_with_the_successor_output`,
+`g2_keyed_child_lineage_after_two_recoveries`,
+`d4_child_with_key_after_recovery_attaches_to_the_newest_generation`, and
+`admin_controls.rs`
+`recoverable_start_at_a_new_version_fails_the_waiting_parent_as_superseded`
+(not recorded for trace checking: a version change is excluded as
+`versions:<kind>`).
+
+**N1. T-X2 on a child key used the root's whole tree as the lineage**
+(model finding). T-X2 took the newest row of the same kind with
+`id = root OR rootWorkflowId = root`. For a keyed child, root is the parent's
+root, so that set holds every child of the same kind in the tree: recovering
+key k superseded a blocked auto-keyed sibling, or returned a newer live
+sibling. **Fixed**: the newest generation is the end of the keyed row's
+`restartedFromWorkflowId` chain (`lock_newest_generation`; no schema change,
+the unique restart key makes the chain linear). Tests:
+`n1_recoverable_start_on_child_key_leaves_blocked_sibling_alone`,
+`n1_recoverable_start_on_child_key_returns_its_own_row`.
+
+**N3. The public restart field accepted a live source** (model finding).
+`StartOptions::restarted_from_workflow_id` was public, and `insert_prepared`
+stored it after only the restart-key uniqueness check, so an application
+could start a "successor" of a running workflow, or take a failed row's
+restart key outside T-X2. **Fixed**: `restarted_from_workflow_id` and
+`root_workflow_id` are `pub(crate)`; only T-X2 and the admin restart (T-A5)
+set them. The model's `TX1_Start` needs a terminal `from`, and
+`inv_S19_sourceTerminal` is part of `safety`. Test: the trybuild case
+`tests/ui/fail/start_options_restart_field_private.rs`.
 
 **G3. A poison-pill `step` stops runtimes.** Lease recovery does not count
 activation attempts (`src/runtime/coordinator.rs:296-321`). A `step` that

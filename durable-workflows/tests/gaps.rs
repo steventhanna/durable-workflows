@@ -17,7 +17,7 @@ use diesel_async::SimpleAsyncConnection;
 use durable_workflows::{
     admin::{AdminControlService, Operator},
     persistence::{database_now_millis, find_activity_by_id, find_workflow_by_id, WorkflowRow},
-    schema::{durable_activity, durable_workflow},
+    schema::{durable_activity, durable_workflow, durable_workflow_event},
     ActivityContext, ActivityError, ActivityHandler, ActivityId, ActivityRegistry, ActivityTopic,
     ActivityWorker, CoordinatorConfig, DurableActivity, DurableError, DurableFlow, DurablePool,
     DurableRuntime, DurableStore, DurableWorkflow, RetryPolicy, RuntimeConfig, StartOptions,
@@ -178,6 +178,57 @@ gap_flow!(G2Parent {}, "gap_g2_parent", 1, |_this, ctx| {
     ctx.child_with_key(&G2Child {}, "g2-key").await
 });
 
+/// Blocks on its first generation (`fail`); a recovery generation started
+/// with `fail: false` returns `value`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct G2RecoveringChild {
+    fail: bool,
+    value: i32,
+}
+
+impl DurableWorkflow for G2RecoveringChild {
+    const KIND: &'static str = "gap_g2_recovering_child";
+    const VERSION: i32 = 1;
+}
+
+#[async_trait]
+impl DurableFlow for G2RecoveringChild {
+    type Context = GapContext;
+    type Output = i32;
+
+    async fn run(&self, ctx: &mut WfCtx<'_, GapContext>) -> Result<i32, WfError> {
+        if self.fail {
+            ctx.run(&G2FailingActivity).await?;
+        }
+        Ok(self.value)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct G2ReattachParent {}
+
+impl DurableWorkflow for G2ReattachParent {
+    const KIND: &'static str = "gap_g2_reattach_parent";
+    const VERSION: i32 = 1;
+}
+
+#[async_trait]
+impl DurableFlow for G2ReattachParent {
+    type Context = GapContext;
+    type Output = i32;
+
+    async fn run(&self, ctx: &mut WfCtx<'_, GapContext>) -> Result<i32, WfError> {
+        ctx.child_with_key(
+            &G2RecoveringChild {
+                fail: true,
+                value: 1,
+            },
+            "g2-reattach",
+        )
+        .await
+    }
+}
+
 gap_flow!(G3Panic {}, "gap_g3_panic", 1, |_this, _ctx| {
     panic!("poison-pill step");
 });
@@ -254,6 +305,8 @@ fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
             G1GatedPanic,
             G2Child,
             G2Parent,
+            G2RecoveringChild,
+            G2ReattachParent,
             G3Panic,
             G3Hang,
             G4Child,
@@ -431,7 +484,6 @@ async fn expire_lease_by_database_clock(pool: &DurablePool, workflow_id: Workflo
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "confirms G2: recoverable start cancels the blocked keyed child but its parent stays waiting_child on it"]
 async fn g2_recoverable_start_wakes_parent_of_superseded_blocked_child() {
     let Some(pool) = support::fresh_pool().await else {
         return;
@@ -485,6 +537,212 @@ async fn g2_recoverable_start_wakes_parent_of_superseded_blocked_child() {
         parent.status.as_str(),
         child_id.get(),
         successor.workflow_id.get(),
+    );
+}
+
+/// Starts `parent`, runs it to its child wait and runs that child until its
+/// only activity dead-letters and blocks it. Returns the blocked child.
+async fn block_keyed_child<W>(
+    pool: &DurablePool,
+    context: &Arc<GapContext>,
+    coordinator: &WorkflowCoordinator<GapContext>,
+    parent: &W,
+) -> (WorkflowId, WorkflowId)
+where
+    W: durable_workflows::WorkflowHandler,
+{
+    let parent_id = DurableStore::new(pool.clone())
+        .start(parent, StartOptions::default())
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    assert_eq!(
+        coordinator.activate_one().await.expect("parent activates"),
+        Some(parent_id)
+    );
+    let child_id = id(load(pool, parent_id)
+        .await
+        .wait_reference_id
+        .expect("child reference"));
+    block_child(pool, context, coordinator, child_id).await;
+    (parent_id, child_id)
+}
+
+/// Runs a ready `child` to its activity and fails that activity, so the child blocks.
+async fn block_child(
+    pool: &DurablePool,
+    context: &Arc<GapContext>,
+    coordinator: &WorkflowCoordinator<GapContext>,
+    child_id: WorkflowId,
+) {
+    assert_eq!(
+        coordinator.activate_one().await.expect("child activates"),
+        Some(child_id)
+    );
+    worker(pool, context.clone())
+        .run_one("gap_g2")
+        .await
+        .expect("activity runs")
+        .expect("activity claim");
+    assert_eq!(load(pool, child_id).await.status.as_str(), "blocked");
+}
+
+async fn reattached_events(pool: &DurablePool, workflow_id: WorkflowId) -> Vec<Option<String>> {
+    let mut connection = pool.get().await.expect("test connection");
+    durable_workflow_event::table
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::event_type.eq("child_wait_reattached"))
+        .order(durable_workflow_event::sequence.asc())
+        .select(durable_workflow_event::metadata_json)
+        .load::<Option<String>>(&mut connection)
+        .await
+        .expect("history loads")
+}
+
+#[tokio::test]
+async fn g2_reattached_parent_completes_with_the_successor_output() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let (parent_id, child_id) =
+        block_keyed_child(&pool, &context, &coordinator, &G2ReattachParent {}).await;
+
+    let successor = DurableStore::new(pool.clone())
+        .start_or_restart_recoverable(
+            &G2RecoveringChild {
+                fail: false,
+                value: 42,
+            },
+            StartOptions::default().with_deduplication_key("g2-reattach"),
+        )
+        .await
+        .expect("recoverable start");
+    assert!(successor.inserted);
+    assert_eq!(load(&pool, child_id).await.status.as_str(), "cancelled");
+    let parent = load(&pool, parent_id).await;
+    assert_eq!(parent.status.as_str(), "waiting_child");
+    assert_eq!(parent.wait_reference_id, Some(successor.workflow_id.get()));
+    let events = reattached_events(&pool, parent_id).await;
+    assert_eq!(events.len(), 1);
+    let metadata: serde_json::Value =
+        serde_json::from_str(events[0].as_deref().expect("reattach metadata")).expect("JSON");
+    assert_eq!(
+        metadata,
+        serde_json::json!({ "from": child_id.get(), "to": successor.workflow_id.get() })
+    );
+
+    assert_eq!(
+        coordinator.activate_one().await.expect("successor runs"),
+        Some(successor.workflow_id)
+    );
+    assert_eq!(
+        load(&pool, successor.workflow_id).await.status.as_str(),
+        "succeeded"
+    );
+    assert_eq!(
+        coordinator.activate_one().await.expect("parent resumes"),
+        Some(parent_id)
+    );
+    let parent = load(&pool, parent_id).await;
+    assert_eq!(parent.status.as_str(), "succeeded");
+    assert_eq!(parent.result_json.as_deref(), Some("42"));
+}
+
+#[tokio::test]
+async fn g2_keyed_child_lineage_after_two_recoveries() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let store = DurableStore::new(pool.clone());
+    let recover = || {
+        store.start_or_restart_recoverable(
+            &G2Child {},
+            StartOptions::default().with_deduplication_key("g2-key"),
+        )
+    };
+    let (parent_id, keyed_id) =
+        block_keyed_child(&pool, &context, &coordinator, &G2Parent {}).await;
+
+    let first = recover().await.expect("first recovery");
+    assert!(first.inserted);
+    block_child(&pool, &context, &coordinator, first.workflow_id).await;
+    let second = recover().await.expect("second recovery");
+    assert!(second.inserted);
+    let again = recover().await.expect("live generation is returned");
+    assert_eq!(again.workflow_id, second.workflow_id);
+    assert!(!again.inserted);
+
+    let keyed = load(&pool, keyed_id).await;
+    let first_row = load(&pool, first.workflow_id).await;
+    let second_row = load(&pool, second.workflow_id).await;
+    assert_eq!(keyed.status.as_str(), "cancelled");
+    assert_eq!(first_row.status.as_str(), "cancelled");
+    assert_eq!(second_row.status.as_str(), "ready");
+    assert_eq!(first_row.restarted_from_workflow_id, Some(keyed_id.get()));
+    assert_eq!(
+        second_row.restarted_from_workflow_id,
+        Some(first.workflow_id.get())
+    );
+    assert_eq!(keyed.root_workflow_id, Some(parent_id.get()));
+    assert_eq!(first_row.root_workflow_id, Some(parent_id.get()));
+    assert_eq!(second_row.root_workflow_id, Some(parent_id.get()));
+    assert_eq!(first_row.deduplication_key, None);
+    assert_eq!(second_row.deduplication_key, None);
+
+    let parent = load(&pool, parent_id).await;
+    assert_eq!(parent.status.as_str(), "waiting_child");
+    assert_eq!(parent.wait_reference_id, Some(second.workflow_id.get()));
+    assert_eq!(reattached_events(&pool, parent_id).await.len(), 2);
+}
+
+#[tokio::test]
+async fn d4_child_with_key_after_recovery_attaches_to_the_newest_generation() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let store = DurableStore::new(pool.clone());
+    let (_, keyed_id) = block_keyed_child(&pool, &context, &coordinator, &G2Parent {}).await;
+    let successor = store
+        .start_or_restart_recoverable(
+            &G2Child {},
+            StartOptions::default().with_deduplication_key("g2-key"),
+        )
+        .await
+        .expect("recoverable start");
+    assert!(successor.inserted);
+    assert_eq!(
+        coordinator.activate_one().await.expect("successor runs"),
+        Some(successor.workflow_id)
+    );
+    assert_eq!(
+        load(&pool, successor.workflow_id).await.status.as_str(),
+        "waiting_activity"
+    );
+
+    let late_parent = store
+        .start(&G2Parent {}, StartOptions::default())
+        .await
+        .expect("late parent starts")
+        .workflow_id;
+    assert_eq!(
+        coordinator.activate_one().await.expect("late parent runs"),
+        Some(late_parent)
+    );
+    let late = load(&pool, late_parent).await;
+    assert_eq!(late.status.as_str(), "waiting_child");
+    assert_eq!(
+        late.wait_reference_id,
+        Some(successor.workflow_id.get()),
+        "child_with_key attached to {:?}, not the newest generation {} of keyed row {}",
+        late.wait_reference_id,
+        successor.workflow_id.get(),
+        keyed_id.get(),
     );
 }
 
@@ -1471,7 +1729,6 @@ async fn n1_tree(block_sibling: bool) -> Option<N1Tree> {
 }
 
 #[tokio::test]
-#[ignore = "confirms N1: recoverable start on child key k cancels the blocked auto-keyed sibling and restarts it"]
 async fn n1_recoverable_start_on_child_key_leaves_blocked_sibling_alone() {
     let Some(tree) = n1_tree(true).await else {
         return;
@@ -1508,7 +1765,6 @@ async fn n1_recoverable_start_on_child_key_leaves_blocked_sibling_alone() {
 }
 
 #[tokio::test]
-#[ignore = "confirms N1: recoverable start on child key k returns the id of an unrelated running sibling"]
 async fn n1_recoverable_start_on_child_key_returns_its_own_row() {
     let Some(tree) = n1_tree(false).await else {
         return;

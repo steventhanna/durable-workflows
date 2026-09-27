@@ -155,7 +155,7 @@ target/debug/durable-trace gen --in "$traces" --out spec/traces \
   --expect-violation spec/traces/gaps.yaml >"$logs/gen.log"
 
 # --- 5. replay --------------------------------------------------------------
-phase "replaying (spec/trace-check.sh ${check_args[*]})"
+phase "replaying (spec/trace-check.sh ${check_args[*]+${check_args[*]}})"
 status=0
 DURABLE_TRACE=$root/target/debug/durable-trace spec/trace-check.sh ${check_args[@]+"${check_args[@]}"} || status=$?
 phase "done (exit $status)"

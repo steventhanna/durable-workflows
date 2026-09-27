@@ -219,17 +219,12 @@ These gaps are confirmed by ignored tests in
 are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
 [`spec/README.md`](spec/README.md).
 
-- **G2** — A recoverable start on a blocked keyed child cancels that child
-  but does not wake its parent, which stays `waiting_child` forever.
 - **G6** — Under a concurrent child deduplication race, a parent can wait on
   a child of a different definition version; the parent then fails on replay.
 - **G8** — `child_with_key` can resolve to the calling workflow (or an
   ancestor), which then waits on itself forever.
 - **G11** — Cancelling a parent workflow does not cancel its children; they
   keep running.
-- **N1** — A recoverable start on a child key can cancel and restart a
-  different sibling child in the same tree, or return an unrelated sibling's
-  id.
 - **N2** — An application cancel or operator pause frees the topic
   concurrency slot while the cancelled handler is still running, so a cap-1
   topic can briefly run two handlers.

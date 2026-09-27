@@ -28,7 +28,6 @@ done
 # expected to hold (the code: READ COMMITTED)
 run durable_mc safety hold
 run durable_mc safetyRc hold                      # safety + S17 at claim and between commits (G7 closed)
-run durable_mc inv_S24_exceptTX2 hold
 run durable_mc_act safetyRc hold                  # activity-only instance: more T-W1 interleavings per sample
 run durable_mc_env safety hold                    # external writes (invalid bounds) break no other invariant
 # historical REPEATABLE READ T-W1 (pre-P4)
@@ -37,12 +36,9 @@ run durable_mc_rr inv_S17_capAlways violate       # G7
 run durable_mc_act_rr inv_S17_capAlways violate   # G7
 run durable_mc_act_rr inv_S17_capAtClaim violate  # G7
 # suspected gaps (expected to be violated)
-run durable_mc inv_S24_parentWakes violate        # G2
 run durable_mc inv_G11_cancelReachesChildren violate
-run durable_mc inv_N1_tx2OwnLineage violate       # N1
 run durable_mc inv_S13_topicConcurrency violate   # N2
 run durable_mc_act inv_S13_topicConcurrency violate
-run durable_mc inv_S19_sourceTerminal violate     # N3
 run durable_mc_drift inv_S13_oneHandler violate   # S13 clock assumption
 run durable_mc_env wit_quarantined violate        # G10 fixed: an invalid row is quarantined (non-vacuity)
 # witnesses (non-vacuity; expected to be violated)
@@ -52,7 +48,7 @@ for w in wit_S3_concurrentStep wit_blocked wit_childSucceeded wit_activitySuccee
 done
 # deeper runs for properties whose traces need more steps now that T-W1 takes ~5 steps
 STEPS2=${3:-80}
-for spec in "durable_mc_drift inv_S13_oneHandler" "durable_mc inv_S13_topicConcurrency" "durable_mc wit_revivedLease" "durable_mc inv_S24_parentWakes"; do
+for spec in "durable_mc_drift inv_S13_oneHandler" "durable_mc inv_S13_topicConcurrency" "durable_mc wit_revivedLease"; do
   set -- $spec
   STEPS=$STEPS2 run "$1" "$2" violate
 done

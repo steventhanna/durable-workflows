@@ -1,29 +1,31 @@
 {
   "mysql": {
-    "pass": 85,
-    "violation_confirmed": 6,
+    "pass": 90,
+    "violation_confirmed": 3,
     "excluded": {
-      "deferred_commit": 2,
+      "deferred_commit": 1,
       "empty": 5,
       "external_invariant:inv_S11_openAttempt": 6,
       "external_invariant:inv_S15_actWfCoupling": 1,
       "external_invariant:inv_S15_actWfCoupling,inv_S5_delivery,inv_S7_waitCoupling": 1,
       "external_invariant:inv_S1_wfLease": 1,
       "external_invariant:inv_S9_actLease": 4,
+      "unmodeled:admin_restart": 1,
       "unmodeled:timer": 2
     }
   },
   "postgres": {
-    "pass": 85,
-    "violation_confirmed": 6,
+    "pass": 90,
+    "violation_confirmed": 3,
     "excluded": {
-      "deferred_commit": 2,
+      "deferred_commit": 1,
       "empty": 5,
       "external_invariant:inv_S11_openAttempt": 6,
       "external_invariant:inv_S15_actWfCoupling": 1,
       "external_invariant:inv_S15_actWfCoupling,inv_S5_delivery,inv_S7_waitCoupling": 1,
       "external_invariant:inv_S1_wfLease": 1,
       "external_invariant:inv_S9_actLease": 4,
+      "unmodeled:admin_restart": 1,
       "unmodeled:timer": 2
     }
   }

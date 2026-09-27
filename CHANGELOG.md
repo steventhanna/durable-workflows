@@ -70,8 +70,14 @@ Compared with the production-internal version it was extracted from:
 - A start that collides on the restart key (`uq_durable_workflow_restart`)
   returns `DurableError::Conflict` and leaves the caller's transaction
   usable (it returned `InvalidState`).
-- `StartOptions` with both a deduplication key and a restart source
-  (`restarted_from_workflow_id`) is rejected with `InvalidDefinition`.
+- `StartOptions::restarted_from_workflow_id` and `StartOptions::root_workflow_id`
+  are crate-private (N3): only a recoverable start and the admin restart set
+  a restart source, so an application can no longer start a "successor" of a
+  live workflow or take a failed workflow's restart key. Use
+  `start_or_restart_recoverable` or `AdminControlService::restart_workflow`.
+  Struct-update syntax (`StartOptions { .., ..StartOptions::default() }`) no
+  longer compiles outside the crate; use the new builders
+  `StartOptions::with_schedule_run_id` and `StartOptions::with_available_at`.
 - `ScheduleHandler::start_occurrence` takes `&mut DurableConnection`. It must
   return every error and must not continue after a failed statement
   (Postgres aborts the transaction); use `connection.transaction(..)` for a
@@ -83,7 +89,9 @@ Compared with the production-internal version it was extracted from:
   compile time.
 - The trace-checking interface is version 5 (`spec/README.md`, "Changes in
   v5"): `TW1_Claim` records the rows the claim quarantined, and `TW1_Error`
-  is gone.
+  is gone; `TX2_RecoverableStart`'s newest generation follows the restart
+  chain and re-points waiting parents (G2, N1), and `TC2_RunChild` attaches
+  to the newest generation of a keyed child (D4).
 
 ### Removed
 
@@ -121,10 +129,23 @@ Compared with the production-internal version it was extracted from:
   (reachable through a stored or `from_validated` policy) saturates at
   `u64::MAX` instead of wrapping to a short delay, so delays stay within the
   jitter bounds and never shrink as attempts grow.
+- G2: `start_or_restart_recoverable` on a blocked child no longer strands
+  the parents waiting on it. When the successor runs the same workflow
+  version, each waiting parent (`waiting_child`, or `paused` on the child)
+  now waits on the successor (history `child_wait_reattached` with
+  `{from, to}`) and receives its outcome; otherwise the parents are woken
+  with `child_failed` (category `child_superseded`), as after an operator
+  restart.
+- N1: `start_or_restart_recoverable` finds the newest generation by
+  following `restarted_from_workflow_id` from the keyed row, so a recovery
+  of a keyed child no longer supersedes or returns a different child of the
+  same kind in the same tree.
+- D4: `child_with_key` on a key whose row was superseded by a recoverable
+  start attaches to the newest generation instead of the cancelled row.
 
 ### Known issues
 
-The confirmed protocol gaps G2, G6, G8, G11, N1 and N2 have
+The confirmed protocol gaps G6, G8, G11 and N2 have
 ignored reproduction tests in `durable-workflows/tests/gaps.rs` and reproduce
 on both backends. See the "Known issues" section of the README and
 `docs/INVARIANTS.md` §6.

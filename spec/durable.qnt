@@ -74,15 +74,17 @@
  *   S12 inv_S12_attemptsBounded   S13 inv_S13_oneHandler, inv_S13_topicConcurrency
  *   S14 inv_S14_actTerminal       S15 inv_S15_actWfCoupling    S16 inv_S16_successOnce
  *   S17 inv_S17_capAtClaim (as stated), inv_S17_capAlways (between commits)
- *   S18 inv_S18_dedup             S19 inv_S19_successor, inv_S19_sourceTerminal   S23 inv_S23_childOnce
- *   S24 inv_S24_exceptTX2 (as claimed), inv_S24_parentWakes (unrestricted)   S25 inv_S25_cancelAtomic
- *   G2  inv_S24_parentWakes (T-X2 path)          G7  inv_S17_capAlways (RR_SNAPSHOT only)
+ *   S18 inv_S18_dedup             S19 inv_S19_successor, inv_S19_sourceTerminal (both in `safety`)   S23 inv_S23_childOnce
+ *   S24 inv_S24_parentWakes (every path, T-X2 included)   S25 inv_S25_cancelAtomic
+ *   G2  fixed: T-X2 re-points the superseded row's waiting parents to its successor (S24 in `safety`)
+ *   G7  inv_S17_capAlways (RR_SNAPSHOT only)
  *   G10 fixed: TW1_QuarantineRow (an invalid row no longer aborts every topic's claims)
  *   G11 inv_G11_cancelReachesChildren
- *   N1  inv_N1_tx2OwnLineage (T-X2 lineage query on a child key: supersession and ReturnLatest)
+ *   N1  fixed: T-X2's newest generation is the end of the keyed row's restartedFrom chain (tx2Latest)
+ *   D4  TC2_RunChild attaches to the newest generation of the keyed row (newestGen)
  *   G1  inv_G1_noSelfCancelFromOperator (fixed; in `safety`: a coordinator never errors)
  *   N2  inv_S13_topicConcurrency (executing handlers per topic can exceed the cap after cancel)
- *   N3  inv_S19_sourceTerminal (public StartOptions.restarted_from_workflow_id accepts a live source)
+ *   N3  fixed: StartOptions.restarted_from_workflow_id is crate-private; TX1_Start's `from` must be terminal
  *
  * Abstractions (INVARIANTS §7.2): payloads, state JSON, history events,
  * errors, backoff and the reconcile retry delay (nondeterministic 0/1 tick; a jittered
@@ -154,7 +156,7 @@ module durable {
   type Proc = { claims: int -> Claim, execs: Set[Exec], hbs: Set[Hb], tw1: int -> Tw1, topicHolder: int }
   type Ghost = {
     staleWfCommit: bool, staleActCommit: bool, capExceededAtClaim: bool,
-    tx2OutsideLineage: bool, noEventError: bool,
+    noEventError: bool,
     revivedExpiredLease: bool, nextHb: int,
     lastIssuedWf: int -> int, lastIssuedAct: int -> int, taskErrors: int -> int,
     // restart budget per task (supervisor.rs: cumulative per TaskSpec, in process memory)
@@ -249,16 +251,6 @@ module durable {
       else acc
     })
 
-  // follow restartedFrom from x; true iff orig is on the chain
-  pure def inLineage(d: Db, x: int, orig: int): bool = {
-    val walk = WF_IDS.fold({ cur: x, found: x == orig }, (st, i) => {
-      val nxt = if (st.cur == 0) 0 else d.wf.get(st.cur).restartedFrom
-      { cur: nxt, found: st.found or (nxt != 0 and nxt == orig) }
-    })
-    walk.found
-  }
-
-  pure def maxOf(s: Set[int]): int = s.fold(0, (m, x) => if (x > m) x else m)
 
   //------------------------------------------------------ T-W1 row locks
   pure def actLocked(p: Proc, a: int): bool = RUNTIMES.exists(r => p.tw1.get(r).lockA.contains(a))
@@ -316,10 +308,22 @@ module durable {
   pure def successorsOf(d: Db, src: int): Set[int] =
     WF_IDS.filter(x => src != 0 and d.wf.get(x).status != "none" and d.wf.get(x).restartedFrom == src)
   pure def anyOf(s: Set[int]): int = s.fold(0, (acc, x) => x)
+  // store.rs lock_newest_generation: follow the restartedFrom chain from x to its end
+  // (S19: at most one successor per row, so the chain is linear); 0 stays 0
+  pure def newestGen(d: Db, x: int): int =
+    WF_IDS.fold(x, (cur, i) => { val s = successorsOf(d, cur); if (s == Set()) cur else anyOf(s) })
+  // T-X2 (G2 fixed): every parent waiting on the superseded row c waits on its successor
+  // instead. The code re-attaches only when the successor runs c's version and otherwise
+  // wakes the parents with child_failed (child_superseded); versions are not modeled.
+  pure def reattachParents(d: Db, c: int, succ: int): Db =
+    WF_IDS.fold(d, (acc, p) => if (waitsOnChild(acc.wf.get(p), c)) setWf(acc, p, acc.wf.get(p).with("waitRef", succ)) else acc)
 
   // T-X1: start_with_conn -> insert_prepared -> insert_started. `from` =
   // StartOptions.restarted_from_workflow_id (0 = none). Both a key and `from` ->
-  // InvalidDefinition before any SQL (not a step).
+  // InvalidDefinition before any SQL (not a step). N3 fixed: the field is crate-private and
+  // only T-A5 (admin restart) sets it; T-A5 is recorded as Unmodeled, and it may restart a
+  // paused or blocked source, which it cancels in the same transaction. The model's TX1_Start
+  // with `from` stands for T-A5 on a terminal source, so `from` must be terminal (S19).
   //   inserted = true : wNew = db.nextWf, a new ready row
   //   inserted = false, key != 0 : dedup hit, wNew = the existing row, no write
   //   inserted = false, key == 0 : restart-key collision -> Conflict, wNew = 0, no row
@@ -328,7 +332,7 @@ module durable {
     val succ = successorsOf(db, from)
     all {
       not(key != NO_KEY and from != 0),
-      from == 0 or (WF_IDS.contains(from) and db.wf.get(from).status != "none"),
+      from == 0 or (WF_IDS.contains(from) and isTerminal(db.wf.get(from).status)),
       if (inserted) all {
         existing == Set(), succ == Set(), wNew == db.nextWf, wNew <= MAX_WF,
         commitAt(newStarted(db, wNew, { ...emptyWf, status: "ready", kind: kind, dedup: key, availableAt: tnow, restartedFrom: from }),
@@ -341,22 +345,19 @@ module durable {
     }
   }
 
-  // T-X2 lookups: the original (kind, key) row and the newest row of its "lineage":
-  // same kind and (id = root or rootWorkflowId = root), root = original's root
+  // T-X2 lookups: the original (kind, key) row and its newest generation, the end of its
+  // restartedFrom chain (N1 fixed: no longer the newest row of the original's root)
   pure def tx2Orig(d: Db, kind: str, key: int): int = anyOf(rowsWithKey(d, kind, key))
-  pure def tx2Latest(d: Db, kind: str, key: int): int = {
-    val orig = tx2Orig(d, kind, key)
-    val root = if (orig == 0) 0 else rootOf(d, orig)
-    maxOf(WF_IDS.filter(x => orig != 0 and d.wf.get(x).status != "none" and d.wf.get(x).kind == kind
-                             and (x == root or d.wf.get(x).root == root)))
-  }
+  pure def tx2Latest(d: Db, kind: str, key: int): int = newestGen(d, tx2Orig(d, kind, key))
 
   // T-X2: start_or_restart_recoverable_with_conn(kind, key). orig/latest are the rows the
   // code locks (0 = none); sNew is the inserted row (0 = none).
   //   orig = 0                          : insert (kind, key)           -> TX2_StartNew
   //   superseded = false, latest live   : return latest, no write      -> TX2_ReturnLatest
   //   superseded = false, successor exists: Conflict, all rolled back  -> TX2_Conflict
-  //   superseded = true                 : cancel latest's dead letters, blocked -> cancelled, successor sNew
+  //                                       (unreachable here: latest ends its chain; the code keeps the path)
+  //   superseded = true                 : successor sNew, cancel latest's dead letters,
+  //                                       blocked -> cancelled and its waiting parents re-pointed to sNew
   action TX2_RecoverableStart(kind: str, key: int, orig: int, latest: int, superseded: bool, sNew: int, tnow: int): bool = {
     val root = if (orig == 0) 0 else rootOf(db, orig)
     val lr = db.wf.get(latest)
@@ -373,10 +374,7 @@ module durable {
                  proc, ghost, "TX2_StartNew", tnow),
       } else if (not(superseded)) all {
         sNew == 0,
-        // N1: the returned row need not be on orig's restart chain (an unrelated sibling)
-        if (not(failedOrBlocked))
-          commitAt(db, proc, ghost.with("tx2OutsideLineage", ghost.tx2OutsideLineage or not(inLineage(db, latest, orig))),
-                   "TX2_ReturnLatest", tnow)
+        if (not(failedOrBlocked)) commitAt(db, proc, ghost, "TX2_ReturnLatest", tnow)
         else all { succ != Set(), succ.forall(x => not(wfLocked(proc, x))), commitAt(db, proc, ghost, "TX2_Conflict", tnow) },
       } else all {
         failedOrBlocked, succ == Set(), sNew == db.nextWf, sNew <= MAX_WF,
@@ -385,11 +383,11 @@ module durable {
         val d1 = ACT_IDS.fold(db, (acc, a) =>
           if (acc.act.get(a).wf == latest and acc.act.get(a).status == "dead_lettered")
             setAct(acc, a, acc.act.get(a).with("status", "cancelled")) else acc)
-        // blocked -> cancelled, wait fields KEPT, no parent wake (G2)
-        val d2 = if (lr.status == "blocked") setWf(d1, latest, lr.with("status", "cancelled").with("token", 0).with("leaseExp", 0)) else d1
+        // blocked -> cancelled (its own wait fields kept), its waiting parents re-pointed to sNew
+        val d2 = if (lr.status == "blocked") reattachParents(setWf(d1, latest, lr.with("status", "cancelled").with("token", 0).with("leaseExp", 0)), latest, sNew)
+                 else d1
         val d3 = newStarted(d2, sNew, { ...emptyWf, status: "ready", kind: kind, availableAt: tnow, root: root, restartedFrom: latest })
-        commitAt(d3, proc, ghost.with("tx2OutsideLineage", ghost.tx2OutsideLineage or not(inLineage(db, latest, orig))),
-                 "TX2_RecoverableStart", tnow),
+        commitAt(d3, proc, ghost, "TX2_RecoverableStart", tnow),
       },
     }
   }
@@ -514,9 +512,9 @@ module durable {
     }
   }
 
-  // T-C2 RunChild(kind, key): key is a domain key or autoKey(w, cmd). existing = the row
-  // with (kind, key), 0 = none: then insert cNew = db.nextWf; else attach (cNew = 0),
-  // locking the child and waking at once if it is already terminal.
+  // T-C2 RunChild(kind, key): key is a domain key or autoKey(w, cmd). existing = the newest
+  // generation of the row with (kind, key) (D4), 0 = none: then insert cNew = db.nextWf; else
+  // attach (cNew = 0), locking the child and waking at once if it is already terminal.
   action TC2_RunChild(r: int, w: int, tok: int, kind: str, key: int, existing: int, cNew: int, tnow: int): bool = {
     val cmd = db.wf.get(w).cmdSeq + 1
     val waitOn = if (existing == 0) cNew else existing
@@ -524,7 +522,7 @@ module durable {
     all {
       ENABLE_CHILDREN,
       tc2Ok(r, w, tok), key != NO_KEY,
-      existing == anyOf(rowsWithKey(db, kind, key)),
+      existing == newestGen(db, anyOf(rowsWithKey(db, kind, key))),
       if (existing == 0) all {
         cNew == db.nextWf, cNew <= MAX_WF,
         val d2 = newStarted(db, cNew, { ...emptyWf, status: "ready", kind: kind, dedup: key, availableAt: tnow,
@@ -1117,7 +1115,7 @@ module durable {
     },
     ghost' = {
       staleWfCommit: false, staleActCommit: false, capExceededAtClaim: false,
-      tx2OutsideLineage: false, noEventError: false, revivedExpiredLease: false,
+      noEventError: false, revivedExpiredLease: false,
       nextHb: 1,
       lastIssuedWf: WF_IDS.mapBy(w => 0), lastIssuedAct: ACT_IDS.mapBy(a => 0), taskErrors: RUNTIMES.mapBy(r => 0),
       coordErrors: RUNTIMES.mapBy(r => 0), dispErrors: RUNTIMES.mapBy(r => 0),
@@ -1170,7 +1168,7 @@ module durable {
     val cw = c.wf
     val cmd = if (cw == 0) 0 else db.wf.get(cw).cmdSeq + 1
     val ck = if (childKey == "domain") DOMAIN_KEY else autoKey(cw, cmd)
-    val cEx = anyOf(rowsWithKey(db, "C", ck))
+    val cEx = newestGen(db, anyOf(rowsWithKey(db, "C", ck)))
     val tx1W = if (inserted) db.nextWf else if (key != NO_KEY) anyOf(rowsWithKey(db, "P", key)) else 0
     val o2 = tx2Orig(db, kind, DOMAIN_KEY)
     val s2 = if (o2 == 0 or superseded) db.nextWf else 0
@@ -1335,8 +1333,8 @@ module durable {
     val src = db.wf.get(x).restartedFrom
     src != 0 implies WF_IDS.forall(y => (y != x) implies db.wf.get(y).restartedFrom != src)
   })
-  // N3 (stronger form): the source of a successor is terminal. T-X2 and admin restart only
-  // restart terminal rows; a public StartOptions.restarted_from_workflow_id is not checked.
+  // S19 (stronger form, N3 fixed): the source of a successor is terminal. T-X2 restarts only a
+  // failed or blocked row (cancelling a blocked one) and the restart field is crate-private.
   val inv_S19_sourceTerminal = WF_IDS.forall(x => {
     val src = db.wf.get(x).restartedFrom
     src != 0 implies isTerminal(db.wf.get(src).status)
@@ -1348,17 +1346,11 @@ module durable {
     db.events.get(p).filter(e => e.ref == c and e.cmd == e1.cmd
       and Set("child_succeeded", "child_failed", "child_cancelled").contains(e.typ)).size() <= 1)))
 
-  // S24: a parent waiting on a child never waits on a terminal child (wake is in the child's terminal txn)
+  // S24: a parent waiting on a child never waits on a terminal child (wake, or for a T-X2
+  // supersession the re-attach to the successor, is in the child's terminal txn)
   val inv_S24_parentWakes = WF_IDS.forall(p => {
     val r = db.wf.get(p)
     r.status == "waiting_child" implies not(isTerminal(db.wf.get(r.waitRef).status))
-  })
-
-  // S24 in the scope INVARIANTS.md claims (every terminal transition except T-X2 supersession)
-  val inv_S24_exceptTX2 = WF_IDS.forall(p => {
-    val r = db.wf.get(p)
-    r.status == "waiting_child" implies
-      (not(isTerminal(db.wf.get(r.waitRef).status)) or WF_IDS.exists(y => db.wf.get(y).restartedFrom == r.waitRef))
   })
 
   // S25: a cancelled workflow has no pending/running activity
@@ -1371,9 +1363,6 @@ module durable {
   val inv_G11_cancelReachesChildren = WF_IDS.forall(p => db.wf.get(p).status == "cancelled" implies
     WF_IDS.forall(c => (db.wf.get(c).parent == p and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
 
-  // N1: T-X2 supersedes or returns only a row on the keyed row's own restart chain
-  val inv_N1_tx2OwnLineage = not(ghost.tx2OutsideLineage)
-
   // G1 (fixed): an operator action never costs a runtime its restart budget. A pause or cancel
   // of a running row makes its coordinator's T-C2/T-C3 miss the fence (CoordFenceMiss), which is
   // not a task error. Stated in its strong form: the coordinator task never errors (LC1_NoEvent,
@@ -1381,14 +1370,13 @@ module durable {
   val inv_G1_noSelfCancelFromOperator = RUNTIMES.forall(r => ghost.coordErrors.get(r) == 0)
 
   // conjunction of the invariants expected to hold. Checked separately: S17 (G7 under the
-  // historical RR snapshot), S24 unrestricted (G2), S13 per topic (N2), S19 source terminal (N3),
-  // G11, N1.
+  // historical RR snapshot), S13 per topic (N2), G11.
   val safety = and {
     inv_S1_wfLease, inv_S2_noStaleWfCommit, inv_S5_delivery, inv_S5_noEventError, inv_S6_wfTerminalAbsorbing,
     inv_S7_waitCoupling, inv_S8_activationBounded, inv_S9_actLease, inv_S10_noStaleActCommit,
     inv_S11_openAttempt, inv_S12_attemptsBounded, inv_S13_oneHandler, inv_S14_actTerminal,
-    inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor,
-    inv_S23_childOnce, inv_S24_exceptTX2, inv_S25_cancelAtomic, inv_G1_noSelfCancelFromOperator,
+    inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor, inv_S19_sourceTerminal,
+    inv_S23_childOnce, inv_S24_parentWakes, inv_S25_cancelAtomic, inv_G1_noSelfCancelFromOperator,
   }
   // safety plus S17 (expected to hold under READ COMMITTED)
   val safetyRc = safety and inv_S17_capAtClaim and inv_S17_capAlways

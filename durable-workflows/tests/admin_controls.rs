@@ -1099,3 +1099,78 @@ async fn recoverable_start_fences_dead_letter_retry_and_races_to_one_live_genera
         .expect("race live generations");
     assert_eq!(race_live, 1);
 }
+
+/// G2 with a version change: T-X2 cannot re-attach a waiting parent to a
+/// successor of another version, so it wakes the parent with `child_failed`
+/// (`child_superseded`), as an operator restart does. Kept out of the recorded
+/// trace suites: the model does not track versions.
+#[tokio::test]
+async fn recoverable_start_at_a_new_version_fails_the_waiting_parent_as_superseded() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let child = start_workflow(&pool).await;
+    let activity_id = insert_activity(&pool, child, "dead_lettered").await;
+    set_waiting_activity(&pool, child, activity_id, "blocked").await;
+    let parent = DurableStore::new(pool.clone())
+        .start(&ControlWorkflowV1 { value: 1 }, StartOptions::default())
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_workflow::table.find(parent.get()))
+        .set((
+            durable_workflow::status.eq("waiting_child"),
+            durable_workflow::wait_kind.eq(Some("child".to_string())),
+            durable_workflow::wait_reference_id.eq(Some(child.get())),
+            durable_workflow::command_sequence.eq(1),
+            durable_workflow::delivered_event_sequence.eq(1),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("parent wait");
+
+    let successor = DurableStore::new(pool.clone())
+        .start_or_restart_recoverable(
+            &ControlWorkflowV2 {
+                value: 9,
+                label: "v2".to_string(),
+            },
+            StartOptions::default().with_deduplication_key("source-dedup"),
+        )
+        .await
+        .expect("blocked child recovers at v2");
+    assert!(successor.inserted);
+
+    let parent_row = durable_workflow::table
+        .find(parent.get())
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(&mut connection)
+        .await
+        .expect("parent loads");
+    assert_eq!(parent_row.status.as_str(), "ready");
+    assert_eq!(parent_row.wait_kind, None);
+    assert_eq!(parent_row.wait_reference_id, None);
+    let events = durable_workflow_event::table
+        .filter(durable_workflow_event::workflow_id.eq(parent.get()))
+        .order(durable_workflow_event::sequence.asc())
+        .select(WorkflowEventRow::as_select())
+        .load::<WorkflowEventRow>(&mut connection)
+        .await
+        .expect("parent events");
+    assert!(events
+        .iter()
+        .all(|event| event.event_type != "child_wait_reattached"));
+    let failed = events
+        .iter()
+        .find(|event| event.event_type == "child_failed")
+        .expect("parent receives child_failed");
+    assert!(failed.delivery_sequence.is_some());
+    let metadata: serde_json::Value =
+        serde_json::from_str(failed.metadata_json.as_deref().expect("event metadata"))
+            .expect("event JSON");
+    assert!(
+        metadata.to_string().contains("child_superseded"),
+        "unexpected child_failed metadata: {metadata}"
+    );
+}
