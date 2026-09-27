@@ -114,6 +114,11 @@ scripts/trace-pipeline.sh mysql && scripts/trace-pipeline.sh postgres
 
 ## Changing behavior
 
+Use the `verify-invariants` skill (`.claude/skills/verify-invariants/`) for
+every behavior change and before every push; it runs
+`scripts/verify-invariants.sh` (`--full` before a push or release) and says how
+to classify a failure as a code, recorder or model problem.
+
 - Name the invariant in `docs/INVARIANTS.md` that a change relies on or
   changes, and update that document, the Quint model (`spec/durable.qnt`,
   `spec/durable_tests.qnt`) and `CHANGELOG.md` with it.
