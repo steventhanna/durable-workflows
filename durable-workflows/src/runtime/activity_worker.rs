@@ -675,13 +675,12 @@ where
             child_cancellation.clone(),
             progress,
         );
-        let execution = self.activities.execute_claimed(
+        let mut handler = handler::RunningHandler::new(self.activities.execute_claimed(
             &claim.row.kind,
             claim.row.version,
             context,
             &claim.row.payload_json,
-        );
-        tokio::pin!(execution);
+        ));
         let timeout = tokio::time::sleep(duration_from_millis(claim.row.timeout_millis)?);
         tokio::pin!(timeout);
         let shutdown_deadline = tokio::time::sleep(self.config.shutdown_grace);
@@ -770,7 +769,7 @@ where
                                     _ = wait_for_lease_deadline(deadline) => {
                                         tracing::warn!("revoked activity cleanup grace elapsed");
                                     }
-                                    result = &mut execution => {
+                                    result = handler.poll_mut() => {
                                         execution_finished = true;
                                         if let Err(cleanup_error) = result {
                                             tracing::warn!(%cleanup_error, "revoked activity cleanup returned an error");
@@ -799,7 +798,7 @@ where
                                     _ = wait_for_lease_deadline(deadline) => {
                                         tracing::warn!("revoked activity cleanup grace elapsed");
                                     }
-                                    result = &mut execution => {
+                                    result = handler.poll_mut() => {
                                         if let Err(cleanup_error) = result {
                                             tracing::warn!(%cleanup_error, "revoked activity cleanup returned an error");
                                         }
@@ -811,7 +810,7 @@ where
                     }
                     heartbeat_stopped = true;
                 }
-                result = &mut execution, if !execution_finished => {
+                result = handler.poll_mut(), if !execution_finished => {
                     execution_finished = true;
                     heartbeat_stop.cancel();
                     if timeout_cleanup_pending {
@@ -826,22 +825,26 @@ where
                 }
             }
         };
+        let stopped = handler.stop(outcome);
         record_execution_step(
             &self.pool,
             &self.worker_id,
             &claim,
             "HandlerReturn",
-            Some(serde_json::json!({ "outcome": outcome.trace_name() })),
+            Some(serde_json::json!({ "outcome": stopped.outcome().trace_name() })),
         )
         .await;
-        self.finish_claim(&claim, outcome).await
+        self.finish_claim(&claim, stopped).await
     }
 
+    /// Takes a [`handler::Stopped`] outcome, so a claim is never finished
+    /// while its handler future is alive (N5).
     async fn finish_claim(
         &self,
         claim: &ActivityClaim,
-        outcome: ExecutionOutcome,
+        stopped: handler::Stopped,
     ) -> Result<(), DurableError> {
+        let outcome = stopped.into_outcome();
         let mut connection = self.pool.get().await?;
         let finished = claim.clone();
         let actor = self.worker_id.as_str();
@@ -1091,6 +1094,76 @@ fn lease_deadline_from_sample(
     started.checked_add(duration).ok_or_else(|| {
         DurableError::InvalidState("activity monotonic lease deadline overflow".to_string())
     })
+}
+
+/// N5: a claim is finished only after its handler future is dropped.
+///
+/// A handler that ignores cancellation is given up on when its timeout or
+/// shutdown grace, or its revoke grace, elapses. It may be inside a progress
+/// report (`src/progress.rs`) whose transaction holds its activity row
+/// `FOR UPDATE` on its own pooled connection. Finishing locks the same row.
+/// While the future is alive nothing polls it: the holder session sits idle,
+/// the database sees no lock cycle, and the finish waits forever (Postgres,
+/// `lock_timeout` 0) or until `innodb_lock_wait_timeout` (MySQL), leaving the
+/// row `running` until its lease expires.
+///
+/// Dropping the future drops that connection mid-transaction. diesel-async
+/// reports a connection with an open transaction as broken
+/// (`is_broken_transaction_manager`), bb8 closes a broken connection instead
+/// of pooling it, and closing the session rolls the transaction back and
+/// releases the lock.
+///
+/// `ActivityWorker::finish_claim` takes a [`Stopped`] outcome, and only
+/// [`RunningHandler::stop`], which consumes the one owner of the future, makes
+/// one. `Stopped` proves that a handler future was dropped, not which one:
+/// `execute_claim` makes one `RunningHandler` per claim.
+///
+/// These types are private, so trybuild cannot name them. Manual probes, from
+/// `execute_claim`: `handler::Stopped(outcome)` is E0603 (private constructor), and
+/// `handler.poll_mut()` after `handler.stop(outcome)` is E0382.
+mod handler {
+    use std::{future::Future, pin::Pin};
+
+    use super::ExecutionOutcome;
+
+    /// The only owner of one attempt's handler future.
+    pub(super) struct RunningHandler<F> {
+        future: Pin<Box<F>>,
+    }
+
+    impl<F: Future> RunningHandler<F> {
+        pub(super) fn new(future: F) -> Self {
+            Self {
+                future: Box::pin(future),
+            }
+        }
+
+        pub(super) fn poll_mut(&mut self) -> Pin<&mut F> {
+            self.future.as_mut()
+        }
+
+        /// Drops the handler future, and with it any connection the handler
+        /// holds, before the outcome can be applied.
+        pub(super) fn stop(self, outcome: ExecutionOutcome) -> Stopped {
+            drop(self.future);
+            Stopped(outcome)
+        }
+    }
+
+    /// An attempt outcome whose handler future has been dropped. Dropping one
+    /// unused leaves the claim unfinished; lease expiry then settles it.
+    #[must_use = "finish the claim with it"]
+    pub(super) struct Stopped(ExecutionOutcome);
+
+    impl Stopped {
+        pub(super) fn outcome(&self) -> &ExecutionOutcome {
+            &self.0
+        }
+
+        pub(super) fn into_outcome(self) -> ExecutionOutcome {
+            self.0
+        }
+    }
 }
 
 enum ExecutionOutcome {

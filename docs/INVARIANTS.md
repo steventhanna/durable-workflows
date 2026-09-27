@@ -442,7 +442,8 @@ still renewed, so the executor keeps its slot while it stops the handler.
 Raced against the local deadline; losing the race drops the in-flight
 transaction future.
 
-**T-W3 finish** (`finish_on_connection`), one transaction: lock workflow
+**T-W3 finish** (`finish_on_connection`) runs after the executor has
+dropped the handler future (N5), in one transaction: lock workflow
 `FOR UPDATE`; `now` ← DB; lock the activity `FOR UPDATE` under the lease
 fence (`status IN LEASE_HOLDERS`, attempt, token; a miss is `FencedWrite`);
 then:
@@ -1196,7 +1197,9 @@ closed under READ COMMITTED, which the library pins for every T-W1 (the
 model shows why; see its entry). G1, G2, G3, G6, G8, G9 and G10 are fixed, N4 (found by the concurrent trace workload)
 is found and fixed, and the model findings N1 and N3 (`spec/README.md`) are fixed;
 their tests in `tests/gaps.rs` run un-ignored. The model finding N2 is fixed
-(see its entry at the end of this section). G5 and G12 are fixed; their tests
+(see its entry at the end of this section), and so is N5, found in a
+concurrent MySQL run (its test is in
+`tests/application_cancellation/timeout_cleanup.rs`). G5 and G12 are fixed; their tests
 are in `tests/schedule_state.rs`, `tests/props_schedule.rs` and
 `tests/schedule_overlap.rs`. G11 is fixed; its tests in `tests/gaps.rs` run
 un-ignored. No suspected gap is open; `spec/traces/gaps.yaml` lists none.
@@ -1485,6 +1488,32 @@ up for `shutdown_grace`, so a cap-1 topic could run two handlers. Fixed with
 the `cancelling` status (§1.2): the revoked row keeps its lease, open attempt
 and topic slot until its handler stops or its lease expires
 (`settle_revoked`). Tests `n2_*` in `tests/gaps.rs`.
+
+**N5. A given-up handler's progress transaction blocked its own finish
+(FIXED).** When a handler that ignores cancellation outlived its timeout
+plus `shutdown_grace` (or the worker's shutdown grace), the executor left
+its poll loop with the handler future still alive and ran T-W3. The handler
+could be inside a T-W4 progress report whose transaction holds the activity
+row `FOR UPDATE` on its own pooled connection. T-W3 locks the workflow, then
+waits for the same row; nothing polls the handler again, so its session sits
+idle, the database's deadlock detector sees no cycle, and T-W3 waits until
+`innodb_lock_wait_timeout` (MySQL, 50 s by default) or forever (Postgres,
+`lock_timeout` 0). The row stays `running` until its lease expires, and on
+Postgres the executor task never returns. The revoke path
+(`ExecutionOutcome::Revoked`) finishes through the same code, but a T-W4
+report cannot hold the lock there: its fence requires `running`, and the
+row is `cancelling`. **Fixed**: the executor drops the handler future before
+T-W3 (`handler::RunningHandler::stop` in `src/runtime/activity_worker.rs`;
+`finish_claim` takes the `Stopped` outcome it returns, so finishing while
+the future is alive does not compile). Dropping the future drops its
+connection mid-transaction: diesel-async reports a connection with an open
+transaction as broken, bb8 closes it instead of pooling it, and the server
+rolls the transaction back. Test:
+`timed_out_handler_holding_the_activity_row_lock_does_not_block_its_finish`
+(`tests/application_cancellation/timeout_cleanup.rs`), on both backends.
+The model does not represent handler futures or their connections, so it
+has no N5 scenario; a lock held by application code outside the engine's
+connections is not covered (§5.5).
 
 ## 7. Modeling notes
 

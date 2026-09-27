@@ -211,6 +211,13 @@ Compared with the production-internal version it was extracted from:
   heartbeat learns of the revoke, cancels the handler and settles it (or the
   lease expires); a pause then resume does not claim the next attempt until
   the old one settles.
+- N5: an activity whose handler ignored cancellation past its timeout and
+  `shutdown_grace` could not be finished while the handler was inside a
+  progress report: the report's transaction held the activity row, the
+  finish waited on it, and nothing polled the handler again. The row stayed
+  `running` until its lease expired (MySQL lock wait timeout) or the
+  executor hung (Postgres). The executor now drops the handler future, which
+  rolls back its transaction, before it finishes the attempt.
 - G5: `ScheduleCalendar::next_after` is strictly later than its argument as an
   instant. A schedule upgraded (or first reconciled) in the second pass of a
   daylight-saving fall-back hour no longer points its cursor at an occurrence
