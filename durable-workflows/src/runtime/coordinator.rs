@@ -23,6 +23,10 @@ use crate::{
     ActivityRegistry, BackoffPolicy, DurableError, DurablePool, RetryPolicy, StoredTransition,
     WorkflowEvent, WorkflowId, WorkflowRegistry,
 };
+use crate::{
+    store::ChildStart,
+    tx::{self, ClaimFence, Locked, Tx, TxScope},
+};
 
 macro_rules! fenced_workflow {
     ($claim:expr) => {
@@ -349,7 +353,7 @@ where
             i32::try_from(self.config.max_activation_attempts).unwrap_or(i32::MAX);
         let actor = self.worker_id.as_str();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             crate::trace::actor(actor);
             let now = persistence::database_now_millis(connection).await?;
             let lease_expires_at = now.checked_add(lease_duration_millis).ok_or_else(|| {
@@ -532,11 +536,12 @@ where
         let config = self.config;
         let actor = self.worker_id.as_str();
         let fence = (claim.row.id, claim.lease_token.clone());
-        let result = crate::dialect::transaction(&mut connection, async move |connection| {
-            crate::trace::actor(actor);
-            commit_on_connection(connection, &claim, &event, transition, config).await
-        })
-        .await;
+        let result =
+            crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
+                crate::trace::actor(actor);
+                commit_on_connection(connection, scope, &claim, &event, transition, config).await
+            })
+            .await;
         drop(connection);
         self.record_fence_miss(fence, &result).await;
         result
@@ -572,105 +577,108 @@ where
         let message = message.to_string();
         let config = self.config;
         let actor = self.worker_id.as_str();
-        let result = crate::dialect::transaction(&mut connection, async move |connection| {
-            crate::trace::actor(actor);
-            let current = durable_workflow::table
-                .find(claim.row.id)
-                .filter(durable_workflow::status.eq(WorkflowStatus::Running))
-                .filter(durable_workflow::lease_token.eq(&claim.lease_token))
-                .for_update()
-                .select(WorkflowRow::as_select())
-                .first::<WorkflowRow>(connection)
-                .await
-                .optional()?
-                .ok_or(DurableError::FencedWrite)?;
-            let attempt = current.activation_attempts.saturating_add(1);
-            let configured_max = i32::try_from(config.max_activation_attempts).unwrap_or(i32::MAX);
-            let max_activation = current.max_activation_attempts.min(configured_max);
-            let exhausted = attempt >= max_activation;
-            let now = persistence::database_now_millis(connection).await?;
-            let attempt_number = u32::try_from(attempt).unwrap_or(u32::MAX);
-            let jitter_percentile = deterministic_jitter_percentile(format!(
-                "workflow:{}:activation:{}",
-                current.id, attempt_number
-            ));
-            let delay = config
-                .activation_retry_policy
-                .delay_for_attempt(attempt_number, jitter_percentile)?;
-            let available_at = now.saturating_add(duration_millis(delay)?);
-            let error = crate::WorkflowError::new("activation", message);
-            let changed = diesel::update(
-                durable_workflow::table
-                    .find(current.id)
-                    .filter(durable_workflow::status.eq(WorkflowStatus::Running))
-                    .filter(durable_workflow::lease_token.eq(&claim.lease_token)),
-            )
-            .set((
-                durable_workflow::status.eq(if exhausted {
-                    WorkflowStatus::Failed
-                } else {
-                    WorkflowStatus::Ready
-                }),
-                durable_workflow::activation_attempts.eq(attempt),
-                durable_workflow::available_at.eq(available_at),
-                durable_workflow::error_category.eq(Some(error.category.clone())),
-                durable_workflow::error_message.eq(Some(error.message.clone())),
-                durable_workflow::lease_owner.eq(None::<String>),
-                durable_workflow::lease_token.eq(None::<String>),
-                durable_workflow::lease_expires_at.eq(None::<i64>),
-                durable_workflow::updated_at.eq(now),
-                durable_workflow::completed_at.eq(exhausted.then_some(now)),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_fenced(changed)?;
-            crate::trace::touch_wf(current.id);
-            crate::trace::declare(|| {
-                crate::trace::Action::new(
-                    "TC3_ActivationFailure",
-                    serde_json::json!({
-                        "workflow_id": current.id,
-                        "token": claim.lease_token,
-                        "attempt": attempt,
-                        "max_activation": max_activation,
-                        "exhausted": exhausted,
-                        "available_at": available_at,
-                    }),
-                )
-            });
-            append_history(
-                connection,
-                WorkflowId::new(current.id)?,
-                if exhausted {
-                    "activation_exhausted"
-                } else {
-                    "activation_failed"
-                },
-                now,
-            )
-            .await?;
-            if exhausted {
-                persistence::wake_waiting_parents_on_child_terminal(
+        let result =
+            crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
+                crate::trace::actor(actor);
+                let current = tx::lock_optional(
                     connection,
-                    current.id,
-                    &current.kind,
-                    current.version,
-                    Err((error.category, error.message)),
+                    scope,
+                    durable_workflow::table
+                        .find(claim.row.id)
+                        .filter(durable_workflow::status.eq(WorkflowStatus::Running))
+                        .filter(durable_workflow::lease_token.eq(&claim.lease_token))
+                        .for_update()
+                        .select(WorkflowRow::as_select()),
+                )
+                .await?
+                .ok_or(DurableError::FencedWrite)?;
+                let attempt = current.activation_attempts.saturating_add(1);
+                let configured_max =
+                    i32::try_from(config.max_activation_attempts).unwrap_or(i32::MAX);
+                let max_activation = current.max_activation_attempts.min(configured_max);
+                let exhausted = attempt >= max_activation;
+                let now = persistence::database_now_millis(connection).await?;
+                let attempt_number = u32::try_from(attempt).unwrap_or(u32::MAX);
+                let jitter_percentile = deterministic_jitter_percentile(format!(
+                    "workflow:{}:activation:{}",
+                    current.id, attempt_number
+                ));
+                let delay = config
+                    .activation_retry_policy
+                    .delay_for_attempt(attempt_number, jitter_percentile)?;
+                let available_at = now.saturating_add(duration_millis(delay)?);
+                let error = crate::WorkflowError::new("activation", message);
+                let changed = diesel::update(
+                    durable_workflow::table
+                        .find(current.id)
+                        .filter(durable_workflow::status.eq(WorkflowStatus::Running))
+                        .filter(durable_workflow::lease_token.eq(&claim.lease_token)),
+                )
+                .set((
+                    durable_workflow::status.eq(if exhausted {
+                        WorkflowStatus::Failed
+                    } else {
+                        WorkflowStatus::Ready
+                    }),
+                    durable_workflow::activation_attempts.eq(attempt),
+                    durable_workflow::available_at.eq(available_at),
+                    durable_workflow::error_category.eq(Some(error.category.clone())),
+                    durable_workflow::error_message.eq(Some(error.message.clone())),
+                    durable_workflow::lease_owner.eq(None::<String>),
+                    durable_workflow::lease_token.eq(None::<String>),
+                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::updated_at.eq(now),
+                    durable_workflow::completed_at.eq(exhausted.then_some(now)),
+                ))
+                .execute(connection)
+                .await?;
+                ensure_fenced(changed)?;
+                crate::trace::touch_wf(current.id);
+                crate::trace::declare(|| {
+                    crate::trace::Action::new(
+                        "TC3_ActivationFailure",
+                        serde_json::json!({
+                            "workflow_id": current.id,
+                            "token": claim.lease_token,
+                            "attempt": attempt,
+                            "max_activation": max_activation,
+                            "exhausted": exhausted,
+                            "available_at": available_at,
+                        }),
+                    )
+                });
+                append_history(
+                    connection,
+                    WorkflowId::new(current.id)?,
+                    if exhausted {
+                        "activation_exhausted"
+                    } else {
+                        "activation_failed"
+                    },
                     now,
                 )
                 .await?;
-            }
-            Ok(())
-        })
-        .await;
+                if exhausted {
+                    persistence::wake_waiting_parents_on_child_terminal(
+                        connection,
+                        current.as_ref(),
+                        Err((error.category, error.message)),
+                        now,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+            .await;
         drop(connection);
         self.record_fence_miss(fence, &result).await;
         result
     }
 }
 
-async fn commit_on_connection(
+async fn commit_on_connection<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     claim: &ClaimedRow,
     event: &WorkflowEventRow,
     transition: StoredTransition,
@@ -745,8 +753,10 @@ async fn commit_on_connection(
             .await
         }
         StoredTransition::Complete { output_json } => {
-            let changed = diesel::update(fenced_workflow!(claim))
-                .set((
+            let completed = tx::lock_by_update(
+                connection,
+                scope,
+                diesel::update(fenced_workflow!(claim)).set((
                     durable_workflow::status.eq(WorkflowStatus::Succeeded),
                     durable_workflow::result_json.eq(Some(output_json.clone())),
                     durable_workflow::delivered_event_sequence.eq(delivered),
@@ -759,10 +769,10 @@ async fn commit_on_connection(
                     durable_workflow::lease_expires_at.eq(None::<i64>),
                     durable_workflow::updated_at.eq(now),
                     durable_workflow::completed_at.eq(Some(now)),
-                ))
-                .execute(connection)
-                .await?;
-            ensure_fenced(changed)?;
+                )),
+                &claim.row,
+            )
+            .await?;
             crate::trace::declare(|| {
                 crate::trace::Action::new(
                     "TC2_Commit",
@@ -777,21 +787,22 @@ async fn commit_on_connection(
             append_history(connection, workflow_id, "workflow_succeeded", now).await?;
             persistence::wake_waiting_parents_on_child_terminal(
                 connection,
-                claim.row.id,
-                &claim.row.kind,
-                claim.row.version,
+                completed,
                 Ok(output_json),
                 now,
             )
             .await?;
             Ok(())
         }
-        transition => commit_wait_transition(connection, claim, delivered, transition, now).await,
+        transition => {
+            commit_wait_transition(connection, scope, claim, delivered, transition, now).await
+        }
     }
 }
 
-async fn commit_wait_transition(
+async fn commit_wait_transition<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     claim: &ClaimedRow,
     delivered: i32,
     transition: StoredTransition,
@@ -836,9 +847,10 @@ async fn commit_wait_transition(
             approval_json,
             expires_at_millis,
         } => {
-            lock_fence(connection, claim).await?;
+            let fence = lock_fence(connection, scope, claim).await?;
             let approval_id = crate::dialect::insert_approval(
                 connection,
+                fence.as_ref(),
                 NewApprovalRow {
                     workflow_id: claim.row.id,
                     command_sequence: command,
@@ -886,13 +898,13 @@ async fn commit_wait_transition(
             activity,
         } => {
             commit_activity(
-                connection, claim, delivered, command, state_json, activity, now,
+                connection, scope, claim, delivered, command, state_json, activity, now,
             )
             .await
         }
         StoredTransition::RunChild { state_json, child } => {
             commit_child(
-                connection, claim, delivered, command, state_json, child, now,
+                connection, scope, claim, delivered, command, state_json, child, now,
             )
             .await
         }
@@ -902,8 +914,10 @@ async fn commit_wait_transition(
     }
 }
 
-async fn commit_activity(
+#[allow(clippy::too_many_arguments)]
+async fn commit_activity<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     claim: &ClaimedRow,
     delivered: i32,
     command: i32,
@@ -918,9 +932,10 @@ async fn commit_activity(
     } else {
         now
     };
-    lock_fence(connection, claim).await?;
+    let fence = lock_fence(connection, scope, claim).await?;
     let activity_id = crate::dialect::insert_activity(
         connection,
+        fence.as_ref(),
         NewActivityRow {
             workflow_id: claim.row.id,
             command_sequence: command,
@@ -996,8 +1011,10 @@ async fn commit_activity(
     append_history(connection, claim.workflow_id()?, "activity_scheduled", now).await
 }
 
-async fn commit_child(
+#[allow(clippy::too_many_arguments)]
+async fn commit_child<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     claim: &ClaimedRow,
     delivered: i32,
     command: i32,
@@ -1014,6 +1031,7 @@ async fn commit_child(
     let trace_key = crate::trace::ENABLED.then(|| deduplication_key.clone());
     let outcome = crate::DurableStore::insert_child(
         connection,
+        scope,
         &child,
         deduplication_key.clone(),
         parent_id,
@@ -1027,10 +1045,11 @@ async fn commit_child(
     // row lock when it rolls back: no second lock, no wait. For an ancestor's
     // key, only the ancestor's generations are locked; the caller's row is not
     // locked until the fenced update below, which this path never reaches.
-    if !outcome.inserted && is_caller_or_ancestor(connection, claim, outcome.workflow_id).await? {
+    let child_id = outcome.workflow_id()?;
+    if !outcome.inserted() && is_caller_or_ancestor(connection, claim, child_id).await? {
         return Err(DurableError::InvalidDefinition(format!(
             "child key {deduplication_key} resolves to workflow {}, which is the caller or an ancestor",
-            outcome.workflow_id.get()
+            child_id.get()
         )));
     }
     // Lock an existing child before the parent: its terminal transaction locks
@@ -1040,32 +1059,10 @@ async fn commit_child(
     // transaction sees it yet. The parent's fence is therefore not taken
     // first here; `insert_child` never fails on the auto key's duplicate, so
     // a stale claim still ends in `FencedWrite` below.
-    let existing = if outcome.inserted {
-        None
-    } else {
-        Some(persistence::find_workflow_by_id_for_update(connection, outcome.workflow_id).await?)
-    };
-    let changed = diesel::update(fenced_workflow!(claim))
-        .set((
-            durable_workflow::state_json.eq(state_json),
-            durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
-            durable_workflow::status.eq(WorkflowStatus::WaitingChild),
-            durable_workflow::wait_kind.eq(Some("child".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(outcome.workflow_id.get())),
-            durable_workflow::command_sequence.eq(command),
-            durable_workflow::delivered_event_sequence.eq(delivered),
-            durable_workflow::consecutive_continuations.eq(0),
-            durable_workflow::activation_attempts.eq(0),
-            durable_workflow::error_category.eq(None::<String>),
-            durable_workflow::error_message.eq(None::<String>),
-            durable_workflow::lease_owner.eq(None::<String>),
-            durable_workflow::lease_token.eq(None::<String>),
-            durable_workflow::lease_expires_at.eq(None::<i64>),
-            durable_workflow::updated_at.eq(now),
-        ))
-        .execute(connection)
-        .await?;
-    ensure_fenced(changed)?;
+    set_child_wait(
+        connection, claim, &outcome, state_json, command, delivered, now,
+    )
+    .await?;
     crate::trace::declare(|| {
         crate::trace::Action::new(
             "TC2_Commit",
@@ -1076,8 +1073,8 @@ async fn commit_child(
                 "consumed": delivered,
                 "child_kind": child.kind(),
                 "child_key": trace_key,
-                "child_id": outcome.workflow_id.get(),
-                "inserted": outcome.inserted,
+                "child_id": child_id.get(),
+                "inserted": outcome.inserted(),
             }),
         )
     });
@@ -1088,7 +1085,7 @@ async fn commit_child(
         now,
     )
     .await?;
-    if let Some(existing) = existing {
+    if let ChildStart::Existing(existing) = &outcome {
         let terminal_outcome = match existing.status {
             WorkflowStatus::Succeeded => Some(Ok(existing
                 .result_json
@@ -1120,9 +1117,7 @@ async fn commit_child(
         if let Some(terminal_outcome) = terminal_outcome {
             persistence::wake_waiting_parents_on_child_terminal(
                 connection,
-                existing.id,
-                &existing.kind,
-                existing.version,
+                Locked::as_ref(existing),
                 terminal_outcome,
                 now,
             )
@@ -1130,6 +1125,40 @@ async fn commit_child(
         }
     }
     Ok(())
+}
+
+/// The parent's fenced move to `waiting_child`. Takes the [`ChildStart`]: an
+/// existing child arrives locked (G9), a new one needs no lock.
+async fn set_child_wait(
+    connection: &mut crate::DurableConnection,
+    claim: &ClaimedRow,
+    child: &ChildStart<'_>,
+    state_json: String,
+    command: i32,
+    delivered: i32,
+    now: i64,
+) -> Result<(), DurableError> {
+    let changed = diesel::update(fenced_workflow!(claim))
+        .set((
+            durable_workflow::state_json.eq(state_json),
+            durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
+            durable_workflow::status.eq(WorkflowStatus::WaitingChild),
+            durable_workflow::wait_kind.eq(Some("child".to_string())),
+            durable_workflow::wait_reference_id.eq(Some(child.workflow_id()?.get())),
+            durable_workflow::command_sequence.eq(command),
+            durable_workflow::delivered_event_sequence.eq(delivered),
+            durable_workflow::consecutive_continuations.eq(0),
+            durable_workflow::activation_attempts.eq(0),
+            durable_workflow::error_category.eq(None::<String>),
+            durable_workflow::error_message.eq(None::<String>),
+            durable_workflow::lease_owner.eq(None::<String>),
+            durable_workflow::lease_token.eq(None::<String>),
+            durable_workflow::lease_expires_at.eq(None::<i64>),
+            durable_workflow::updated_at.eq(now),
+        ))
+        .execute(connection)
+        .await?;
+    ensure_fenced(changed)
 }
 
 /// Whether `target` is the claimed workflow or on its `parent_workflow_id`
@@ -1230,18 +1259,20 @@ fn declare_workflow_claim(
 /// Locks the claimed row under its fence before a T-C2 path inserts a command
 /// row. A stale claim then gets `FencedWrite`, not a unique-key error from the
 /// command the recovering claim already inserted (N4).
-async fn lock_fence(
+async fn lock_fence<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     claim: &ClaimedRow,
-) -> Result<(), DurableError> {
-    fenced_workflow!(claim)
-        .for_update()
-        .select(durable_workflow::id)
-        .first::<i64>(connection)
-        .await
-        .optional()?
-        .ok_or(DurableError::FencedWrite)
-        .map(|_| ())
+) -> Result<Locked<'tx, ClaimFence>, DurableError> {
+    tx::lock_optional(
+        connection,
+        scope,
+        fenced_workflow!(claim)
+            .for_update()
+            .select((durable_workflow::id,)),
+    )
+    .await?
+    .ok_or(DurableError::FencedWrite)
 }
 
 /// A T-C2/T-C3 outcome that is not a coordinator error: the fence was lost

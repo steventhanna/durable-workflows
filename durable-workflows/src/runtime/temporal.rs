@@ -1,3 +1,4 @@
+use crate::tx::Tx;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 
@@ -30,7 +31,7 @@ impl TimerMaterializer {
 
     pub async fn materialize_one(&self, now: i64) -> Result<Option<WorkflowId>, DurableError> {
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             let Some(workflow) = durable_workflow::table
                 .filter(durable_workflow::status.eq(WorkflowStatus::Sleeping))
                 .filter(durable_workflow::wait_kind.eq("timer"))
@@ -97,7 +98,7 @@ impl ApprovalExpiryMaterializer {
             return Ok(None);
         };
 
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             let workflow = durable_workflow::table
                 .find(workflow_id)
                 .for_update()

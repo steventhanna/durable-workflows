@@ -590,6 +590,23 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
   order as the previous line (G9, fixed; it was parent → child).
 - Progress: activity only. Schedules: state → run rows → new workflow rows.
 
+**Type enforcement.** N4 and G9 are enforced by the compiler
+(`src/tx.rs`). A lock is a `Locked<'tx, Row>` witness, which only the
+`tx::lock_*` functions make, inside the transaction `'tx`.
+`dialect::insert_activity` and `insert_approval` need a
+`Locked<ClaimFence>` (from `lock_fence`) or a `Locked<WorkflowRow>`, so a
+command row cannot be inserted before its workflow is locked (N4).
+`commit_child`'s fenced parent update needs the `ChildStart` from
+`insert_child`, whose `Existing` arm is the locked child, so the parent
+cannot be locked before an existing child (G9). The helpers that need an
+earlier lock (`cancel_locked_workflow`, `wake_waiting_parents_on_child_terminal`,
+`hand_waiting_parents_to_successor`, `settle_revoked`, `quarantine_candidate`,
+`block_workflow`, `MaterializedFloor::load`, `active_workflow_count`) take a
+witness too. The types do not prove which row was locked (a witness for
+workflow X passed with a command for workflow Y still compiles; the command
+inserts `debug_assert` the ids match), that the row is fresh, or what the
+database contains. The SQL fences (lease token, status filters) stay.
+
 ---
 
 ## 3. Safety invariants

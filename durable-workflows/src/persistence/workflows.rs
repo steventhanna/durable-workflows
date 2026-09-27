@@ -5,6 +5,7 @@ use crate::{
     dialect::{self, WorkflowInsert},
     persistence::{self, NewWorkflowEventRow, NewWorkflowRow, WorkflowRow, WorkflowStatus},
     schema::{durable_workflow, durable_workflow_event},
+    tx::{self, Locked, TxScope},
     ChildResult, DurableConnection, DurableError, WorkflowEvent, WorkflowId,
 };
 
@@ -24,15 +25,16 @@ pub(crate) async fn find_by_deduplication_key(
 
 /// Outcome of [`insert_started`]: the new row's id, or the row that already
 /// holds the deduplication key, locked `FOR UPDATE`.
-pub(crate) enum StartedInsert {
+pub(crate) enum StartedInsert<'tx> {
     Inserted(i64),
-    Existing(Box<WorkflowRow>),
+    Existing(Box<Locked<'tx, WorkflowRow>>),
 }
 
-pub(crate) async fn insert_started(
+pub(crate) async fn insert_started<'tx>(
     connection: &mut DurableConnection,
+    scope: TxScope<'tx>,
     workflow: NewWorkflowRow,
-) -> Result<StartedInsert, DurableError> {
+) -> Result<StartedInsert<'tx>, DurableError> {
     let kind = workflow.kind.clone();
     let deduplication_key = workflow.deduplication_key.clone();
     match dialect::insert_workflow(connection, workflow).await? {
@@ -61,7 +63,7 @@ pub(crate) async fn insert_started(
                     "workflow deduplication conflict without a deduplication key".to_string(),
                 )
             })?;
-            match find_by_deduplication_key_for_update(connection, &kind, key).await? {
+            match find_by_deduplication_key_for_update(connection, scope, &kind, key).await? {
                 Some(row) => Ok(StartedInsert::Existing(Box::new(row))),
                 None => Err(DurableError::Conflict(
                     "duplicate start raced with an uncommitted insert outside READ COMMITTED; retry"
@@ -72,19 +74,45 @@ pub(crate) async fn insert_started(
     }
 }
 
-async fn find_by_deduplication_key_for_update(
+async fn find_by_deduplication_key_for_update<'tx>(
     connection: &mut DurableConnection,
+    scope: TxScope<'tx>,
     kind: &str,
     key: &str,
-) -> Result<Option<WorkflowRow>, DurableError> {
-    Ok(durable_workflow::table
-        .filter(durable_workflow::kind.eq(kind))
-        .filter(durable_workflow::deduplication_key.eq(key))
-        .for_update()
-        .select(WorkflowRow::as_select())
-        .first(connection)
-        .await
-        .optional()?)
+) -> Result<Option<Locked<'tx, WorkflowRow>>, DurableError> {
+    Ok(tx::lock_optional(
+        connection,
+        scope,
+        durable_workflow::table
+            .filter(durable_workflow::kind.eq(kind))
+            .filter(durable_workflow::deduplication_key.eq(key))
+            .for_update()
+            .select(WorkflowRow::as_select()),
+    )
+    .await?)
+}
+
+/// Current-read lock of a workflow row inside an open transaction, with its
+/// witness.
+///
+/// An unlocked read can miss a concurrent terminal commit (one still in flight,
+/// or under REPEATABLE READ one that committed after the snapshot). Callers
+/// that establish a parent wait on a deduplicated child must lock that child
+/// before rechecking its status.
+pub(crate) async fn lock_workflow_by_id<'tx>(
+    connection: &mut DurableConnection,
+    scope: TxScope<'tx>,
+    workflow_id: crate::WorkflowId,
+) -> Result<Locked<'tx, WorkflowRow>, DurableError> {
+    Ok(tx::lock_first(
+        connection,
+        scope,
+        durable_workflow::table
+            .find(workflow_id.get())
+            .for_update()
+            .select(WorkflowRow::as_select()),
+    )
+    .await?)
 }
 
 pub async fn find_workflow_by_id(
@@ -98,24 +126,6 @@ pub async fn find_workflow_by_id(
         .await?)
 }
 
-/// Current-read lock of a workflow row for use inside an open transaction.
-///
-/// An unlocked read can miss a concurrent terminal commit (one still in flight,
-/// or under REPEATABLE READ one that committed after the snapshot). Callers
-/// that establish a parent wait on a deduplicated child must lock that child
-/// before rechecking its status.
-pub async fn find_workflow_by_id_for_update(
-    connection: &mut DurableConnection,
-    workflow_id: crate::WorkflowId,
-) -> Result<WorkflowRow, DurableError> {
-    Ok(durable_workflow::table
-        .find(workflow_id.get())
-        .for_update()
-        .select(WorkflowRow::as_select())
-        .first(connection)
-        .await?)
-}
-
 /// Delivers a terminal child outcome to every parent awaiting that child.
 ///
 /// Parents are discovered by `wait_reference_id` rather than the child's
@@ -123,14 +133,19 @@ pub async fn find_workflow_by_id_for_update(
 /// wakes each waiter. A parent that no longer waits on this child (for
 /// example after an operator cancelled or restarted it) is skipped, so a
 /// child's own terminal commit can never be blocked by parent state.
-pub(crate) async fn wake_waiting_parents_on_child_terminal(
+///
+/// Takes the child's lock witness: the child is locked before its waiting
+/// parents (INVARIANTS §2.8, G9), so a caller that has not locked the child
+/// does not compile.
+pub(crate) async fn wake_waiting_parents_on_child_terminal<'tx>(
     connection: &mut DurableConnection,
-    child_workflow_id: i64,
-    child_kind: &str,
-    child_version: i32,
+    child: Locked<'tx, &WorkflowRow>,
     outcome: Result<String, (String, String)>,
     now: i64,
 ) -> Result<(), DurableError> {
+    let child = child.row();
+    let (child_workflow_id, child_kind, child_version) =
+        (child.id, child.kind.as_str(), child.version);
     let parents = durable_workflow::table
         .filter(durable_workflow::wait_kind.eq("child"))
         .filter(durable_workflow::wait_reference_id.eq(child_workflow_id))

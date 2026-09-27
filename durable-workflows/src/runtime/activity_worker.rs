@@ -16,6 +16,7 @@ use crate::{
     },
     schema::{durable_activity, durable_activity_attempt, durable_topic_lock, durable_workflow},
     store::close_attempt,
+    tx::{self, Locked, Tx, TxScope},
     ActivityContext, ActivityDispatchError, ActivityError, ActivityId, ActivityRegistry,
     ActivityResult, DurableError, DurablePool, ProgressReporter, RetryPolicy, TopicRegistry,
     WorkflowEvent, WorkflowId,
@@ -202,7 +203,7 @@ where
         let worker_id = self.worker_id.clone();
         let mut connection = self.pool.get().await?;
         self.topics.seed_locks(&mut connection).await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::actor(&worker_id);
             let topics = std::slice::from_ref(&topic);
             let lease_sample_started = tokio::time::Instant::now();
@@ -215,7 +216,7 @@ where
                 .await?;
             let max_concurrency = i64::from(max_concurrency);
 
-            let reconciled = reconcile_expired(connection, &topic, now).await?;
+            let reconciled = reconcile_expired(connection, scope, &topic, now).await?;
 
             let in_flight = durable_activity::table
                 .filter(durable_activity::topic.eq(&topic))
@@ -282,6 +283,7 @@ where
                 if let Some(claim) = self
                     .claim_locked_candidate(
                         connection,
+                        scope,
                         candidate_id,
                         workflow_id,
                         now,
@@ -326,7 +328,7 @@ where
         let worker_id = self.worker_id.clone();
         let mut connection = self.pool.get().await?;
         self.topics.seed_locks(&mut connection).await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             let locked_topics = durable_topic_lock::table
                 .filter(durable_topic_lock::topic.eq_any(&registered_topics))
                 .order(durable_topic_lock::topic.asc())
@@ -349,7 +351,7 @@ where
             let mut reconciled = Vec::new();
             let mut quarantined = Vec::new();
             for (topic, persisted_limit) in locked_topics {
-                reconciled.extend(reconcile_expired(connection, &topic, now).await?);
+                reconciled.extend(reconcile_expired(connection, scope, &topic, now).await?);
                 let in_flight = durable_activity::table
                     .filter(durable_activity::topic.eq(&topic))
                     .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
@@ -438,6 +440,7 @@ where
                     if let Some(claim) = self
                         .claim_locked_candidate(
                             connection,
+                            scope,
                             candidate_id,
                             workflow_id,
                             now,
@@ -466,6 +469,7 @@ where
     async fn claim_locked_candidate(
         &self,
         connection: &mut crate::DurableConnection,
+        scope: TxScope<'_>,
         candidate_id: i64,
         workflow_id: i64,
         now: i64,
@@ -486,17 +490,19 @@ where
         let Some(schedule_run_id) = locked_workflow else {
             return Ok(None);
         };
-        let Some(mut row) = durable_activity::table
-            .find(candidate_id)
-            .filter(durable_activity::workflow_id.eq(workflow_id))
-            .filter(durable_activity::status.eq(ActivityStatus::Pending))
-            .filter(durable_activity::available_at.le(now))
-            .for_update()
-            .skip_locked()
-            .select(ActivityRow::as_select())
-            .first::<ActivityRow>(connection)
-            .await
-            .optional()?
+        let Some(row) = tx::lock_optional(
+            connection,
+            scope,
+            durable_activity::table
+                .find(candidate_id)
+                .filter(durable_activity::workflow_id.eq(workflow_id))
+                .filter(durable_activity::status.eq(ActivityStatus::Pending))
+                .filter(durable_activity::available_at.le(now))
+                .for_update()
+                .skip_locked()
+                .select(ActivityRow::as_select()),
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -511,7 +517,7 @@ where
         }
         if row.attempt_count >= row.max_attempts {
             let message = format!("pending activity {} has exhausted its attempt cap", row.id);
-            quarantine_candidate(connection, &row, "attempt_cap", &message, now).await?;
+            quarantine_candidate(connection, row.as_ref(), "attempt_cap", &message, now).await?;
             if crate::trace::ENABLED {
                 quarantined.push(serde_json::json!({
                     "activity_id": row.id,
@@ -522,7 +528,7 @@ where
         }
         if row.timeout_millis <= 0 || row.lease_duration_millis <= row.timeout_millis {
             let message = format!("activity {} has invalid timeout or lease bounds", row.id);
-            quarantine_candidate(connection, &row, "invalid_bounds", &message, now).await?;
+            quarantine_candidate(connection, row.as_ref(), "invalid_bounds", &message, now).await?;
             if crate::trace::ENABLED {
                 quarantined.push(serde_json::json!({
                     "activity_id": row.id,
@@ -531,6 +537,7 @@ where
             }
             return Ok(None);
         }
+        let mut row = row.into_row();
         let attempt_number = row
             .attempt_count
             .checked_add(1)
@@ -844,11 +851,12 @@ where
             | ExecutionOutcome::Retryable(_)
             | ExecutionOutcome::Permanent(_) => false,
         };
-        let result = crate::dialect::transaction(&mut connection, async move |connection| {
-            crate::trace::actor(actor);
-            finish_on_connection(connection, &finished, outcome).await
-        })
-        .await;
+        let result =
+            crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
+                crate::trace::actor(actor);
+                finish_on_connection(connection, scope, &finished, outcome).await
+            })
+            .await;
         drop(connection);
         if matches!(result, Err(DurableError::FencedWrite)) {
             record_execution_step(&self.pool, &self.worker_id, claim, "TW3_FenceMiss", None).await;
@@ -1002,64 +1010,65 @@ async fn heartbeat_once(
         .await;
         sent.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let result = crate::dialect::transaction(&mut connection, async move |connection| {
-        crate::trace::actor(actor);
-        let lease_sample_started = tokio::time::Instant::now();
-        let now = persistence::database_now_millis(connection).await?;
-        let lease_expires_at = now
-            .checked_add(claim.row.lease_duration_millis)
-            .ok_or_else(|| DurableError::InvalidState("activity lease overflow".to_string()))?;
-        let status = leased_activity!(claim)
-            .for_update()
-            .select(durable_activity::status)
-            .first::<ActivityStatus>(connection)
-            .await
-            .optional()?
-            .ok_or(DurableError::FencedWrite)?;
-        let changed = diesel::update(leased_activity!(claim))
-            .set((
-                durable_activity::lease_expires_at.eq(Some(lease_expires_at)),
-                durable_activity::updated_at.eq(now),
-            ))
+    let result =
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
+            crate::trace::actor(actor);
+            let lease_sample_started = tokio::time::Instant::now();
+            let now = persistence::database_now_millis(connection).await?;
+            let lease_expires_at = now
+                .checked_add(claim.row.lease_duration_millis)
+                .ok_or_else(|| DurableError::InvalidState("activity lease overflow".to_string()))?;
+            let status = leased_activity!(claim)
+                .for_update()
+                .select(durable_activity::status)
+                .first::<ActivityStatus>(connection)
+                .await
+                .optional()?
+                .ok_or(DurableError::FencedWrite)?;
+            let changed = diesel::update(leased_activity!(claim))
+                .set((
+                    durable_activity::lease_expires_at.eq(Some(lease_expires_at)),
+                    durable_activity::updated_at.eq(now),
+                ))
+                .execute(connection)
+                .await?;
+            ensure_fenced(changed)?;
+            let changed = diesel::update(
+                durable_activity_attempt::table
+                    .find((claim.row.id, claim.attempt_number))
+                    .filter(durable_activity_attempt::lease_token.eq(&claim.lease_token))
+                    .filter(durable_activity_attempt::finished_at.is_null()),
+            )
+            .set(durable_activity_attempt::heartbeat_at.eq(now))
             .execute(connection)
             .await?;
-        ensure_fenced(changed)?;
-        let changed = diesel::update(
-            durable_activity_attempt::table
-                .find((claim.row.id, claim.attempt_number))
-                .filter(durable_activity_attempt::lease_token.eq(&claim.lease_token))
-                .filter(durable_activity_attempt::finished_at.is_null()),
-        )
-        .set(durable_activity_attempt::heartbeat_at.eq(now))
-        .execute(connection)
-        .await?;
-        ensure_fenced(changed)?;
-        crate::trace::touch_act(claim.row.id);
-        crate::trace::declare(|| {
-            crate::trace::Action::new(
-                "TW2_Commit",
-                serde_json::json!({
-                    "hb": hb,
-                    "activity_id": claim.row.id,
-                    "lease_expires_at": lease_expires_at,
-                }),
-            )
-        });
-        let deadline =
-            lease_deadline_from_sample(lease_sample_started, claim.row.lease_duration_millis)?;
-        match status {
-            ActivityStatus::Running => Ok(Renewed::Held(deadline)),
-            ActivityStatus::Cancelling => Ok(Renewed::Revoked(deadline)),
-            ActivityStatus::Pending
-            | ActivityStatus::Succeeded
-            | ActivityStatus::DeadLettered
-            | ActivityStatus::Cancelled => Err(DurableError::InvalidState(format!(
-                "lease renewal fenced activity {} in status {status}, which holds no lease",
-                claim.row.id
-            ))),
-        }
-    })
-    .await;
+            ensure_fenced(changed)?;
+            crate::trace::touch_act(claim.row.id);
+            crate::trace::declare(|| {
+                crate::trace::Action::new(
+                    "TW2_Commit",
+                    serde_json::json!({
+                        "hb": hb,
+                        "activity_id": claim.row.id,
+                        "lease_expires_at": lease_expires_at,
+                    }),
+                )
+            });
+            let deadline =
+                lease_deadline_from_sample(lease_sample_started, claim.row.lease_duration_millis)?;
+            match status {
+                ActivityStatus::Running => Ok(Renewed::Held(deadline)),
+                ActivityStatus::Cancelling => Ok(Renewed::Revoked(deadline)),
+                ActivityStatus::Pending
+                | ActivityStatus::Succeeded
+                | ActivityStatus::DeadLettered
+                | ActivityStatus::Cancelled => Err(DurableError::InvalidState(format!(
+                    "lease renewal fenced activity {} in status {status}, which holds no lease",
+                    claim.row.id
+                ))),
+            }
+        })
+        .await;
     // A fence miss rolled back cleanly. Other errors may have broken the
     // connection; they are not recorded (the model keeps the heartbeat in flight).
     if crate::trace::ENABLED && matches!(result, Err(DurableError::FencedWrite)) {
@@ -1123,6 +1132,7 @@ fn dispatch_outcome(result: Result<String, ActivityDispatchError>) -> ExecutionO
 /// Returns the reconciled rows (`TW1_Claim` `reconciled`) in order.
 async fn reconcile_expired(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'_>,
     topic: &str,
     now: i64,
 ) -> Result<Vec<serde_json::Value>, DurableError> {
@@ -1148,20 +1158,22 @@ async fn reconcile_expired(
             ))
             .first::<(WorkflowStatus, Option<i64>)>(connection)
             .await?;
-        let Some(row) = durable_activity::table
-            .find(activity_id)
-            .filter(durable_activity::topic.eq(topic))
-            .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
-            .filter(
-                durable_activity::lease_expires_at
-                    .le(now)
-                    .or(durable_activity::lease_expires_at.is_null()),
-            )
-            .for_update()
-            .select(ActivityRow::as_select())
-            .first::<ActivityRow>(connection)
-            .await
-            .optional()?
+        let Some(row) = tx::lock_optional(
+            connection,
+            scope,
+            durable_activity::table
+                .find(activity_id)
+                .filter(durable_activity::topic.eq(topic))
+                .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
+                .filter(
+                    durable_activity::lease_expires_at
+                        .le(now)
+                        .or(durable_activity::lease_expires_at.is_null()),
+                )
+                .for_update()
+                .select(ActivityRow::as_select()),
+        )
+        .await?
         else {
             continue;
         };
@@ -1171,7 +1183,7 @@ async fn reconcile_expired(
             ActivityStatus::Cancelling => {
                 let settled = settle_revoked(
                     connection,
-                    &row,
+                    row.as_ref(),
                     "lease_expired",
                     "activity lease expired",
                     now,
@@ -1268,7 +1280,7 @@ async fn reconcile_expired(
         if blocks {
             block_workflow(
                 connection,
-                &row,
+                row.as_ref(),
                 "lease_expired",
                 "activity lease expired",
                 now,
@@ -1298,14 +1310,16 @@ struct SettledRevoke {
 /// Closes the open attempt of a `cancelling` row whose handler stopped (T-W3)
 /// or whose lease expired (reconciliation), and releases its lease and topic
 /// slot (N2): `cancelled` when its workflow is terminal, else `pending` and
-/// claimable at once. The caller holds the workflow and the row `FOR UPDATE`.
+/// claimable at once. The caller holds the workflow and the row `FOR UPDATE`
+/// (`row` is the witness of the row lock).
 async fn settle_revoked(
     connection: &mut crate::DurableConnection,
-    row: &ActivityRow,
+    row: Locked<'_, &ActivityRow>,
     attempt_outcome: &str,
     message: &str,
     now: i64,
 ) -> Result<SettledRevoke, DurableError> {
+    let row = row.row();
     let lease_token = row.lease_token.as_deref().ok_or_else(|| {
         DurableError::InvalidState(format!("cancelling activity {} has no lease token", row.id))
     })?;
@@ -1355,11 +1369,12 @@ async fn settle_revoked(
 /// `retry_activity` replaces the row from the registered definition.
 async fn quarantine_candidate(
     connection: &mut crate::DurableConnection,
-    row: &ActivityRow,
+    locked: Locked<'_, &ActivityRow>,
     reason: &str,
     message: &str,
     now: i64,
 ) -> Result<(), DurableError> {
+    let row = locked.row();
     tracing::warn!(
         activity_id = row.id,
         workflow_id = row.workflow_id,
@@ -1391,7 +1406,7 @@ async fn quarantine_candidate(
         now,
     )
     .await?;
-    block_workflow(connection, row, INVALID_ROW_CATEGORY, &message, now).await?;
+    block_workflow(connection, locked, INVALID_ROW_CATEGORY, &message, now).await?;
     crate::trace::touch_act(row.id);
     crate::trace::touch_wf(row.workflow_id);
     Ok(())
@@ -1425,6 +1440,7 @@ async fn append_activity_history(
 
 async fn finish_on_connection(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'_>,
     claim: &ActivityClaim,
     outcome: ExecutionOutcome,
 ) -> Result<(), DurableError> {
@@ -1435,13 +1451,15 @@ async fn finish_on_connection(
         .first::<i64>(connection)
         .await?;
     let now = persistence::database_now_millis(connection).await?;
-    let row = leased_activity!(claim)
-        .for_update()
-        .select(ActivityRow::as_select())
-        .first::<ActivityRow>(connection)
-        .await
-        .optional()?
-        .ok_or(DurableError::FencedWrite)?;
+    let row = tx::lock_optional(
+        connection,
+        scope,
+        leased_activity!(claim)
+            .for_update()
+            .select(ActivityRow::as_select()),
+    )
+    .await?
+    .ok_or(DurableError::FencedWrite)?;
     match (row.status, outcome) {
         // Revoked (N2): whatever the handler returned is not applied.
         (ActivityStatus::Cancelling, _) => {
@@ -1452,7 +1470,7 @@ async fn finish_on_connection(
                 ))
             })?;
             let message = row.last_error_message.clone().unwrap_or_default();
-            let settled = settle_revoked(connection, &row, &outcome, &message, now).await?;
+            let settled = settle_revoked(connection, row.as_ref(), &outcome, &message, now).await?;
             declare_finish(claim, "revoked", Some(settled.available_at));
             Ok(())
         }
@@ -1503,7 +1521,7 @@ async fn finish_on_connection(
             let (category, message) = activity_error_parts(error);
             if claim.attempt_number >= claim.row.max_attempts {
                 declare_finish(claim, "retryable", None);
-                dead_letter(connection, claim, &category, &message, now).await
+                dead_letter(connection, claim, row.as_ref(), &category, &message, now).await
             } else {
                 let retry_policy: RetryPolicy = serde_json::from_str(&claim.row.retry_policy_json)?;
                 let attempt = u32::try_from(claim.attempt_number).map_err(|_| {
@@ -1551,7 +1569,7 @@ async fn finish_on_connection(
         (ActivityStatus::Running, ExecutionOutcome::Permanent(error)) => {
             let (category, message) = activity_error_parts(error);
             declare_finish(claim, "permanent", None);
-            dead_letter(connection, claim, &category, &message, now).await
+            dead_letter(connection, claim, row.as_ref(), &category, &message, now).await
         }
     }
 }
@@ -1559,6 +1577,7 @@ async fn finish_on_connection(
 async fn dead_letter(
     connection: &mut crate::DurableConnection,
     claim: &ActivityClaim,
+    row: Locked<'_, &ActivityRow>,
     category: &str,
     message: &str,
     now: i64,
@@ -1585,7 +1604,7 @@ async fn dead_letter(
         now,
     )
     .await?;
-    block_workflow(connection, &claim.row, category, message, now).await
+    block_workflow(connection, row, category, message, now).await
 }
 
 async fn finish_attempt(
@@ -1677,11 +1696,12 @@ async fn wake_workflow(
 
 async fn block_workflow(
     connection: &mut crate::DurableConnection,
-    row: &ActivityRow,
+    row: Locked<'_, &ActivityRow>,
     category: &str,
     message: &str,
     now: i64,
 ) -> Result<(), DurableError> {
+    let row = row.row();
     let changed = diesel::update(
         durable_workflow::table
             .find(row.workflow_id)

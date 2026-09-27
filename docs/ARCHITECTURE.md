@@ -323,6 +323,15 @@ each is fenced on `status = pending`, so exactly one of them wins (S20).
   to an existing child both lock child, then parent. Schedules: state, then
   run rows, then new workflows. Details in
   [INVARIANTS §2.8](INVARIANTS.md#28-lock-order-summary).
+- **Lock witnesses.** Every library transaction callback receives a
+  `tx::Tx { connection, scope }`. The `scope` token brands the transaction.
+  A row read `FOR UPDATE` through `tx::lock_*` becomes a
+  `Locked<'tx, Row>`, which cannot leave its transaction. The functions that
+  depend on an earlier lock take the witness as a parameter, so a wrong lock
+  order is a compile error. The command inserts need the claim fence (N4),
+  and a parent's child wait needs the locked existing child (G9). The SQL
+  fences stay; a witness does not prove what the database contains
+  ([INVARIANTS §2.8](INVARIANTS.md#28-lock-order-summary)).
 - **One workflow claim per coordinator.** `WorkflowCoordinator::claim_one`
   takes `&mut self` and returns a `WorkflowClaim` that borrows the
   coordinator until `WorkflowClaim::activate` consumes it. A second claim

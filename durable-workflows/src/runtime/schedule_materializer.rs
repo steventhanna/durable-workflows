@@ -9,6 +9,7 @@ use crate::{
     persistence::{self, NewScheduleRunRow, ScheduleRunRow, ScheduleStateRow, WorkflowStatus},
     schedule::ScheduleCursor,
     schema::{durable_schedule_run, durable_schedule_state, durable_workflow},
+    tx::{self, Locked, Tx},
     DurableError, DurablePool, LocalTimeDisposition, MisfirePolicy, OverlapPolicy,
     ScheduleCalendar, ScheduleOccurrence, ScheduleRegistry, ScheduleRunId,
     ScheduleStateReconcileOutcome,
@@ -110,14 +111,17 @@ where
         let registry = self.registry.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("schedule_materialize", true);
-            let state = durable_schedule_state::table
-                .find(&schedule_key)
-                .for_update()
-                .select(ScheduleStateRow::as_select())
-                .first::<ScheduleStateRow>(connection)
-                .await?;
+            let state = tx::lock_first(
+                connection,
+                scope,
+                durable_schedule_state::table
+                    .find(&schedule_key)
+                    .for_update()
+                    .select(ScheduleStateRow::as_select()),
+            )
+            .await?;
             if state.definition_version != metadata.version
                 || state.definition_fingerprint != metadata.fingerprint
             {
@@ -130,7 +134,8 @@ where
                 report.paused = true;
                 return Ok(report);
             }
-            let mut active = active_workflow_count(connection, &schedule_key).await?;
+            let mut active =
+                active_workflow_count(connection, state.as_ref(), &schedule_key).await?;
             let mut queued = queued_run_exists(connection, &schedule_key).await?;
             if metadata.overlap == OverlapPolicy::QueueOne && active == 0 && queued {
                 promote_queued(
@@ -416,10 +421,11 @@ where
     Ok(())
 }
 
-/// Non-terminal workflows started by runs of `schedule_key` (S29). Call it
-/// with the schedule state row locked.
+/// Non-terminal workflows started by runs of `schedule_key` (S29), with the
+/// schedule state row locked (`_state` is the witness).
 pub(crate) async fn active_workflow_count(
     connection: &mut crate::DurableConnection,
+    _state: Locked<'_, &ScheduleStateRow>,
     schedule_key: &str,
 ) -> Result<i64, DurableError> {
     Ok(durable_workflow::table

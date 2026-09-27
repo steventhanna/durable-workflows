@@ -21,6 +21,7 @@ pub mod trace;
 #[path = "trace/noop.rs"]
 mod trace;
 mod transition;
+mod tx;
 
 pub mod migrations;
 

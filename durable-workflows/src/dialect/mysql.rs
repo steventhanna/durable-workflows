@@ -2,6 +2,7 @@ use diesel::ExpressionMethods;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 
 use super::{TransactionCallback, WorkflowInsert};
+use crate::tx::{CommandParent, Locked, Tx};
 use crate::{
     persistence::{
         NewActivityRow, NewApprovalRow, NewScheduleRunRow, NewScheduleStateRow, NewTopicLockRow,
@@ -33,8 +34,8 @@ pub(crate) async fn transaction<'a, 'conn, R, E, F>(
     callback: F,
 ) -> Result<R, E>
 where
-    for<'r> F: AsyncFnOnce(&'r mut DurableConnection) -> Result<R, E>
-        + TransactionCallback<&'r mut DurableConnection, Result<R, E>, Fut: Send>
+    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<R, E>
+        + TransactionCallback<Tx<'r>, Result<R, E>, Fut: Send>
         + Send
         + 'a,
     E: From<diesel::result::Error> + Send + 'a,
@@ -45,7 +46,7 @@ where
         .batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .await?;
     connection
-        .transaction(async move |connection| crate::trace::scoped(connection, callback).await)
+        .transaction(async move |connection| crate::tx::enter(connection, callback).await)
         .await
 }
 
@@ -98,10 +99,14 @@ fn restart_conflict(restarted_from_workflow_id: Option<i64>) -> DurableError {
     }
 }
 
-pub(crate) async fn insert_activity(
+/// Takes the locked parent workflow, so the insert cannot run before the
+/// fence lock (N4): a stale claim then gets `FencedWrite`, not a duplicate key.
+pub(crate) async fn insert_activity<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
+    parent: Locked<'tx, &P>,
     row: NewActivityRow,
 ) -> Result<i64, DurableError> {
+    debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     diesel::insert_into(durable_activity::table)
         .values(row)
         .execute(connection)
@@ -109,10 +114,14 @@ pub(crate) async fn insert_activity(
     connection_last_insert_id(connection).await
 }
 
-pub(crate) async fn insert_approval(
+/// Takes the locked parent workflow, so the insert cannot run before the
+/// fence lock (N4): a stale claim then gets `FencedWrite`, not a duplicate key.
+pub(crate) async fn insert_approval<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
+    parent: Locked<'tx, &P>,
     row: NewApprovalRow,
 ) -> Result<i64, DurableError> {
+    debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     diesel::insert_into(durable_approval::table)
         .values(row)
         .execute(connection)

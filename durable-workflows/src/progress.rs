@@ -1,3 +1,4 @@
+use crate::tx::Tx;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl};
 use diesel_async::RunQueryDsl;
 
@@ -89,7 +90,7 @@ impl ProgressReporter {
         let attempt_number = self.attempt_number;
         let lease_token = self.lease_token.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             let fenced = durable_activity::table
                 .find(activity_id)
                 .filter(durable_activity::status.eq(ActivityStatus::Running))

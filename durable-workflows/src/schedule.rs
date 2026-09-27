@@ -1,5 +1,6 @@
 use std::{collections::HashMap, marker::PhantomData, str::FromStr, sync::Arc, time::Duration};
 
+use crate::tx::{self, Tx};
 use async_trait::async_trait;
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -395,7 +396,7 @@ where
         let metadata = definition.metadata.clone();
         let now = deployed_at.timestamp_millis();
         let mut connection = pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("schedule_state", false);
             let inserted = crate::dialect::insert_schedule_state_if_absent(
                 connection,
@@ -416,12 +417,15 @@ where
                 },
             )
             .await?;
-            let row = durable_schedule_state::table
-                .find(&metadata.key)
-                .for_update()
-                .select(ScheduleStateRow::as_select())
-                .first::<ScheduleStateRow>(connection)
-                .await?;
+            let row = tx::lock_first(
+                connection,
+                scope,
+                durable_schedule_state::table
+                    .find(&metadata.key)
+                    .for_update()
+                    .select(ScheduleStateRow::as_select()),
+            )
+            .await?;
             if inserted {
                 return Ok(ScheduleStateReconcileOutcome::Inserted);
             }
@@ -439,7 +443,7 @@ where
             }
             // The upgrade drops the unmaterialized span before `now` (intended)
             // and never targets an occurrence with a run row (S27, G5).
-            let floor = MaterializedFloor::load(connection, &metadata.key).await?;
+            let floor = MaterializedFloor::load(connection, row.as_ref(), &metadata.key).await?;
             let (cursor, target) = ScheduleCursor::upgrade(&calendar, deployed_at, floor)?;
             diesel::update(durable_schedule_state::table.find(&metadata.key))
                 .set((

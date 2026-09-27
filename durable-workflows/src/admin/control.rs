@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use crate::tx::{self, Locked, Tx, TxScope};
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 
@@ -63,8 +64,8 @@ where
     ) -> Result<WorkflowControlOutcome, DurableError> {
         let operator = operator.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
-            let workflow = lock_workflow(connection, workflow_id).await?;
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
+            let workflow = lock_workflow(connection, scope, workflow_id).await?;
             if workflow.status == WorkflowStatus::Paused || workflow.status.is_terminal() {
                 return Err(conflict(workflow_id, "cannot be paused", workflow.status));
             }
@@ -113,8 +114,8 @@ where
     ) -> Result<WorkflowControlOutcome, DurableError> {
         let operator = operator.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
-            let workflow = lock_workflow(connection, workflow_id).await?;
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
+            let workflow = lock_workflow(connection, scope, workflow_id).await?;
             if workflow.status != WorkflowStatus::Paused {
                 return Err(conflict(workflow_id, "is not paused", workflow.status));
             }
@@ -164,8 +165,8 @@ where
     ) -> Result<WorkflowControlOutcome, DurableError> {
         let operator = operator.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
-            let workflow = lock_workflow(connection, workflow_id).await?;
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
+            let workflow = lock_workflow(connection, scope, workflow_id).await?;
             if workflow.status.is_terminal() {
                 return Err(conflict(
                     workflow_id,
@@ -182,7 +183,7 @@ where
             });
             crate::store::cancel_locked_workflow(
                 connection,
-                &workflow,
+                workflow.as_ref(),
                 operator.reason(),
                 Some(operator.actor_id()),
                 now,
@@ -222,9 +223,9 @@ where
     ) -> Result<WorkflowRestartOutcome, DurableError> {
         let workflows = self.workflows.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_restart", true);
-            let source = lock_workflow(connection, workflow_id).await?;
+            let source = lock_workflow(connection, scope, workflow_id).await?;
             if !source.status.is_restartable() {
                 return Err(conflict(
                     workflow_id,
@@ -308,9 +309,7 @@ where
                 .await?;
                 persistence::wake_waiting_parents_on_child_terminal(
                     connection,
-                    source.id,
-                    &source.kind,
-                    source.version,
+                    source.as_ref(),
                     Err((
                         "child_superseded".to_string(),
                         operator.reason().to_string(),
@@ -399,9 +398,9 @@ where
             .transpose()?
             .ok_or_else(|| not_found("activity", activity_id))?;
         let activities = self.activities.clone();
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_retry", true);
-                    let workflow = lock_workflow(connection, workflow_id).await?;
+                    let workflow = lock_workflow(connection, scope, workflow_id).await?;
                     let source = durable_activity::table
                         .find(activity_id.get())
                         .for_update()
@@ -450,6 +449,7 @@ where
                     let now = persistence::database_now_millis(connection).await?;
                     let inserted_id = crate::dialect::insert_activity(
                         connection,
+                        workflow.as_ref(),
                         NewActivityRow {
                             workflow_id: source.workflow_id,
                             command_sequence: source.command_sequence,
@@ -537,7 +537,7 @@ where
         let decision_json = decision_json.to_string();
         let workflows = self.workflows.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_resolve_approval", true);
             let workflow_id = durable_approval::table
                 .find(approval_id.get())
@@ -547,7 +547,7 @@ where
                 .optional()?
                 .ok_or_else(|| not_found("approval", approval_id))?;
             let workflow_id = WorkflowId::new(workflow_id)?;
-            let workflow = lock_workflow(connection, workflow_id).await?;
+            let workflow = lock_workflow(connection, scope, workflow_id).await?;
             let approval = durable_approval::table
                 .find(approval_id.get())
                 .for_update()
@@ -702,9 +702,9 @@ where
         let operator = operator.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_schedule_pause", false);
-            let state = lock_schedule_state(connection, &schedule_key).await?;
+            let state = lock_schedule_state(connection, scope, &schedule_key).await?;
             validate_schedule_state(&state, &definition)?;
             if paused == state.paused_at.is_some() {
                 return Err(DurableError::Conflict(format!(
@@ -776,16 +776,17 @@ where
         let operator = operator.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_run_schedule_now", true);
-            let state = lock_schedule_state(connection, &schedule_key).await?;
+            let state = lock_schedule_state(connection, scope, &schedule_key).await?;
             validate_schedule_state(&state, &definition)?;
             let overlap_checked = match definition.overlap {
                 OverlapPolicy::Allow => false,
                 OverlapPolicy::SkipIfActive | OverlapPolicy::QueueOne => true,
             };
             if overlap_checked
-                && crate::runtime::active_workflow_count(connection, &schedule_key).await? > 0
+                && crate::runtime::active_workflow_count(connection, state.as_ref(), &schedule_key)
+                    .await? > 0
             {
                 return Err(DurableError::Conflict(format!(
                     "schedule {schedule_key} has an active run; overlap policy {:?} rejects run-now",
@@ -862,32 +863,38 @@ where
     }
 }
 
-async fn lock_workflow(
+async fn lock_workflow<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     workflow_id: WorkflowId,
-) -> Result<WorkflowRow, DurableError> {
-    durable_workflow::table
-        .find(workflow_id.get())
-        .for_update()
-        .select(WorkflowRow::as_select())
-        .first::<WorkflowRow>(connection)
-        .await
-        .optional()?
-        .ok_or_else(|| not_found("workflow", workflow_id))
+) -> Result<Locked<'tx, WorkflowRow>, DurableError> {
+    tx::lock_optional(
+        connection,
+        scope,
+        durable_workflow::table
+            .find(workflow_id.get())
+            .for_update()
+            .select(WorkflowRow::as_select()),
+    )
+    .await?
+    .ok_or_else(|| not_found("workflow", workflow_id))
 }
 
-async fn lock_schedule_state(
+async fn lock_schedule_state<'tx>(
     connection: &mut crate::DurableConnection,
+    scope: TxScope<'tx>,
     schedule_key: &str,
-) -> Result<ScheduleStateRow, DurableError> {
-    durable_schedule_state::table
-        .find(schedule_key)
-        .for_update()
-        .select(ScheduleStateRow::as_select())
-        .first::<ScheduleStateRow>(connection)
-        .await
-        .optional()?
-        .ok_or_else(|| not_found("schedule state", schedule_key))
+) -> Result<Locked<'tx, ScheduleStateRow>, DurableError> {
+    tx::lock_optional(
+        connection,
+        scope,
+        durable_schedule_state::table
+            .find(schedule_key)
+            .for_update()
+            .select(ScheduleStateRow::as_select()),
+    )
+    .await?
+    .ok_or_else(|| not_found("schedule state", schedule_key))
 }
 
 fn validate_schedule_state(

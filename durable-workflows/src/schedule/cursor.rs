@@ -7,7 +7,10 @@ use diesel::{ExpressionMethods, QueryDsl, TextExpressionMethods};
 use diesel_async::RunQueryDsl;
 
 use super::{ScheduleCalendar, ScheduleOccurrence};
-use crate::{schema::durable_schedule_run, DurableConnection, DurableError};
+use crate::{
+    persistence::ScheduleStateRow, schema::durable_schedule_run, tx::Locked, DurableConnection,
+    DurableError,
+};
 
 /// The `local_occurrence` prefix of an admin run-now row (T-A9). Those rows
 /// are not calendar occurrences and never bound the cursor.
@@ -58,10 +61,12 @@ impl FromStr for LocalOccurrence {
 pub(crate) struct MaterializedFloor(Option<LocalOccurrence>);
 
 impl MaterializedFloor {
-    /// One query. Call it with the schedule state row locked: a tick inserts
-    /// run rows only under that lock, so the floor cannot rise before commit.
+    /// One query, with the schedule state row locked (`_state` is the
+    /// witness): a tick inserts run rows only under that lock, so the floor
+    /// cannot rise before commit.
     pub(crate) async fn load(
         connection: &mut DurableConnection,
+        _state: Locked<'_, &ScheduleStateRow>,
         schedule_key: &str,
     ) -> Result<Self, DurableError> {
         // Local keys are fixed width, so the text maximum is the latest key.

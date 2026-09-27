@@ -30,8 +30,11 @@ system can make the violation fail to compile. In order of preference:
    (`WorkflowCoordinator::claim_one(&mut self)` returns a `WorkflowClaim<'_, C>`,
    so a second claim while one is alive is E0499), a method that consumes
    `self` for a one-shot transition (`claim.activate()`), a proof token with a
-   private constructor that a function must receive before it may act, an
-   exhaustive `match` that forces every new variant to be decided.
+   private constructor that a function must receive before it may act (a
+   `tx::Locked<'tx, Row>` row-lock witness: `insert_activity` takes the
+   `Locked<ClaimFence>` that `lock_fence` returns, N4; `commit_child`'s parent
+   update takes the `ChildStart` whose `Existing` arm is the locked child,
+   G9), an exhaustive `match` that forces every new variant to be decided.
 3. **Checked at the boundary.** A constructor or parser that returns `Result`
    (e.g. `RetryPolicy::fixed`), or a transition that does
    (`ScheduleCursor::advance_to` rejects a cursor that does not move forward
@@ -91,9 +94,46 @@ type system cannot express the rule.
   dropped.
 - Every compile-time guarantee has a compile-fail case under
   `durable-workflows/tests/ui/fail/` (trybuild; regenerate `.stderr` with
-  `TRYBUILD=overwrite` and read it before committing).
+  `TRYBUILD=overwrite` and read it before committing). A `pub(crate)` type
+  that trybuild cannot name has a documented manual probe instead (the lock
+  witnesses: `src/tx.rs` module docs).
 - Types cannot prove what the database contains. Keep the SQL fences
   (lease token and status filters); a type-level rule adds to them.
+
+### Transaction callbacks and lock witnesses
+
+`src/tx.rs` holds the transaction scope and the row-lock witnesses. The
+N4 and G9 lock orders, and every helper documented as "the caller holds
+the row `FOR UPDATE`", depend on them.
+
+- A transaction callback (`dialect::transaction`, `tx::caller_transaction`)
+  has one argument, `Tx<'r>`, destructured in the closure head:
+  `async move |Tx { connection, scope }| { .. }`, or `Tx { connection, .. }`
+  when the body takes no lock. `TxScope<'tx>` is the transaction's brand;
+  only `tx::enter` makes one.
+- A helper that needs a lock taken earlier in the transaction takes the
+  witness `Locked<'tx, &Row>` (a `Copy` token; `locked.as_ref()`) next to
+  `connection: &mut DurableConnection`. Locks are taken through
+  `tx::lock_optional` / `lock_first` / `lock_by_update`, or a wrapper of
+  them (`lock_fence`, `lock_workflow_by_id`, `lock_workflow`,
+  `lock_schedule_state`), which need the `scope`.
+- `Locked::new` stays private to `tx.rs`. No `Clone`, `Default` or `From`
+  on `Locked<'tx, Row>` other than the `Row: Copy` impl.
+- Compiler limit 1: never put `&mut Tx<'_>`, `&mut T<'tx>` or any
+  `&'a mut X<'b>` in an `async fn` signature that runs inside a transaction
+  callback. rustc cannot prove the future `Send` under the callback's
+  higher-ranked lifetime (rust-lang/rust#102211, #110338). Pass the
+  connection and the witness as separate parameters.
+- Compiler limit 2: a helper generic over a Diesel query type (a
+  `LoadQuery<'q, ..>` bound) is written
+  `fn .. -> impl Future<Output = ..> + Send + 'conn { async move { .. } }`,
+  never `async fn`, for the same reason.
+- The witness types are `pub(crate)`, so trybuild cannot reach them. Their
+  compile-fail check is the list of manual probes in the `src/tx.rs` module
+  docs. Run it when you change `tx.rs` or a signature that takes a witness.
+- A witness proves that a lock was taken in this transaction. It does not
+  prove which row the caller meant, that the row is fresh, or what the
+  database contains. Keep the SQL fences.
 
 ## Commands
 
