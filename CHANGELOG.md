@@ -92,6 +92,16 @@ Compared with the production-internal version it was extracted from:
 - `WorkflowStatus` and `ActivityStatus` are `#[non_exhaustive]`. A
   downstream exhaustive `match` on either needs a wildcard arm (breaking),
   so new statuses can ship in a minor release.
+- More public enums are `#[non_exhaustive]` (breaking for a downstream
+  exhaustive `match`; add a `_` arm): the errors `DurableError`,
+  `ActivityError`, `WfError`, `WorkflowDispatchError` and
+  `ActivityDispatchError`, and `WorkflowTransition`, `StoredTransition`,
+  `BackoffPolicy`, `MisfirePolicy`, `OverlapPolicy`,
+  `LocalTimeDisposition`, `ScheduleStateReconcileOutcome`,
+  `ProgressSeverity`, `ProgressReportOutcome`, `admin::ScheduleHealthIssue`
+  and `admin::TimelineEntry`. Building their values is unchanged.
+  `WorkflowEvent` and `BackendKind` stay exhaustive: a new event or backend
+  is meant to break every `match` that must handle it.
 - The remaining string-typed status and kind columns of the public row
   types are enums, like `WorkflowStatus`: `WorkflowRow::wait_kind` and
   `NewWorkflowRow::wait_kind` are `Option<persistence::WaitKind>`,

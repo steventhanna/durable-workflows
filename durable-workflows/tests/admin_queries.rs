@@ -464,6 +464,7 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
             TimelineEntry::ActivityAttempt(_) => "activityAttempt",
             TimelineEntry::Progress(_) => "progress",
             TimelineEntry::Approval(_) => "approval",
+            other => panic!("unexpected timeline entry: {other:?}"),
         })
         .collect::<Vec<_>>();
     assert_eq!(

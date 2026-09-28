@@ -2,6 +2,7 @@ use crate::DefinitionKey;
 use crate::MAX_ERROR_REASON_BYTES;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DurableError {
     #[error("database error: {0}")]
     Database(#[from] diesel::result::Error),
@@ -110,6 +111,7 @@ impl WorkflowError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ActivityError {
     #[error("retryable activity error {category}: {message}")]
     Retryable { category: String, message: String },

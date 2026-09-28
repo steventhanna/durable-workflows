@@ -16,6 +16,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum StoredTransition {
     RunActivity {
         state_json: String,
@@ -43,6 +44,7 @@ pub enum StoredTransition {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WorkflowDispatchError {
     #[error("workflow handler failed: {0}")]
     Handler(#[from] WorkflowError),
@@ -51,6 +53,7 @@ pub enum WorkflowDispatchError {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ActivityDispatchError {
     #[error("activity handler failed: {0}")]
     Handler(#[from] ActivityError),

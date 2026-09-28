@@ -28,6 +28,7 @@ const MAX_CATCH_UP_OCCURRENCES: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
 pub enum MisfirePolicy {
     Skip,
     RunLatest,
@@ -36,6 +37,7 @@ pub enum MisfirePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OverlapPolicy {
     Allow,
     SkipIfActive,
@@ -76,6 +78,7 @@ pub trait ScheduleHandler: DurableSchedule {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalTimeDisposition {
     Exact,
     Gap,
@@ -249,6 +252,7 @@ pub struct ScheduleDefinitionMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScheduleStateReconcileOutcome {
     Inserted,
     Preserved,

@@ -13,6 +13,7 @@ pub const MAX_PROGRESS_EVENTS_PER_ATTEMPT: i32 = 100;
 pub const MAX_PROGRESS_DESCRIPTION_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProgressSeverity {
     Info,
     Warning,
@@ -53,6 +54,7 @@ impl ProgressEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProgressReportOutcome {
     Persisted { sequence: u32 },
     LimitReached,

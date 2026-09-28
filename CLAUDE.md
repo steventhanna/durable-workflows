@@ -84,10 +84,20 @@ type system cannot express the rule.
   `persistence::LeaseCleared` changeset fragment instead of listing the three
   lease columns (S1, S9).
 - Public enums and config structs that may grow are `#[non_exhaustive]`
-  (`WorkflowStatus`, `ActivityStatus`, `WaitKind`, `ApprovalStatus`,
-  `ScheduleRunStatus`, `AttemptOutcome`; the compile-fail case
-  `activity_status_match_non_exhaustive` shows a downstream exhaustive
-  `match` is E0004).
+  (the persisted status and kind enums `WorkflowStatus`, `ActivityStatus`,
+  `WaitKind`, `ApprovalStatus`, `ScheduleRunStatus`, `AttemptOutcome`; the
+  error enums `DurableError`, `ActivityError`, `WfError`,
+  `WorkflowDispatchError`, `ActivityDispatchError`; `WorkflowTransition`,
+  `StoredTransition`, `BackoffPolicy`, `MisfirePolicy`, `OverlapPolicy`,
+  `LocalTimeDisposition`, `ScheduleStateReconcileOutcome`,
+  `ProgressSeverity`, `ProgressReportOutcome`, `HealthAlert`,
+  `BenignActivationKind`, `ScheduleHealthIssue`, `TimelineEntry`; the
+  compile-fail case `activity_status_match_non_exhaustive` shows a
+  downstream exhaustive `match` is E0004). Two public enums stay exhaustive
+  on purpose: `WorkflowEvent`, because a workflow handler must decide every
+  event (a new event must break its `match`, not fall into a `_` arm that
+  drops it), and `BackendKind`, because code that picks backend SQL (tests,
+  `tools/durable-trace`) must decide a new backend.
 - Never persist or compare host wall-clock time with a database timestamp.
   Persisted times and due/expiry comparisons use the database clock; process
   time (`tokio::time::Instant`) is only for local deadlines, timeouts and

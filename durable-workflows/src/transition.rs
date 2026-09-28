@@ -366,6 +366,7 @@ pub enum WorkflowEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum WorkflowTransition<S, A, O> {
     RunActivity {
         state: S,

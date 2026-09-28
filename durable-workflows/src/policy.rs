@@ -20,6 +20,7 @@ pub fn deterministic_jitter_percentile(seed: impl AsRef<[u8]>) -> u8 {
 pub const MAX_RETRY_DELAY_SECS: u64 = (i64::MAX / 2_000) as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum BackoffPolicy {
     Fixed {
         delay_secs: u64,

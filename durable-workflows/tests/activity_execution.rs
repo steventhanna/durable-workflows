@@ -118,6 +118,7 @@ impl ActivityHandler for TestActivity {
                     {
                         ProgressReportOutcome::Persisted { .. } => persisted += 1,
                         ProgressReportOutcome::LimitReached => {}
+                        other => panic!("unexpected progress outcome: {other:?}"),
                     }
                 }
                 Ok(serde_json::json!(persisted))

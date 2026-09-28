@@ -44,6 +44,7 @@ pub struct FlowJournal {
 
 /// Errors surfaced to and from flow code.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WfError {
     /// Internal control-flow marker used to suspend at an unresolved step.
     /// Flow code must propagate this error (usually via `?`) rather than
