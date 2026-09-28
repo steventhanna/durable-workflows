@@ -66,44 +66,51 @@ where
     ) -> Result<WorkflowControlOutcome, DurableError> {
         let operator = operator.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            let workflow = lock_workflow(connection, scope, workflow_id).await?;
-            if workflow.status == WorkflowStatus::Paused || workflow.status.is_terminal() {
-                return Err(conflict(workflow_id, "cannot be paused", workflow.status));
-            }
-            crate::trace::declare(|| {
-                crate::trace::Action::new(
-                    "AdminPause",
-                    serde_json::json!({ "workflow_id": workflow.id }),
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let workflow = lock_workflow(connection, scope, workflow_id).await?;
+                if workflow.status == WorkflowStatus::Paused || workflow.status.is_terminal() {
+                    return Err(conflict(workflow_id, "cannot be paused", workflow.status));
+                }
+                let trace = trace.declare(|| {
+                    crate::trace::Action::new(
+                        "AdminPause",
+                        serde_json::json!({ "workflow_id": workflow.id }),
+                    )
+                });
+                crate::trace::touch_wf(workflow.id);
+                let now = persistence::database_now_millis(connection).await?;
+                if let Some(Wait::Activity(activity_id)) = workflow.wait()? {
+                    pause_activity(connection, activity_id, &operator, now).await?;
+                }
+                let changed = diesel::update(
+                    durable_workflow::table
+                        .find(workflow.id)
+                        .filter(durable_workflow::status.eq(&workflow.status)),
                 )
-            });
-            crate::trace::touch_wf(workflow.id);
-            let now = persistence::database_now_millis(connection).await?;
-            if let Some(Wait::Activity(activity_id)) = workflow.wait()? {
-                pause_activity(connection, activity_id, &operator, now).await?;
-            }
-            let changed = diesel::update(
-                durable_workflow::table
-                    .find(workflow.id)
-                    .filter(durable_workflow::status.eq(&workflow.status)),
-            )
-            .set((
-                durable_workflow::status.eq(WorkflowStatus::Paused),
-                durable_workflow::lease_owner.eq(None::<String>),
-                durable_workflow::lease_token.eq(None::<String>),
-                durable_workflow::lease_expires_at.eq(None::<i64>),
-                durable_workflow::updated_at.eq(now),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_changed(changed)?;
-            append_operator_event(connection, workflow_id, "workflow_paused", &operator, now)
+                .set((
+                    durable_workflow::status.eq(WorkflowStatus::Paused),
+                    durable_workflow::lease_owner.eq(None::<String>),
+                    durable_workflow::lease_token.eq(None::<String>),
+                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::updated_at.eq(now),
+                ))
+                .execute(connection)
                 .await?;
-            Ok(WorkflowControlOutcome {
-                workflow_id,
-                status: "paused".to_string(),
-            })
-        })
+                ensure_changed(changed)?;
+                append_operator_event(connection, workflow_id, "workflow_paused", &operator, now)
+                    .await?;
+                Ok(trace.commit(WorkflowControlOutcome {
+                    workflow_id,
+                    status: "paused".to_string(),
+                }))
+            },
+        )
         .await
     }
 
@@ -114,47 +121,54 @@ where
     ) -> Result<WorkflowControlOutcome, DurableError> {
         let operator = operator.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            let workflow = lock_workflow(connection, scope, workflow_id).await?;
-            if workflow.status != WorkflowStatus::Paused {
-                return Err(conflict(workflow_id, "is not paused", workflow.status));
-            }
-            crate::trace::declare(|| {
-                crate::trace::Action::new(
-                    "AdminResume",
-                    serde_json::json!({ "workflow_id": workflow.id }),
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let workflow = lock_workflow(connection, scope, workflow_id).await?;
+                if workflow.status != WorkflowStatus::Paused {
+                    return Err(conflict(workflow_id, "is not paused", workflow.status));
+                }
+                let trace = trace.declare(|| {
+                    crate::trace::Action::new(
+                        "AdminResume",
+                        serde_json::json!({ "workflow_id": workflow.id }),
+                    )
+                });
+                crate::trace::touch_wf(workflow.id);
+                let now = persistence::database_now_millis(connection).await?;
+                let status = resume_status(connection, &workflow).await?;
+                let changed = diesel::update(
+                    durable_workflow::table
+                        .find(workflow.id)
+                        .filter(durable_workflow::status.eq(WorkflowStatus::Paused)),
                 )
-            });
-            crate::trace::touch_wf(workflow.id);
-            let now = persistence::database_now_millis(connection).await?;
-            let status = resume_status(connection, &workflow).await?;
-            let changed = diesel::update(
-                durable_workflow::table
-                    .find(workflow.id)
-                    .filter(durable_workflow::status.eq(WorkflowStatus::Paused)),
-            )
-            .set((
-                durable_workflow::status.eq(status),
-                durable_workflow::available_at.eq(if status == WorkflowStatus::Ready {
-                    now.get()
-                } else {
-                    workflow.available_at
-                }),
-                durable_workflow::lease_owner.eq(None::<String>),
-                durable_workflow::lease_token.eq(None::<String>),
-                durable_workflow::lease_expires_at.eq(None::<i64>),
-                durable_workflow::updated_at.eq(now),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_changed(changed)?;
-            append_operator_event(connection, workflow_id, "workflow_resumed", &operator, now)
+                .set((
+                    durable_workflow::status.eq(status),
+                    durable_workflow::available_at.eq(if status == WorkflowStatus::Ready {
+                        now.get()
+                    } else {
+                        workflow.available_at
+                    }),
+                    durable_workflow::lease_owner.eq(None::<String>),
+                    durable_workflow::lease_token.eq(None::<String>),
+                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::updated_at.eq(now),
+                ))
+                .execute(connection)
                 .await?;
-            Ok(WorkflowControlOutcome {
-                workflow_id,
-                status: status.to_string(),
-            })
-        })
+                ensure_changed(changed)?;
+                append_operator_event(connection, workflow_id, "workflow_resumed", &operator, now)
+                    .await?;
+                Ok(trace.commit(WorkflowControlOutcome {
+                    workflow_id,
+                    status: status.to_string(),
+                }))
+            },
+        )
         .await
     }
 
@@ -168,35 +182,42 @@ where
     ) -> Result<WorkflowControlOutcome, DurableError> {
         let operator = operator.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            let workflow = lock_workflow(connection, scope, workflow_id).await?;
-            if workflow.status.is_terminal() {
-                return Err(conflict(
-                    workflow_id,
-                    "is already terminal",
-                    workflow.status,
-                ));
-            }
-            let now = persistence::database_now_millis(connection).await?;
-            crate::trace::declare(|| {
-                crate::trace::Action::new(
-                    "AdminCancel",
-                    serde_json::json!({ "workflow_id": workflow.id }),
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let workflow = lock_workflow(connection, scope, workflow_id).await?;
+                if workflow.status.is_terminal() {
+                    return Err(conflict(
+                        workflow_id,
+                        "is already terminal",
+                        workflow.status,
+                    ));
+                }
+                let now = persistence::database_now_millis(connection).await?;
+                let trace = trace.declare(|| {
+                    crate::trace::Action::new(
+                        "AdminCancel",
+                        serde_json::json!({ "workflow_id": workflow.id }),
+                    )
+                });
+                crate::store::cancel_locked_workflow(
+                    connection,
+                    workflow.as_ref(),
+                    operator.reason(),
+                    Some(operator.actor_id()),
+                    now,
                 )
-            });
-            crate::store::cancel_locked_workflow(
-                connection,
-                workflow.as_ref(),
-                operator.reason(),
-                Some(operator.actor_id()),
-                now,
-            )
-            .await?;
-            Ok(WorkflowControlOutcome {
-                workflow_id,
-                status: "cancelled".to_string(),
-            })
-        })
+                .await?;
+                Ok(trace.commit(WorkflowControlOutcome {
+                    workflow_id,
+                    status: "cancelled".to_string(),
+                }))
+            },
+        )
         .await
     }
 
@@ -226,140 +247,149 @@ where
     ) -> Result<WorkflowRestartOutcome, DurableError> {
         let workflows = self.workflows.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("admin_restart", true);
-            let source = lock_workflow(connection, scope, workflow_id).await?;
-            if !source.status.is_restartable() {
-                return Err(conflict(
-                    workflow_id,
-                    "must be paused, blocked, or terminal before restart",
-                    source.status,
-                ));
-            }
-            let existing_restart = durable_workflow::table
-                .filter(durable_workflow::restarted_from_workflow_id.eq(Some(source.id)))
-                .select(durable_workflow::id)
-                .first::<WorkflowId>(connection)
-                .await
-                .optional()?;
-            if existing_restart.is_some() {
-                return Err(DurableError::Conflict(format!(
-                    "workflow {workflow_id} already has a restart"
-                )));
-            }
-            let prepared = match correction.as_deref() {
-                Some(input) => workflows.prepare_start_current(&source.kind, input)?,
-                None => workflows.prepare_start_exact(
-                    &source.kind,
-                    source.version,
-                    &source.input_json,
-                )?,
-            };
-            let kind = prepared.kind().to_string();
-            let version = prepared.version();
-            let root = source.root_workflow_id.unwrap_or(source.id);
-            let schedule_run_id = source.schedule_run_id;
-            let mut options = StartOptions::default().restarted(root, workflow_id);
-            options.schedule_run_id = schedule_run_id;
-            let outcome =
-                DurableStore::start_prepared_with_conn(connection, prepared, options).await?;
-            if !outcome.inserted {
-                return Err(DurableError::InvalidState(
-                    "workflow restart unexpectedly deduplicated".to_string(),
-                ));
-            }
-            let now = persistence::database_now_millis(connection).await?;
-            if !source.status.is_terminal() {
-                cancel_activities(
-                    connection,
-                    source.id,
-                    operator.reason(),
-                    AttemptOutcome::OperatorCancelled,
-                    now,
-                )
-                .await?;
-                cancel_approvals(connection, source.id, operator.reason(), now).await?;
-                let changed = diesel::update(
-                    durable_workflow::table
-                        .find(source.id)
-                        .filter(durable_workflow::status.eq(&source.status)),
-                )
-                .set((
-                    durable_workflow::status.eq(WorkflowStatus::Cancelled),
-                    durable_workflow::lease_owner.eq(None::<String>),
-                    durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
-                    durable_workflow::updated_at.eq(now),
-                    durable_workflow::completed_at.eq(Some(now)),
-                ))
-                .execute(connection)
-                .await?;
-                ensure_changed(changed)?;
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("admin_restart", true);
+                let source = lock_workflow(connection, scope, workflow_id).await?;
+                if !source.status.is_restartable() {
+                    return Err(conflict(
+                        workflow_id,
+                        "must be paused, blocked, or terminal before restart",
+                        source.status,
+                    ));
+                }
+                let existing_restart = durable_workflow::table
+                    .filter(durable_workflow::restarted_from_workflow_id.eq(Some(source.id)))
+                    .select(durable_workflow::id)
+                    .first::<WorkflowId>(connection)
+                    .await
+                    .optional()?;
+                if existing_restart.is_some() {
+                    return Err(DurableError::Conflict(format!(
+                        "workflow {workflow_id} already has a restart"
+                    )));
+                }
+                let prepared = match correction.as_deref() {
+                    Some(input) => workflows.prepare_start_current(&source.kind, input)?,
+                    None => workflows.prepare_start_exact(
+                        &source.kind,
+                        source.version,
+                        &source.input_json,
+                    )?,
+                };
+                let kind = prepared.kind().to_string();
+                let version = prepared.version();
+                let root = source.root_workflow_id.unwrap_or(source.id);
+                let schedule_run_id = source.schedule_run_id;
+                let mut options = StartOptions::default().restarted(root, workflow_id);
+                options.schedule_run_id = schedule_run_id;
+                crate::store::check_prepared_start(&prepared, &options)?;
+                let (outcome, trace) =
+                    DurableStore::start_prepared_in(connection, scope, trace, prepared, options)
+                        .await?;
+                if !outcome.inserted {
+                    return Err(DurableError::InvalidState(
+                        "workflow restart unexpectedly deduplicated".to_string(),
+                    ));
+                }
+                let now = persistence::database_now_millis(connection).await?;
+                if !source.status.is_terminal() {
+                    cancel_activities(
+                        connection,
+                        source.id,
+                        operator.reason(),
+                        AttemptOutcome::OperatorCancelled,
+                        now,
+                    )
+                    .await?;
+                    cancel_approvals(connection, source.id, operator.reason(), now).await?;
+                    let changed = diesel::update(
+                        durable_workflow::table
+                            .find(source.id)
+                            .filter(durable_workflow::status.eq(&source.status)),
+                    )
+                    .set((
+                        durable_workflow::status.eq(WorkflowStatus::Cancelled),
+                        durable_workflow::lease_owner.eq(None::<String>),
+                        durable_workflow::lease_token.eq(None::<String>),
+                        durable_workflow::lease_expires_at.eq(None::<i64>),
+                        durable_workflow::updated_at.eq(now),
+                        durable_workflow::completed_at.eq(Some(now)),
+                    ))
+                    .execute(connection)
+                    .await?;
+                    ensure_changed(changed)?;
+                    append_operator_event(
+                        connection,
+                        workflow_id,
+                        "workflow_superseded_by_restart",
+                        &operator,
+                        now,
+                    )
+                    .await?;
+                    persistence::wake_waiting_parents_on_child_terminal(
+                        connection,
+                        source.as_ref(),
+                        Err((
+                            "child_superseded".to_string(),
+                            operator.reason().to_string(),
+                        )),
+                        now,
+                    )
+                    .await?;
+                    crate::store::cancel_owned_descendants(
+                        connection,
+                        source.as_ref(),
+                        operator.reason(),
+                        Some(operator.actor_id()),
+                        now,
+                    )
+                    .await?;
+                }
+                if let Some(schedule_run_id) = schedule_run_id {
+                    let changed = diesel::update(
+                        durable_schedule_run::table
+                            .find(schedule_run_id)
+                            .filter(durable_schedule_run::workflow_id.eq(Some(source.id))),
+                    )
+                    .set(durable_schedule_run::workflow_id.eq(Some(outcome.workflow_id)))
+                    .execute(connection)
+                    .await?;
+                    ensure_changed(changed)?;
+                }
                 append_operator_event(
                     connection,
                     workflow_id,
-                    "workflow_superseded_by_restart",
+                    if correction.is_some() {
+                        "workflow_corrected_and_restarted"
+                    } else {
+                        "workflow_restarted"
+                    },
                     &operator,
                     now,
                 )
                 .await?;
-                persistence::wake_waiting_parents_on_child_terminal(
+                append_operator_event(
                     connection,
-                    source.as_ref(),
-                    Err((
-                        "child_superseded".to_string(),
-                        operator.reason().to_string(),
-                    )),
+                    outcome.workflow_id,
+                    "workflow_restart_created",
+                    &operator,
                     now,
                 )
                 .await?;
-                crate::store::cancel_owned_descendants(
-                    connection,
-                    source.as_ref(),
-                    operator.reason(),
-                    Some(operator.actor_id()),
-                    now,
-                )
-                .await?;
-            }
-            if let Some(schedule_run_id) = schedule_run_id {
-                let changed = diesel::update(
-                    durable_schedule_run::table
-                        .find(schedule_run_id)
-                        .filter(durable_schedule_run::workflow_id.eq(Some(source.id))),
-                )
-                .set(durable_schedule_run::workflow_id.eq(Some(outcome.workflow_id)))
-                .execute(connection)
-                .await?;
-                ensure_changed(changed)?;
-            }
-            append_operator_event(
-                connection,
-                workflow_id,
-                if correction.is_some() {
-                    "workflow_corrected_and_restarted"
-                } else {
-                    "workflow_restarted"
-                },
-                &operator,
-                now,
-            )
-            .await?;
-            append_operator_event(
-                connection,
-                outcome.workflow_id,
-                "workflow_restart_created",
-                &operator,
-                now,
-            )
-            .await?;
-            Ok(WorkflowRestartOutcome {
-                source_workflow_id: workflow_id,
-                workflow_id: outcome.workflow_id,
-                kind,
-                version,
-            })
-        })
+                Ok(trace.commit(WorkflowRestartOutcome {
+                    source_workflow_id: workflow_id,
+                    workflow_id: outcome.workflow_id,
+                    kind,
+                    version,
+                }))
+            },
+        )
         .await
     }
 
@@ -400,8 +430,8 @@ where
             .optional()?
             .ok_or_else(|| not_found("activity", activity_id))?;
         let activities = self.activities.clone();
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("admin_retry", true);
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope, trace }| {
+            let trace = trace.declare_unmodeled("admin_retry", true);
                     let workflow = lock_workflow(connection, scope, workflow_id).await?;
                     let source = durable_activity::table
                         .find(activity_id)
@@ -516,13 +546,13 @@ where
                         now,
                     )
                     .await?;
-                    Ok(ActivityRetryOutcome {
+                    Ok(trace.commit(ActivityRetryOutcome {
                         source_activity_id: activity_id,
                         activity_id: replacement_id,
                         kind: command.kind().to_string(),
                         version: command.version(),
                         operation_key,
-                    })
+                    }))
             })
             .await
     }
@@ -538,133 +568,142 @@ where
         let decision_json = decision_json.to_string();
         let workflows = self.workflows.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("admin_resolve_approval", true);
-            let workflow_id = durable_approval::table
-                .find(approval_id)
-                .select(durable_approval::workflow_id)
-                .first::<WorkflowId>(connection)
-                .await
-                .optional()?
-                .ok_or_else(|| not_found("approval", approval_id))?;
-            let workflow = lock_workflow(connection, scope, workflow_id).await?;
-            let approval = durable_approval::table
-                .find(approval_id)
-                .for_update()
-                .select(ApprovalRow::as_select())
-                .first::<ApprovalRow>(connection)
-                .await
-                .optional()?
-                .ok_or_else(|| not_found("approval", approval_id))?;
-            if approval.status != ApprovalStatus::Pending {
-                return Err(DurableError::Conflict(format!(
-                    "approval {approval_id} is already {}",
-                    approval.status
-                )));
-            }
-            let now = persistence::database_now_millis(connection).await?;
-            if approval
-                .expires_at
-                .is_some_and(|expires_at| expires_at <= now.get())
-            {
-                return Err(DurableError::Conflict(format!(
-                    "approval {approval_id} has expired"
-                )));
-            }
-            if !workflow.status.awaits_approval()
-                || workflow.wait()? != Some(Wait::Approval(approval_id))
-                || workflow.kind != approval.kind
-                || workflow.version != approval.version
-            {
-                return Err(DurableError::Conflict(format!(
-                    "approval {approval_id} no longer matches workflow {workflow_id}"
-                )));
-            }
-            let decision = workflows.validate_approval_exact(
-                &workflow.kind,
-                workflow.version,
-                &decision_json,
-            )?;
-            let command_sequence = u32::try_from(approval.command_sequence).map_err(|_| {
-                DurableError::InvalidState("negative approval command sequence".to_string())
-            })?;
-            let event = WorkflowEvent::ApprovalResolved {
-                command_sequence,
-                result: ApprovalResult {
-                    kind: workflow.kind.clone(),
-                    version: workflow.version,
-                    payload_json: decision.clone(),
-                },
-            };
-            let metadata_json = serde_json::to_string(&event)?;
-            ensure_size(
-                "approval resolution event",
-                &metadata_json,
-                MAX_EVENT_METADATA_BYTES,
-            )?;
-            let delivery_sequence = workflow
-                .delivered_event_sequence
-                .checked_add(1)
-                .ok_or_else(|| {
-                    DurableError::InvalidState("workflow delivery sequence overflow".to_string())
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("admin_resolve_approval", true);
+                let workflow_id = durable_approval::table
+                    .find(approval_id)
+                    .select(durable_approval::workflow_id)
+                    .first::<WorkflowId>(connection)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| not_found("approval", approval_id))?;
+                let workflow = lock_workflow(connection, scope, workflow_id).await?;
+                let approval = durable_approval::table
+                    .find(approval_id)
+                    .for_update()
+                    .select(ApprovalRow::as_select())
+                    .first::<ApprovalRow>(connection)
+                    .await
+                    .optional()?
+                    .ok_or_else(|| not_found("approval", approval_id))?;
+                if approval.status != ApprovalStatus::Pending {
+                    return Err(DurableError::Conflict(format!(
+                        "approval {approval_id} is already {}",
+                        approval.status
+                    )));
+                }
+                let now = persistence::database_now_millis(connection).await?;
+                if approval
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= now.get())
+                {
+                    return Err(DurableError::Conflict(format!(
+                        "approval {approval_id} has expired"
+                    )));
+                }
+                if !workflow.status.awaits_approval()
+                    || workflow.wait()? != Some(Wait::Approval(approval_id))
+                    || workflow.kind != approval.kind
+                    || workflow.version != approval.version
+                {
+                    return Err(DurableError::Conflict(format!(
+                        "approval {approval_id} no longer matches workflow {workflow_id}"
+                    )));
+                }
+                let decision = workflows.validate_approval_exact(
+                    &workflow.kind,
+                    workflow.version,
+                    &decision_json,
+                )?;
+                let command_sequence = u32::try_from(approval.command_sequence).map_err(|_| {
+                    DurableError::InvalidState("negative approval command sequence".to_string())
                 })?;
-            let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
-            persistence::append_event(
-                connection,
-                NewWorkflowEventRow {
-                    workflow_id: workflow.id,
-                    sequence,
-                    delivery_sequence: Some(delivery_sequence),
-                    event_type: "approval_resolved".to_string(),
-                    metadata_json: Some(metadata_json),
-                    actor_type: Some("operator".to_string()),
-                    actor_id: Some(operator.actor_id().to_string()),
-                    reason: Some(operator.reason().to_string()),
-                    created_at: now.get(),
-                },
-            )
-            .await?;
-            let changed = diesel::update(
-                durable_approval::table
-                    .find(approval.id)
-                    .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
-            )
-            .set((
-                durable_approval::status.eq(ApprovalStatus::Resolved),
-                durable_approval::decision_payload_json.eq(Some(decision)),
-                durable_approval::decided_by.eq(Some(actor_id)),
-                durable_approval::operator_reason.eq(Some(operator.reason().to_string())),
-                durable_approval::resolved_at.eq(Some(now)),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_changed(changed)?;
-            let next_status = if workflow.status == WorkflowStatus::Paused {
-                WorkflowStatus::Paused
-            } else {
-                WorkflowStatus::Ready
-            };
-            let changed = diesel::update(
-                durable_workflow::table
-                    .find(workflow.id)
-                    .filter(durable_workflow::status.eq(&workflow.status))
-                    .filter(durable_workflow::wait_reference_id.eq(Some(approval.id.get()))),
-            )
-            .set((
-                durable_workflow::status.eq(next_status),
-                persistence::WaitColumns::cleared(),
-                durable_workflow::available_at.eq(now),
-                durable_workflow::updated_at.eq(now),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_changed(changed)?;
-            Ok(ApprovalResolutionOutcome {
-                approval_id,
-                workflow_id,
-                status: ApprovalStatus::Resolved.to_string(),
-            })
-        })
+                let event = WorkflowEvent::ApprovalResolved {
+                    command_sequence,
+                    result: ApprovalResult {
+                        kind: workflow.kind.clone(),
+                        version: workflow.version,
+                        payload_json: decision.clone(),
+                    },
+                };
+                let metadata_json = serde_json::to_string(&event)?;
+                ensure_size(
+                    "approval resolution event",
+                    &metadata_json,
+                    MAX_EVENT_METADATA_BYTES,
+                )?;
+                let delivery_sequence = workflow
+                    .delivered_event_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        DurableError::InvalidState(
+                            "workflow delivery sequence overflow".to_string(),
+                        )
+                    })?;
+                let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
+                persistence::append_event(
+                    connection,
+                    NewWorkflowEventRow {
+                        workflow_id: workflow.id,
+                        sequence,
+                        delivery_sequence: Some(delivery_sequence),
+                        event_type: "approval_resolved".to_string(),
+                        metadata_json: Some(metadata_json),
+                        actor_type: Some("operator".to_string()),
+                        actor_id: Some(operator.actor_id().to_string()),
+                        reason: Some(operator.reason().to_string()),
+                        created_at: now.get(),
+                    },
+                )
+                .await?;
+                let changed = diesel::update(
+                    durable_approval::table
+                        .find(approval.id)
+                        .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
+                )
+                .set((
+                    durable_approval::status.eq(ApprovalStatus::Resolved),
+                    durable_approval::decision_payload_json.eq(Some(decision)),
+                    durable_approval::decided_by.eq(Some(actor_id)),
+                    durable_approval::operator_reason.eq(Some(operator.reason().to_string())),
+                    durable_approval::resolved_at.eq(Some(now)),
+                ))
+                .execute(connection)
+                .await?;
+                ensure_changed(changed)?;
+                let next_status = if workflow.status == WorkflowStatus::Paused {
+                    WorkflowStatus::Paused
+                } else {
+                    WorkflowStatus::Ready
+                };
+                let changed = diesel::update(
+                    durable_workflow::table
+                        .find(workflow.id)
+                        .filter(durable_workflow::status.eq(&workflow.status))
+                        .filter(durable_workflow::wait_reference_id.eq(Some(approval.id.get()))),
+                )
+                .set((
+                    durable_workflow::status.eq(next_status),
+                    persistence::WaitColumns::cleared(),
+                    durable_workflow::available_at.eq(now),
+                    durable_workflow::updated_at.eq(now),
+                ))
+                .execute(connection)
+                .await?;
+                ensure_changed(changed)?;
+                Ok(trace.commit(ApprovalResolutionOutcome {
+                    approval_id,
+                    workflow_id,
+                    status: ApprovalStatus::Resolved.to_string(),
+                }))
+            },
+        )
         .await
     }
 
@@ -700,52 +739,60 @@ where
         let operator = operator.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("admin_schedule_pause", false);
-            let state = lock_schedule_state(connection, scope, &schedule_key).await?;
-            validate_schedule_state(&state, &definition)?;
-            if paused == state.paused_at.is_some() {
-                return Err(DurableError::Conflict(format!(
-                    "schedule {schedule_key} is already {}",
-                    if paused { "paused" } else { "active" }
-                )));
-            }
-            let now = persistence::database_now_millis(connection).await?;
-            let changed = if paused {
-                diesel::update(
-                    durable_schedule_state::table
-                        .find(&schedule_key)
-                        .filter(durable_schedule_state::paused_at.is_null()),
-                )
-                .set((
-                    durable_schedule_state::paused_at.eq(Some(now)),
-                    durable_schedule_state::paused_by.eq(Some(actor_id)),
-                    durable_schedule_state::pause_reason.eq(Some(operator.reason().to_string())),
-                    durable_schedule_state::updated_at.eq(now),
-                ))
-                .execute(connection)
-                .await?
-            } else {
-                diesel::update(
-                    durable_schedule_state::table
-                        .find(&schedule_key)
-                        .filter(durable_schedule_state::paused_at.is_not_null()),
-                )
-                .set((
-                    durable_schedule_state::paused_at.eq(None::<i64>),
-                    durable_schedule_state::paused_by.eq(None::<i32>),
-                    durable_schedule_state::pause_reason.eq(None::<String>),
-                    durable_schedule_state::updated_at.eq(now),
-                ))
-                .execute(connection)
-                .await?
-            };
-            ensure_changed(changed)?;
-            Ok(ScheduleControlOutcome {
-                schedule_key,
-                paused,
-            })
-        })
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("admin_schedule_pause", false);
+                let state = lock_schedule_state(connection, scope, &schedule_key).await?;
+                validate_schedule_state(&state, &definition)?;
+                if paused == state.paused_at.is_some() {
+                    return Err(DurableError::Conflict(format!(
+                        "schedule {schedule_key} is already {}",
+                        if paused { "paused" } else { "active" }
+                    )));
+                }
+                let now = persistence::database_now_millis(connection).await?;
+                let changed = if paused {
+                    diesel::update(
+                        durable_schedule_state::table
+                            .find(&schedule_key)
+                            .filter(durable_schedule_state::paused_at.is_null()),
+                    )
+                    .set((
+                        durable_schedule_state::paused_at.eq(Some(now)),
+                        durable_schedule_state::paused_by.eq(Some(actor_id)),
+                        durable_schedule_state::pause_reason
+                            .eq(Some(operator.reason().to_string())),
+                        durable_schedule_state::updated_at.eq(now),
+                    ))
+                    .execute(connection)
+                    .await?
+                } else {
+                    diesel::update(
+                        durable_schedule_state::table
+                            .find(&schedule_key)
+                            .filter(durable_schedule_state::paused_at.is_not_null()),
+                    )
+                    .set((
+                        durable_schedule_state::paused_at.eq(None::<i64>),
+                        durable_schedule_state::paused_by.eq(None::<i32>),
+                        durable_schedule_state::pause_reason.eq(None::<String>),
+                        durable_schedule_state::updated_at.eq(now),
+                    ))
+                    .execute(connection)
+                    .await?
+                };
+                ensure_changed(changed)?;
+                Ok(trace.commit(ScheduleControlOutcome {
+                    schedule_key,
+                    paused,
+                }))
+            },
+        )
         .await
     }
 
@@ -774,8 +821,8 @@ where
         let operator = operator.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("admin_run_schedule_now", true);
+        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope, trace }| {
+            let trace = trace.declare_unmodeled("admin_run_schedule_now", true);
             let state = lock_schedule_state(connection, scope, &schedule_key).await?;
             validate_schedule_state(&state, &definition)?;
             let overlap_checked = match definition.overlap {
@@ -841,11 +888,11 @@ where
             ensure_changed(changed)?;
             append_operator_event(connection, workflow_id, "schedule_run_now", &operator, now)
                 .await?;
-            Ok(ScheduleRunNowOutcome {
+            Ok(trace.commit(ScheduleRunNowOutcome {
                 schedule_run_id,
                 workflow_id,
                 scheduled_for,
-            })
+            }))
         })
         .await
     }

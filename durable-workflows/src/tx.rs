@@ -5,8 +5,21 @@
 //!   [`TxScope`] token branded with the callback's lifetime. Only [`enter`]
 //!   builds one, inside a transaction that `dialect::transaction` or
 //!   [`caller_transaction`] opened. Callbacks destructure it
-//!   (`async move |Tx { connection, scope }| ...`) and keep passing the plain
-//!   `&mut DurableConnection` to helpers, as before.
+//!   (`async move |Tx { connection, scope, trace }| ...`) and keep passing
+//!   the plain `&mut DurableConnection` to helpers, as before.
+//! - [`Trace`] is the trace declaration state of the transaction
+//!   (`Tx::trace`). It starts `Trace<'tx, Undeclared>`; [`Trace::declare`]
+//!   (or `declare_unmodeled`) yields `Trace<'tx, Declared>`, and the callback
+//!   must return `Ok(Committed<R>)`, which only `Trace<'tx, Declared>::commit`
+//!   builds. A transaction that commits without naming its model step does
+//!   not compile. A helper that declares for its caller (`insert_prepared`,
+//!   `commit_on_connection`, `finish_on_connection`) takes the `Trace` by
+//!   value and returns `Trace<'tx, Declared>` with its result. The one
+//!   escape is [`Trace::unchanged`] (or a [`Step`] from
+//!   [`Trace::declare_if`]) for a path that wrote nothing: it records no
+//!   step, and under `trace-model` it panics if the scope declared a step or
+//!   touched a row. A path that writes a row without touching it is not
+//!   caught by either; that is a review rule (every write touches its row).
 //! - [`Locked`] proves that its row was read `FOR UPDATE` (or changed by a
 //!   one-row fenced `UPDATE`) in the transaction of its brand `'tx`. Only the
 //!   `lock_*` functions in this module build one; they need the scope token,
@@ -55,6 +68,15 @@
 //! 6. In `activity_worker::finish_on_connection`, call `settle_revoked` with
 //!    the claim's unlocked copy `&claim.row`: E0308 (expected
 //!    `Locked<'_, &ActivityRow>`, found `&ActivityRow`).
+//! 7. Trace: in `AdminControlService::pause_workflow`, drop the
+//!    `let trace = trace.declare(..)` statement: E0599 (no method `commit`
+//!    for `Trace<'_, Undeclared>`).
+//! 8. Trace: in `ProgressReporter::report`, return
+//!    `Ok(ProgressReportOutcome::LimitReached)` without `trace.commit`:
+//!    E0308 (expected `Committed<_>`).
+//! 9. Trace: in `coordinator::commit_activity`, drop the
+//!    `let trace = trace.declare(..)` statement: E0308 (expected
+//!    `Trace<'_, Declared>`, found `Trace<'_, Undeclared>`).
 
 use std::{future::Future, marker::PhantomData, ops::Deref};
 
@@ -77,24 +99,149 @@ pub(crate) struct TxScope<'tx>(PhantomData<fn(&'tx ()) -> &'tx ()>);
 pub(crate) struct Tx<'tx> {
     pub(crate) connection: &'tx mut DurableConnection,
     pub(crate) scope: TxScope<'tx>,
+    pub(crate) trace: Trace<'tx, Undeclared>,
+}
+
+/// State of a [`Trace`] before the transaction named its model step.
+pub(crate) enum Undeclared {}
+/// State of a [`Trace`] after the transaction named its model step.
+pub(crate) enum Declared {}
+
+/// The trace declaration state of one transaction (INVARIANTS §2.8; the
+/// trace-checking recorder, `docs/TRACE_CHECKING.md`). Every callback starts
+/// with `Trace<'tx, Undeclared>`; [`Trace::declare`] moves it to
+/// `Trace<'tx, Declared>`, and only that state builds the [`Committed`] a
+/// callback must return on success. A transaction that commits without
+/// declaring its step does not compile.
+///
+/// Branded with the transaction's `'tx` like [`TxScope`], so a state cannot
+/// leave its callback or serve another transaction. Not `Clone`: a helper
+/// that declares takes the state by value and returns `Trace<'tx, Declared>`
+/// with its result. Rust is affine: dropping a state is allowed, but a
+/// callback that drops it has nothing to build `Committed` from, so it can
+/// only return an error (which rolls back and records no step).
+#[must_use = "a transaction commits only through `Trace::commit` or `Trace::unchanged`"]
+pub(crate) struct Trace<'tx, State> {
+    scope: TxScope<'tx>,
+    state: PhantomData<State>,
+}
+
+/// The success value of a transaction callback: proof that the transaction
+/// declared its model step (or wrote nothing, [`Trace::unchanged`]).
+/// [`enter`] unwraps it; callers of `dialect::transaction` get `R`.
+///
+/// Not branded: a `'tx` in the callback's output type makes its future's
+/// higher-ranked `Send` unprovable (rust-lang/rust#102211; the witness
+/// erases the two brands separately). It needs no brand to stay sound: only
+/// consuming a branded [`Trace`] builds one, each callback gets one `Trace`,
+/// and [`enter`] unwraps the value, so a `Committed` never reaches another
+/// callback.
+#[must_use]
+pub(crate) struct Committed<R> {
+    value: R,
+}
+
+impl<'tx, State> Trace<'tx, State> {
+    /// Declares the transaction's model step. A second declaration in the
+    /// same transaction makes the recorded step a `Batch` of them, in order.
+    pub(crate) fn declare(
+        self,
+        action: impl FnOnce() -> crate::trace::Action,
+    ) -> Trace<'tx, Declared> {
+        crate::trace::declare(action);
+        Trace {
+            scope: self.scope,
+            state: PhantomData,
+        }
+    }
+
+    /// Declares a step the model does not cover (`Unmodeled{name}`); see
+    /// `trace::declare_unmodeled`.
+    pub(crate) fn declare_unmodeled(
+        self,
+        name: &'static str,
+        writes_modeled: bool,
+    ) -> Trace<'tx, Declared> {
+        crate::trace::declare_unmodeled(name, writes_modeled);
+        Trace {
+            scope: self.scope,
+            state: PhantomData,
+        }
+    }
+}
+
+impl<'tx> Trace<'tx, Declared> {
+    /// Commits the transaction with `value` as the callback's result.
+    pub(crate) fn commit<R>(self, value: R) -> Committed<R> {
+        Committed { value }
+    }
+}
+
+impl<'tx> Trace<'tx, Undeclared> {
+    /// Declares `action` when `wrote`, else leaves the step undeclared for
+    /// [`Trace::unchanged`].
+    pub(crate) fn declare_if(
+        self,
+        wrote: bool,
+        action: impl FnOnce() -> crate::trace::Action,
+    ) -> Step<'tx> {
+        if wrote {
+            Step::Declared(self.declare(action))
+        } else {
+            Step::Unchanged(self)
+        }
+    }
+
+    /// Commits a path that wrote nothing and declared no step (an early
+    /// return on a row that is already in its final state): the recorder
+    /// records no row for it. Under `trace-model` a scope that holds a
+    /// declaration or a touched row panics here, so a writing path cannot
+    /// commit this way unnoticed; the types cannot see writes.
+    pub(crate) fn unchanged<R>(self, value: R) -> Committed<R> {
+        crate::trace::assert_unchanged();
+        Committed { value }
+    }
+}
+
+/// A [`Trace`] whose step is declared on some paths only (a claim that found
+/// nothing to claim or reconcile records nothing): built by
+/// [`Trace::declare_if`], committed either way by [`Step::commit`].
+#[must_use = "a transaction commits only through `Step::commit`"]
+pub(crate) enum Step<'tx> {
+    Unchanged(Trace<'tx, Undeclared>),
+    Declared(Trace<'tx, Declared>),
+}
+
+impl Step<'_> {
+    pub(crate) fn commit<R>(self, value: R) -> Committed<R> {
+        match self {
+            Step::Unchanged(trace) => trace.unchanged(value),
+            Step::Declared(trace) => trace.commit(value),
+        }
+    }
 }
 
 /// Runs `callback` inside the transaction the caller opened on `connection`
-/// (the only constructor of [`Tx`]), within the trace scope.
+/// (the only constructor of [`Tx`] and of [`Trace`]), within the trace scope.
 pub(crate) async fn enter<R, E, F>(connection: &mut DurableConnection, callback: F) -> Result<R, E>
 where
-    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<R, E>
-        + TransactionCallback<Tx<'r>, Result<R, E>, Fut: Send>
+    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<Committed<R>, E>
+        + TransactionCallback<Tx<'r>, Result<Committed<R>, E>, Fut: Send>
         + Send,
     E: Send,
     R: Send,
 {
     crate::trace::scoped(connection, async move |connection| {
-        callback(Tx {
+        let scope = TxScope(PhantomData);
+        let tx = Tx {
             connection,
-            scope: TxScope(PhantomData),
-        })
-        .await
+            scope,
+            trace: Trace {
+                scope,
+                state: PhantomData,
+            },
+        };
+        callback(tx).await.map(|committed| committed.value)
     })
     .await
 }
@@ -107,8 +254,8 @@ pub(crate) async fn caller_transaction<R, E, F>(
     callback: F,
 ) -> Result<R, E>
 where
-    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<R, E>
-        + TransactionCallback<Tx<'r>, Result<R, E>, Fut: Send>
+    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<Committed<R>, E>
+        + TransactionCallback<Tx<'r>, Result<Committed<R>, E>, Fut: Send>
         + Send,
     E: From<diesel::result::Error> + Send,
     R: Send,

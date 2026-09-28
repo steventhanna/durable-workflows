@@ -1,4 +1,4 @@
-use crate::tx::Tx;
+use crate::tx::{Declared, Trace, Tx, Undeclared};
 use crate::DbMillis;
 use chrono::{DateTime, Utc};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper, TextExpressionMethods};
@@ -142,32 +142,40 @@ impl DurableStore {
                 crate::MAX_ERROR_REASON_BYTES
             )));
         }
-        crate::tx::caller_transaction(connection, async move |Tx { connection, scope }| {
-            let workflow = tx::lock_optional(
-                connection,
-                scope,
-                durable_workflow::table
-                    .find(workflow_id)
-                    .for_update()
-                    .select(WorkflowRow::as_select()),
-            )
-            .await?
-            .ok_or_else(|| DurableError::NotFound {
-                resource: "workflow",
-                identifier: workflow_id.to_string(),
-            })?;
-            if workflow.status.is_terminal() {
-                return Ok(());
-            }
-            let now = persistence::database_now_millis(connection).await?;
-            crate::trace::declare(|| {
-                crate::trace::Action::new(
-                    "TX3_Cancel",
-                    serde_json::json!({ "workflow_id": workflow.id }),
+        crate::tx::caller_transaction(
+            connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let workflow = tx::lock_optional(
+                    connection,
+                    scope,
+                    durable_workflow::table
+                        .find(workflow_id)
+                        .for_update()
+                        .select(WorkflowRow::as_select()),
                 )
-            });
-            cancel_locked_workflow(connection, workflow.as_ref(), reason, None, now).await
-        })
+                .await?
+                .ok_or_else(|| DurableError::NotFound {
+                    resource: "workflow",
+                    identifier: workflow_id.to_string(),
+                })?;
+                if workflow.status.is_terminal() {
+                    return Ok(trace.unchanged(()));
+                }
+                let now = persistence::database_now_millis(connection).await?;
+                let trace = trace.declare(|| {
+                    crate::trace::Action::new(
+                        "TX3_Cancel",
+                        serde_json::json!({ "workflow_id": workflow.id }),
+                    )
+                });
+                cancel_locked_workflow(connection, workflow.as_ref(), reason, None, now).await?;
+                Ok(trace.commit(()))
+            },
+        )
         .await
     }
 
@@ -181,10 +189,28 @@ impl DurableStore {
     {
         let (result, rolled_back) = crate::trace::capture_rollback(async {
             let mut connection = self.pool.get().await?;
-            // The inner transaction becomes a savepoint inside this pinned one.
-            crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
-                Self::start_with_conn(connection, workflow, options).await
-            })
+            crate::dialect::transaction(
+                &mut connection,
+                async move |Tx {
+                                connection,
+                                scope,
+                                trace,
+                            }| {
+                    let (input_json, state_json) = prepare_start(workflow, &options)?;
+                    let (outcome, trace) = Self::insert_prepared(
+                        connection,
+                        scope,
+                        trace,
+                        W::KIND,
+                        W::VERSION,
+                        input_json,
+                        state_json,
+                        options,
+                    )
+                    .await?;
+                    Ok(trace.commit(outcome))
+                },
+            )
             .await
         })
         .await;
@@ -204,30 +230,26 @@ impl DurableStore {
     where
         W: WorkflowHandler,
     {
-        validate_definition::<W>()?;
-        validate_options(&options)?;
-
-        let input_json = serde_json::to_string(workflow)?;
-        ensure_size("workflow input", &input_json, MAX_INPUT_STATE_PAYLOAD_BYTES)?;
-        let state_json = serde_json::to_string(&workflow.initial_state())?;
-        ensure_size("workflow state", &state_json, MAX_INPUT_STATE_PAYLOAD_BYTES)?;
-
+        let (input_json, state_json) = prepare_start(workflow, &options)?;
         crate::tx::caller_transaction(
             connection,
             async move |Tx {
                             connection: transaction,
                             scope,
+                            trace,
                         }| {
-                Self::insert_prepared(
+                let (outcome, trace) = Self::insert_prepared(
                     transaction,
                     scope,
+                    trace,
                     W::KIND,
                     W::VERSION,
                     input_json,
                     state_json,
                     options,
                 )
-                .await
+                .await?;
+                Ok(trace.commit(outcome))
             },
         )
         .await
@@ -265,10 +287,21 @@ impl DurableStore {
     {
         let (result, rolled_back) = crate::trace::capture_rollback(async {
             let mut connection = self.pool.get().await?;
-            // The inner transaction becomes a savepoint inside this pinned one.
-            crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
-                Self::start_or_restart_recoverable_with_conn(connection, workflow, options).await
-            })
+            crate::dialect::transaction(
+                &mut connection,
+                async move |Tx {
+                                connection,
+                                scope,
+                                trace,
+                            }| {
+                    let (input_json, state_json) = prepare_start(workflow, &options)?;
+                    let (outcome, trace) = Self::recoverable_start_in::<W>(
+                        connection, scope, trace, input_json, state_json, options,
+                    )
+                    .await?;
+                    Ok(trace.commit(outcome))
+                },
+            )
             .await
         })
         .await;
@@ -288,202 +321,225 @@ impl DurableStore {
     where
         W: WorkflowHandler,
     {
-        validate_definition::<W>()?;
-        validate_options(&options)?;
-
-        let input_json = serde_json::to_string(workflow)?;
-        ensure_size("workflow input", &input_json, MAX_INPUT_STATE_PAYLOAD_BYTES)?;
-        let state_json = serde_json::to_string(&workflow.initial_state())?;
-        ensure_size("workflow state", &state_json, MAX_INPUT_STATE_PAYLOAD_BYTES)?;
-
+        let (input_json, state_json) = prepare_start(workflow, &options)?;
         crate::tx::caller_transaction(
             connection,
             async move |Tx {
                             connection: transaction,
                             scope,
+                            trace,
                         }| {
-                let Some(key) = options.deduplication_key().map(str::to_owned) else {
-                    return Self::insert_prepared(
-                        transaction,
-                        scope,
-                        W::KIND,
-                        W::VERSION,
-                        input_json,
-                        state_json,
-                        options,
-                    )
-                    .await;
-                };
-                let original = tx::lock_optional(
+                let (outcome, trace) = Self::recoverable_start_in::<W>(
                     transaction,
                     scope,
-                    durable_workflow::table
-                        .filter(durable_workflow::kind.eq(W::KIND))
-                        .filter(durable_workflow::deduplication_key.eq(&key))
-                        .for_update()
-                        .select(WorkflowRow::as_select()),
-                )
-                .await?;
-                let Some(original) = original else {
-                    let outcome = Self::insert_prepared_untraced(
-                        transaction,
-                        scope,
-                        W::KIND,
-                        W::VERSION,
-                        input_json,
-                        state_json,
-                        options,
-                    )
-                    .await?;
-                    declare_recoverable_start(
-                        W::KIND,
-                        W::VERSION,
-                        &key,
-                        None,
-                        false,
-                        outcome.workflow_id.get(),
-                        outcome.inserted,
-                    );
-                    return Ok(outcome);
-                };
-                let root_id = original.root_workflow_id.unwrap_or(original.id);
-                let original_id = original.id;
-                let latest = lock_newest_generation(transaction, original).await?;
-                if !latest.status.is_start_recoverable() {
-                    declare_recoverable_start(
-                        W::KIND,
-                        W::VERSION,
-                        &key,
-                        Some((original_id, latest.id)),
-                        false,
-                        latest.id.get(),
-                        false,
-                    );
-                    return Ok(StartOutcome {
-                        workflow_id: latest.id,
-                        inserted: false,
-                    });
-                }
-
-                // The successor goes in first: a restart-key `Conflict` then
-                // rolls back before anything else is written, and a blocked
-                // row's waiting parents can be re-pointed at it.
-                let lineage = Some((original_id, latest.id));
-                let outcome = Self::insert_prepared_untraced(
-                    transaction,
-                    scope,
-                    W::KIND,
-                    W::VERSION,
+                    trace,
                     input_json,
                     state_json,
-                    options.restarted(root_id, latest.id),
+                    options,
                 )
-                .await;
-                let successor = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        // The restart key already has a successor: everything rolls back.
-                        if matches!(error, DurableError::Conflict(_)) {
-                            crate::trace::declare_rollback(|| {
-                                recoverable_start_action(
-                                    W::KIND,
-                                    W::VERSION,
-                                    &key,
-                                    lineage,
-                                    false,
-                                    0,
-                                    false,
-                                )
-                            });
-                        }
-                        return Err(error);
-                    }
-                };
-
-                let now = persistence::database_now_millis(transaction).await?;
-                if crate::trace::ENABLED {
-                    for id in durable_activity::table
-                        .filter(durable_activity::workflow_id.eq(latest.id))
-                        .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-                        .select(durable_activity::id)
-                        .load::<ActivityId>(transaction)
-                        .await?
-                    {
-                        crate::trace::touch_act(id);
-                    }
-                    crate::trace::touch_wf(latest.id);
-                }
-                diesel::update(
-                    durable_activity::table
-                        .filter(durable_activity::workflow_id.eq(latest.id))
-                        .filter(durable_activity::status.eq(ActivityStatus::DeadLettered)),
-                )
-                .set((
-                    durable_activity::status.eq(ActivityStatus::Cancelled),
-                    persistence::LeaseCleared::new(),
-                    durable_activity::updated_at.eq(now),
-                    durable_activity::completed_at.eq(Some(now)),
-                ))
-                .execute(transaction)
                 .await?;
-                if latest.status == WorkflowStatus::Blocked {
-                    let changed = diesel::update(
-                        durable_workflow::table
-                            .find(latest.id)
-                            .filter(durable_workflow::status.eq(WorkflowStatus::Blocked)),
-                    )
-                    .set((
-                        durable_workflow::status.eq(WorkflowStatus::Cancelled),
-                        durable_workflow::lease_owner.eq(None::<String>),
-                        durable_workflow::lease_token.eq(None::<String>),
-                        durable_workflow::lease_expires_at.eq(None::<i64>),
-                        durable_workflow::updated_at.eq(now),
-                        durable_workflow::completed_at.eq(Some(now)),
-                    ))
-                    .execute(transaction)
-                    .await?;
-                    if changed != 1 {
-                        return Err(DurableError::FencedWrite);
-                    }
-                    let sequence = persistence::next_event_sequence(transaction, latest.id).await?;
-                    persistence::append_event(
-                        transaction,
-                        NewWorkflowEventRow {
-                            workflow_id: latest.id,
-                            sequence,
-                            delivery_sequence: None,
-                            event_type: "workflow_superseded_by_recovery".to_string(),
-                            metadata_json: None,
-                            actor_type: Some("system".to_string()),
-                            actor_id: None,
-                            reason: Some("a successor recovery generation was started".to_string()),
-                            created_at: now.get(),
-                        },
-                    )
-                    .await?;
-                    hand_waiting_parents_to_successor(
-                        transaction,
-                        latest.as_ref(),
-                        successor.workflow_id,
-                        W::VERSION,
-                        now,
-                    )
-                    .await?;
-                }
-
-                declare_recoverable_start(
-                    W::KIND,
-                    W::VERSION,
-                    &key,
-                    lineage,
-                    true,
-                    successor.workflow_id.get(),
-                    successor.inserted,
-                );
-                Ok(successor)
+                Ok(trace.commit(outcome))
             },
         )
         .await
+    }
+
+    /// T-X2 in the caller's transaction: `start_or_restart_recoverable` and
+    /// its `_with_conn` form.
+    async fn recoverable_start_in<'tx, W: WorkflowHandler>(
+        transaction: &mut DurableConnection,
+        scope: TxScope<'tx>,
+        trace: Trace<'tx, Undeclared>,
+        input_json: String,
+        state_json: String,
+        options: StartOptions,
+    ) -> Result<(StartOutcome, Trace<'tx, Declared>), DurableError> {
+        let Some(key) = options.deduplication_key().map(str::to_owned) else {
+            return Self::insert_prepared(
+                transaction,
+                scope,
+                trace,
+                W::KIND,
+                W::VERSION,
+                input_json,
+                state_json,
+                options,
+            )
+            .await;
+        };
+        let original = tx::lock_optional(
+            transaction,
+            scope,
+            durable_workflow::table
+                .filter(durable_workflow::kind.eq(W::KIND))
+                .filter(durable_workflow::deduplication_key.eq(&key))
+                .for_update()
+                .select(WorkflowRow::as_select()),
+        )
+        .await?;
+        let Some(original) = original else {
+            let outcome = Self::insert_prepared_untraced(
+                transaction,
+                scope,
+                W::KIND,
+                W::VERSION,
+                input_json,
+                state_json,
+                options,
+            )
+            .await?;
+            let trace = declare_recoverable_start(
+                trace,
+                W::KIND,
+                W::VERSION,
+                &key,
+                None,
+                false,
+                outcome.workflow_id.get(),
+                outcome.inserted,
+            );
+            return Ok((outcome, trace));
+        };
+        let root_id = original.root_workflow_id.unwrap_or(original.id);
+        let original_id = original.id;
+        let latest = lock_newest_generation(transaction, original).await?;
+        if !latest.status.is_start_recoverable() {
+            let trace = declare_recoverable_start(
+                trace,
+                W::KIND,
+                W::VERSION,
+                &key,
+                Some((original_id, latest.id)),
+                false,
+                latest.id.get(),
+                false,
+            );
+            return Ok((
+                StartOutcome {
+                    workflow_id: latest.id,
+                    inserted: false,
+                },
+                trace,
+            ));
+        }
+
+        // The successor goes in first: a restart-key `Conflict` then
+        // rolls back before anything else is written, and a blocked
+        // row's waiting parents can be re-pointed at it.
+        let lineage = Some((original_id, latest.id));
+        let outcome = Self::insert_prepared_untraced(
+            transaction,
+            scope,
+            W::KIND,
+            W::VERSION,
+            input_json,
+            state_json,
+            options.restarted(root_id, latest.id),
+        )
+        .await;
+        let successor = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // The restart key already has a successor: everything rolls back.
+                if matches!(error, DurableError::Conflict(_)) {
+                    crate::trace::declare_rollback(|| {
+                        recoverable_start_action(
+                            W::KIND,
+                            W::VERSION,
+                            &key,
+                            lineage,
+                            false,
+                            0,
+                            false,
+                        )
+                    });
+                }
+                return Err(error);
+            }
+        };
+
+        let now = persistence::database_now_millis(transaction).await?;
+        if crate::trace::ENABLED {
+            for id in durable_activity::table
+                .filter(durable_activity::workflow_id.eq(latest.id))
+                .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
+                .select(durable_activity::id)
+                .load::<ActivityId>(transaction)
+                .await?
+            {
+                crate::trace::touch_act(id);
+            }
+            crate::trace::touch_wf(latest.id);
+        }
+        diesel::update(
+            durable_activity::table
+                .filter(durable_activity::workflow_id.eq(latest.id))
+                .filter(durable_activity::status.eq(ActivityStatus::DeadLettered)),
+        )
+        .set((
+            durable_activity::status.eq(ActivityStatus::Cancelled),
+            persistence::LeaseCleared::new(),
+            durable_activity::updated_at.eq(now),
+            durable_activity::completed_at.eq(Some(now)),
+        ))
+        .execute(transaction)
+        .await?;
+        if latest.status == WorkflowStatus::Blocked {
+            let changed = diesel::update(
+                durable_workflow::table
+                    .find(latest.id)
+                    .filter(durable_workflow::status.eq(WorkflowStatus::Blocked)),
+            )
+            .set((
+                durable_workflow::status.eq(WorkflowStatus::Cancelled),
+                durable_workflow::lease_owner.eq(None::<String>),
+                durable_workflow::lease_token.eq(None::<String>),
+                durable_workflow::lease_expires_at.eq(None::<i64>),
+                durable_workflow::updated_at.eq(now),
+                durable_workflow::completed_at.eq(Some(now)),
+            ))
+            .execute(transaction)
+            .await?;
+            if changed != 1 {
+                return Err(DurableError::FencedWrite);
+            }
+            let sequence = persistence::next_event_sequence(transaction, latest.id).await?;
+            persistence::append_event(
+                transaction,
+                NewWorkflowEventRow {
+                    workflow_id: latest.id,
+                    sequence,
+                    delivery_sequence: None,
+                    event_type: "workflow_superseded_by_recovery".to_string(),
+                    metadata_json: None,
+                    actor_type: Some("system".to_string()),
+                    actor_id: None,
+                    reason: Some("a successor recovery generation was started".to_string()),
+                    created_at: now.get(),
+                },
+            )
+            .await?;
+            hand_waiting_parents_to_successor(
+                transaction,
+                latest.as_ref(),
+                successor.workflow_id,
+                W::VERSION,
+                now,
+            )
+            .await?;
+        }
+
+        let trace = declare_recoverable_start(
+            trace,
+            W::KIND,
+            W::VERSION,
+            &key,
+            lineage,
+            true,
+            successor.workflow_id.get(),
+            successor.inserted,
+        );
+        Ok((successor, trace))
     }
 
     /// Runs in the caller's transaction; see the `*_with_conn` contract on
@@ -493,72 +549,86 @@ impl DurableStore {
         prepared: crate::PreparedWorkflowStart,
         options: StartOptions,
     ) -> Result<StartOutcome, DurableError> {
-        validate_options(&options)?;
-        ensure_size(
-            "workflow input",
-            prepared.input_json(),
-            MAX_INPUT_STATE_PAYLOAD_BYTES,
-        )?;
-        ensure_size(
-            "workflow state",
-            prepared.state_json(),
-            MAX_INPUT_STATE_PAYLOAD_BYTES,
-        )?;
+        check_prepared_start(&prepared, &options)?;
         crate::tx::caller_transaction(
             connection,
             async move |Tx {
                             connection: transaction,
                             scope,
+                            trace,
                         }| {
-                Self::insert_prepared(
-                    transaction,
-                    scope,
-                    prepared.kind(),
-                    prepared.version(),
-                    prepared.input_json().to_string(),
-                    prepared.state_json().to_string(),
-                    options,
-                )
-                .await
+                let (outcome, trace) =
+                    Self::start_prepared_in(transaction, scope, trace, prepared, options).await?;
+                Ok(trace.commit(outcome))
             },
         )
         .await
     }
 
-    /// T-X1: `insert_prepared_untraced` declared as `TX1_Start`.
-    async fn insert_prepared<'tx>(
+    /// T-X1 for a prepared start inside a transaction the library already
+    /// opened (an operator restart); the caller runs
+    /// [`check_prepared_start`] first.
+    pub(crate) async fn start_prepared_in<'tx, S>(
         connection: &mut DurableConnection,
         scope: TxScope<'tx>,
+        trace: Trace<'tx, S>,
+        prepared: crate::PreparedWorkflowStart,
+        options: StartOptions,
+    ) -> Result<(StartOutcome, Trace<'tx, Declared>), DurableError> {
+        Self::insert_prepared(
+            connection,
+            scope,
+            trace,
+            prepared.kind(),
+            prepared.version(),
+            prepared.input_json().to_string(),
+            prepared.state_json().to_string(),
+            options,
+        )
+        .await
+    }
+
+    /// T-X1: `insert_prepared_untraced` declared as `TX1_Start`.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_prepared<'tx, S>(
+        connection: &mut DurableConnection,
+        scope: TxScope<'tx>,
+        trace: Trace<'tx, S>,
         kind: &str,
         version: i32,
         input_json: String,
         state_json: String,
         options: StartOptions,
-    ) -> Result<StartOutcome, DurableError> {
+    ) -> Result<(StartOutcome, Trace<'tx, Declared>), DurableError> {
         let key = options.deduplication_key().map(str::to_owned);
         let from = options.restarted_from_workflow_id();
         let outcome = Self::insert_prepared_untraced(
             connection, scope, kind, version, input_json, state_json, options,
         )
         .await;
-        match &outcome {
-            Ok(outcome) => declare_start(
-                kind,
-                version,
-                key.as_deref(),
-                from,
-                outcome.workflow_id.get(),
-                outcome.inserted,
-            ),
-            // Only the restart key can collide without a deduplication key.
-            Err(DurableError::Conflict(_)) if key.is_none() && from.is_some() => {
-                crate::trace::declare_rollback(|| {
-                    start_action(kind, version, None, from, 0, false)
-                });
+        match outcome {
+            Ok(outcome) => {
+                let trace = declare_start(
+                    trace,
+                    kind,
+                    version,
+                    key.as_deref(),
+                    from,
+                    outcome.workflow_id.get(),
+                    outcome.inserted,
+                );
+                Ok((outcome, trace))
             }
-            Err(_) => {}
+            Err(error) => {
+                // Only the restart key can collide without a deduplication key.
+                if matches!(error, DurableError::Conflict(_)) && key.is_none() && from.is_some() {
+                    crate::trace::declare_rollback(|| {
+                        start_action(kind, version, None, from, 0, false)
+                    });
+                }
+                Err(error)
+            }
         }
-        outcome
     }
 
     async fn insert_prepared_untraced<'tx>(
@@ -1190,15 +1260,49 @@ pub(crate) async fn cancel_approvals(
     Ok(())
 }
 
-fn declare_start(
+/// Validates a start and serializes its input and initial state.
+fn prepare_start<W: WorkflowHandler>(
+    workflow: &W,
+    options: &StartOptions,
+) -> Result<(String, String), DurableError> {
+    validate_definition::<W>()?;
+    validate_options(options)?;
+
+    let input_json = serde_json::to_string(workflow)?;
+    ensure_size("workflow input", &input_json, MAX_INPUT_STATE_PAYLOAD_BYTES)?;
+    let state_json = serde_json::to_string(&workflow.initial_state())?;
+    ensure_size("workflow state", &state_json, MAX_INPUT_STATE_PAYLOAD_BYTES)?;
+    Ok((input_json, state_json))
+}
+
+/// Validates a prepared start's options and payload sizes.
+pub(crate) fn check_prepared_start(
+    prepared: &crate::PreparedWorkflowStart,
+    options: &StartOptions,
+) -> Result<(), DurableError> {
+    validate_options(options)?;
+    ensure_size(
+        "workflow input",
+        prepared.input_json(),
+        MAX_INPUT_STATE_PAYLOAD_BYTES,
+    )?;
+    ensure_size(
+        "workflow state",
+        prepared.state_json(),
+        MAX_INPUT_STATE_PAYLOAD_BYTES,
+    )
+}
+
+fn declare_start<'tx, S>(
+    trace: Trace<'tx, S>,
     kind: &str,
     version: i32,
     deduplication_key: Option<&str>,
     from: Option<WorkflowId>,
     id: i64,
     inserted: bool,
-) {
-    crate::trace::declare(|| start_action(kind, version, deduplication_key, from, id, inserted));
+) -> Trace<'tx, Declared> {
+    trace.declare(|| start_action(kind, version, deduplication_key, from, id, inserted))
 }
 
 /// `TX1_Start`; `workflow_id` 0 with `inserted` false is a restart-key `Conflict`.
@@ -1223,7 +1327,9 @@ fn start_action(
     )
 }
 
-fn declare_recoverable_start(
+#[allow(clippy::too_many_arguments)]
+fn declare_recoverable_start<'tx>(
+    trace: Trace<'tx, Undeclared>,
     kind: &str,
     version: i32,
     deduplication_key: &str,
@@ -1231,8 +1337,8 @@ fn declare_recoverable_start(
     superseded: bool,
     id: i64,
     inserted: bool,
-) {
-    crate::trace::declare(|| {
+) -> Trace<'tx, Declared> {
+    trace.declare(|| {
         recoverable_start_action(
             kind,
             version,
@@ -1242,7 +1348,7 @@ fn declare_recoverable_start(
             id,
             inserted,
         )
-    });
+    })
 }
 
 /// `TX2_RecoverableStart`: `lineage` = the locked (original, latest) rows;

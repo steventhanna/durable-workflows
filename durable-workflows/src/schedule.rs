@@ -403,67 +403,76 @@ where
         let metadata = definition.metadata.clone();
         let now = deployed_at.timestamp_millis();
         let mut connection = pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("schedule_state", false);
-            let inserted = crate::dialect::insert_schedule_state_if_absent(
-                connection,
-                NewScheduleStateRow {
-                    schedule_key: metadata.key.clone(),
-                    definition_fingerprint: metadata.fingerprint.clone(),
-                    definition_version: metadata.version,
-                    next_local_occurrence: ScheduleCursor::initial(next.local())
-                        .local()
-                        .to_string(),
-                    next_occurrence_at: next.due_at,
-                    last_materialized_at: None,
-                    paused_at: None,
-                    paused_by: None,
-                    pause_reason: None,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .await?;
-            let row = tx::lock_first(
-                connection,
-                scope,
-                durable_schedule_state::table
-                    .find(&metadata.key)
-                    .for_update()
-                    .select(ScheduleStateRow::as_select()),
-            )
-            .await?;
-            if inserted {
-                return Ok(ScheduleStateReconcileOutcome::Inserted);
-            }
-            if row.definition_version > metadata.version {
-                return Ok(ScheduleStateReconcileOutcome::NewerPersisted);
-            }
-            if row.definition_version == metadata.version {
-                if row.definition_fingerprint == metadata.fingerprint {
-                    return Ok(ScheduleStateReconcileOutcome::Preserved);
-                }
-                return Err(DurableError::Conflict(format!(
-                    "schedule {} v{} metadata changed without a version bump",
-                    metadata.key, metadata.version
-                )));
-            }
-            // The upgrade drops the unmaterialized span before `now` (intended)
-            // and never targets an occurrence with a run row (S27, G5).
-            let floor = MaterializedFloor::load(connection, row.as_ref(), &metadata.key).await?;
-            let (cursor, target) = ScheduleCursor::upgrade(&calendar, deployed_at, floor)?;
-            diesel::update(durable_schedule_state::table.find(&metadata.key))
-                .set((
-                    durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
-                    durable_schedule_state::definition_version.eq(metadata.version),
-                    durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
-                    durable_schedule_state::next_occurrence_at.eq(target.due_at),
-                    durable_schedule_state::updated_at.eq(now),
-                ))
-                .execute(connection)
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("schedule_state", false);
+                let inserted = crate::dialect::insert_schedule_state_if_absent(
+                    connection,
+                    NewScheduleStateRow {
+                        schedule_key: metadata.key.clone(),
+                        definition_fingerprint: metadata.fingerprint.clone(),
+                        definition_version: metadata.version,
+                        next_local_occurrence: ScheduleCursor::initial(next.local())
+                            .local()
+                            .to_string(),
+                        next_occurrence_at: next.due_at,
+                        last_materialized_at: None,
+                        paused_at: None,
+                        paused_by: None,
+                        pause_reason: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
                 .await?;
-            Ok(ScheduleStateReconcileOutcome::Upgraded)
-        })
+                let row = tx::lock_first(
+                    connection,
+                    scope,
+                    durable_schedule_state::table
+                        .find(&metadata.key)
+                        .for_update()
+                        .select(ScheduleStateRow::as_select()),
+                )
+                .await?;
+                if inserted {
+                    return Ok(trace.commit(ScheduleStateReconcileOutcome::Inserted));
+                }
+                if row.definition_version > metadata.version {
+                    return Ok(trace.commit(ScheduleStateReconcileOutcome::NewerPersisted));
+                }
+                if row.definition_version == metadata.version {
+                    if row.definition_fingerprint == metadata.fingerprint {
+                        return Ok(trace.commit(ScheduleStateReconcileOutcome::Preserved));
+                    }
+                    return Err(DurableError::Conflict(format!(
+                        "schedule {} v{} metadata changed without a version bump",
+                        metadata.key, metadata.version
+                    )));
+                }
+                // The upgrade drops the unmaterialized span before `now` (intended)
+                // and never targets an occurrence with a run row (S27, G5).
+                let floor =
+                    MaterializedFloor::load(connection, row.as_ref(), &metadata.key).await?;
+                let (cursor, target) = ScheduleCursor::upgrade(&calendar, deployed_at, floor)?;
+                diesel::update(durable_schedule_state::table.find(&metadata.key))
+                    .set((
+                        durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
+                        durable_schedule_state::definition_version.eq(metadata.version),
+                        durable_schedule_state::next_local_occurrence
+                            .eq(cursor.local().to_string()),
+                        durable_schedule_state::next_occurrence_at.eq(target.due_at),
+                        durable_schedule_state::updated_at.eq(now),
+                    ))
+                    .execute(connection)
+                    .await?;
+                Ok(trace.commit(ScheduleStateReconcileOutcome::Upgraded))
+            },
+        )
         .await
     }
 }

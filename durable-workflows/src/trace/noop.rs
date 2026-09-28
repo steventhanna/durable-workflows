@@ -68,6 +68,9 @@ pub(crate) async fn capture_rollback<T>(
 }
 
 #[inline(always)]
+pub(crate) fn assert_unchanged() {}
+
+#[inline(always)]
 pub(crate) fn declare_unmodeled(_name: &'static str, _writes_modeled: bool) {}
 
 #[inline(always)]

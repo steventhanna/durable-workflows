@@ -114,105 +114,113 @@ where
         let registry = self.registry.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
-            crate::trace::declare_unmodeled("schedule_materialize", true);
-            let state = tx::lock_first(
-                connection,
-                scope,
-                durable_schedule_state::table
-                    .find(&schedule_key)
-                    .for_update()
-                    .select(ScheduleStateRow::as_select()),
-            )
-            .await?;
-            if state.definition_version != metadata.version
-                || state.definition_fingerprint != metadata.fingerprint
-            {
-                return Err(DurableError::Conflict(format!(
-                    "schedule {schedule_key} definition changed while materializing"
-                )));
-            }
-            let mut report = ScheduleMaterializationReport::empty(&schedule_key);
-            if state.paused_at.is_some() {
-                report.paused = true;
-                return Ok(report);
-            }
-            let mut active =
-                active_workflow_count(connection, state.as_ref(), &schedule_key).await?;
-            let mut queued = queued_run_exists(connection, &schedule_key).await?;
-            if metadata.overlap == OverlapPolicy::QueueOne && active == 0 && queued {
-                promote_queued(
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("schedule_materialize", true);
+                let state = tx::lock_first(
                     connection,
-                    registry.as_ref(),
-                    context.as_ref(),
-                    &schedule_key,
+                    scope,
+                    durable_schedule_state::table
+                        .find(&schedule_key)
+                        .for_update()
+                        .select(ScheduleStateRow::as_select()),
                 )
                 .await?;
-                active = 1;
-                queued = false;
-                report.started = report.started.saturating_add(1);
-            }
-
-            let cursor = ScheduleCursor::load(&schedule_key, &state.next_local_occurrence)?;
-            let mut occurrence = calendar.occurrence_at_local(cursor.local().datetime())?;
-            if occurrence.local_occurrence != state.next_local_occurrence
-                || occurrence.due_at != state.next_occurrence_at
-            {
-                return Err(DurableError::InvalidState(format!(
-                    "schedule {schedule_key} persisted local and UTC occurrences disagree"
-                )));
-            }
-            let (due, next, outcomes) = plan_due_chunk(
-                &calendar,
-                occurrence,
-                metadata.misfire,
-                metadata.misfire_grace_millis,
-                now,
-            )?;
-            occurrence = next;
-            report.inspected = u32::try_from(due.len()).map_err(|_| {
-                DurableError::InvalidState("schedule occurrence count exceeds u32".to_string())
-            })?;
-            for (occurrence, outcome) in due.into_iter().zip(outcomes) {
-                let target = MaterializationTarget {
-                    registry: registry.as_ref(),
-                    context: context.as_ref(),
-                    schedule_key: &schedule_key,
-                    overlap: metadata.overlap,
-                    active: &mut active,
-                    queued: &mut queued,
-                    now,
-                };
-                materialize_occurrence(connection, target, occurrence, outcome, &mut report)
-                    .await?;
-            }
-            if report.inspected == 0 {
-                return Ok(report);
-            }
-            let cursor = cursor.advance_to(occurrence.local())?;
-            let changed = diesel::update(
-                durable_schedule_state::table
-                    .find(&schedule_key)
-                    .filter(durable_schedule_state::definition_version.eq(metadata.version))
-                    .filter(
-                        durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
+                if state.definition_version != metadata.version
+                    || state.definition_fingerprint != metadata.fingerprint
+                {
+                    return Err(DurableError::Conflict(format!(
+                        "schedule {schedule_key} definition changed while materializing"
+                    )));
+                }
+                let mut report = ScheduleMaterializationReport::empty(&schedule_key);
+                if state.paused_at.is_some() {
+                    report.paused = true;
+                    return Ok(trace.commit(report));
+                }
+                let mut active =
+                    active_workflow_count(connection, state.as_ref(), &schedule_key).await?;
+                let mut queued = queued_run_exists(connection, &schedule_key).await?;
+                if metadata.overlap == OverlapPolicy::QueueOne && active == 0 && queued {
+                    promote_queued(
+                        connection,
+                        registry.as_ref(),
+                        context.as_ref(),
+                        &schedule_key,
                     )
-                    .filter(
-                        durable_schedule_state::next_local_occurrence
-                            .eq(&state.next_local_occurrence),
-                    ),
-            )
-            .set((
-                durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
-                durable_schedule_state::next_occurrence_at.eq(occurrence.due_at),
-                durable_schedule_state::last_materialized_at.eq(Some(now)),
-                durable_schedule_state::updated_at.eq(now),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_single_change(changed)?;
-            Ok(report)
-        })
+                    .await?;
+                    active = 1;
+                    queued = false;
+                    report.started = report.started.saturating_add(1);
+                }
+
+                let cursor = ScheduleCursor::load(&schedule_key, &state.next_local_occurrence)?;
+                let mut occurrence = calendar.occurrence_at_local(cursor.local().datetime())?;
+                if occurrence.local_occurrence != state.next_local_occurrence
+                    || occurrence.due_at != state.next_occurrence_at
+                {
+                    return Err(DurableError::InvalidState(format!(
+                        "schedule {schedule_key} persisted local and UTC occurrences disagree"
+                    )));
+                }
+                let (due, next, outcomes) = plan_due_chunk(
+                    &calendar,
+                    occurrence,
+                    metadata.misfire,
+                    metadata.misfire_grace_millis,
+                    now,
+                )?;
+                occurrence = next;
+                report.inspected = u32::try_from(due.len()).map_err(|_| {
+                    DurableError::InvalidState("schedule occurrence count exceeds u32".to_string())
+                })?;
+                for (occurrence, outcome) in due.into_iter().zip(outcomes) {
+                    let target = MaterializationTarget {
+                        registry: registry.as_ref(),
+                        context: context.as_ref(),
+                        schedule_key: &schedule_key,
+                        overlap: metadata.overlap,
+                        active: &mut active,
+                        queued: &mut queued,
+                        now,
+                    };
+                    materialize_occurrence(connection, target, occurrence, outcome, &mut report)
+                        .await?;
+                }
+                if report.inspected == 0 {
+                    return Ok(trace.commit(report));
+                }
+                let cursor = cursor.advance_to(occurrence.local())?;
+                let changed = diesel::update(
+                    durable_schedule_state::table
+                        .find(&schedule_key)
+                        .filter(durable_schedule_state::definition_version.eq(metadata.version))
+                        .filter(
+                            durable_schedule_state::definition_fingerprint
+                                .eq(&metadata.fingerprint),
+                        )
+                        .filter(
+                            durable_schedule_state::next_local_occurrence
+                                .eq(&state.next_local_occurrence),
+                        ),
+                )
+                .set((
+                    durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
+                    durable_schedule_state::next_occurrence_at.eq(occurrence.due_at),
+                    durable_schedule_state::last_materialized_at.eq(Some(now)),
+                    durable_schedule_state::updated_at.eq(now),
+                ))
+                .execute(connection)
+                .await?;
+                ensure_single_change(changed)?;
+                Ok(trace.commit(report))
+            },
+        )
         .await
     }
 }

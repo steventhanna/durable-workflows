@@ -35,32 +35,37 @@ impl TimerMaterializer {
 
     pub async fn materialize_one(&self, now: DbMillis) -> Result<Option<WorkflowId>, DurableError> {
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
-            let Some(workflow) = durable_workflow::table
-                .filter(durable_workflow::status.eq(WorkflowStatus::Sleeping))
-                .filter(durable_workflow::wait_kind.eq(WaitKind::Timer))
-                .filter(durable_workflow::available_at.le(now))
-                .order((
-                    durable_workflow::available_at.asc(),
-                    durable_workflow::id.asc(),
-                ))
-                .for_update()
-                .skip_locked()
-                .select(WorkflowRow::as_select())
-                .first::<WorkflowRow>(connection)
-                .await
-                .optional()?
-            else {
-                return Ok(None);
-            };
-            let command_sequence = wait_command_sequence(&workflow)?;
-            crate::trace::declare_unmodeled("timer_fired", true);
-            crate::trace::touch_wf(workflow.id);
-            let event = WorkflowEvent::TimerFired { command_sequence };
-            append_delivery_event(connection, &workflow, "timer_fired", &event, now).await?;
-            clear_wait(connection, &workflow, now).await?;
-            Ok(Some(workflow.id))
-        })
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection, trace, ..
+                        }| {
+                let Some(workflow) = durable_workflow::table
+                    .filter(durable_workflow::status.eq(WorkflowStatus::Sleeping))
+                    .filter(durable_workflow::wait_kind.eq(WaitKind::Timer))
+                    .filter(durable_workflow::available_at.le(now))
+                    .order((
+                        durable_workflow::available_at.asc(),
+                        durable_workflow::id.asc(),
+                    ))
+                    .for_update()
+                    .skip_locked()
+                    .select(WorkflowRow::as_select())
+                    .first::<WorkflowRow>(connection)
+                    .await
+                    .optional()?
+                else {
+                    return Ok(trace.unchanged(None));
+                };
+                let command_sequence = wait_command_sequence(&workflow)?;
+                let trace = trace.declare_unmodeled("timer_fired", true);
+                crate::trace::touch_wf(workflow.id);
+                let event = WorkflowEvent::TimerFired { command_sequence };
+                append_delivery_event(connection, &workflow, "timer_fired", &event, now).await?;
+                clear_wait(connection, &workflow, now).await?;
+                Ok(trace.commit(Some(workflow.id)))
+            },
+        )
         .await
     }
 }
@@ -102,62 +107,68 @@ impl ApprovalExpiryMaterializer {
             return Ok(None);
         };
 
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
-            let workflow = durable_workflow::table
-                .find(workflow_id)
-                .for_update()
-                .select(WorkflowRow::as_select())
-                .first::<WorkflowRow>(connection)
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection, trace, ..
+                        }| {
+                let workflow = durable_workflow::table
+                    .find(workflow_id)
+                    .for_update()
+                    .select(WorkflowRow::as_select())
+                    .first::<WorkflowRow>(connection)
+                    .await?;
+                let approval = durable_approval::table
+                    .find(approval_id)
+                    .for_update()
+                    .select(ApprovalRow::as_select())
+                    .first::<ApprovalRow>(connection)
+                    .await?;
+                if approval.status != ApprovalStatus::Pending
+                    || approval
+                        .expires_at
+                        .is_none_or(|expires_at| expires_at > now.get())
+                {
+                    return Ok(trace.unchanged(None));
+                }
+                if !workflow.status.awaits_approval()
+                    || workflow.wait()? != Some(Wait::Approval(approval.id))
+                    || workflow.kind != approval.kind
+                    || workflow.version != approval.version
+                {
+                    return Err(DurableError::InvalidState(format!(
+                        "expired approval {} no longer matches workflow {}",
+                        approval.id, workflow.id
+                    )));
+                }
+                let command_sequence = wait_command_sequence(&workflow)?;
+                if i64::from(command_sequence) != i64::from(approval.command_sequence) {
+                    return Err(DurableError::InvalidState(format!(
+                        "approval {} command sequence does not match workflow {}",
+                        approval.id, workflow.id
+                    )));
+                }
+                let event = WorkflowEvent::ApprovalExpired { command_sequence };
+                let trace = trace.declare_unmodeled("approval_expired", true);
+                crate::trace::touch_wf(workflow.id);
+                append_delivery_event(connection, &workflow, "approval_expired", &event, now)
+                    .await?;
+                let changed = diesel::update(
+                    durable_approval::table
+                        .find(approval.id)
+                        .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
+                )
+                .set((
+                    durable_approval::status.eq(ApprovalStatus::Expired),
+                    durable_approval::resolved_at.eq(Some(now)),
+                ))
+                .execute(connection)
                 .await?;
-            let approval = durable_approval::table
-                .find(approval_id)
-                .for_update()
-                .select(ApprovalRow::as_select())
-                .first::<ApprovalRow>(connection)
-                .await?;
-            if approval.status != ApprovalStatus::Pending
-                || approval
-                    .expires_at
-                    .is_none_or(|expires_at| expires_at > now.get())
-            {
-                return Ok(None);
-            }
-            if !workflow.status.awaits_approval()
-                || workflow.wait()? != Some(Wait::Approval(approval.id))
-                || workflow.kind != approval.kind
-                || workflow.version != approval.version
-            {
-                return Err(DurableError::InvalidState(format!(
-                    "expired approval {} no longer matches workflow {}",
-                    approval.id, workflow.id
-                )));
-            }
-            let command_sequence = wait_command_sequence(&workflow)?;
-            if i64::from(command_sequence) != i64::from(approval.command_sequence) {
-                return Err(DurableError::InvalidState(format!(
-                    "approval {} command sequence does not match workflow {}",
-                    approval.id, workflow.id
-                )));
-            }
-            let event = WorkflowEvent::ApprovalExpired { command_sequence };
-            crate::trace::declare_unmodeled("approval_expired", true);
-            crate::trace::touch_wf(workflow.id);
-            append_delivery_event(connection, &workflow, "approval_expired", &event, now).await?;
-            let changed = diesel::update(
-                durable_approval::table
-                    .find(approval.id)
-                    .filter(durable_approval::status.eq(ApprovalStatus::Pending)),
-            )
-            .set((
-                durable_approval::status.eq(ApprovalStatus::Expired),
-                durable_approval::resolved_at.eq(Some(now)),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_single_change(changed)?;
-            clear_wait(connection, &workflow, now).await?;
-            Ok(Some(approval.id))
-        })
+                ensure_single_change(changed)?;
+                clear_wait(connection, &workflow, now).await?;
+                Ok(trace.commit(Some(approval.id)))
+            },
+        )
         .await
     }
 }

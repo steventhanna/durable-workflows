@@ -2,7 +2,7 @@ use diesel::OptionalExtension;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 
 use super::{is_unique_violation, TransactionCallback, WorkflowInsert};
-use crate::tx::{CommandParent, Locked, Tx};
+use crate::tx::{CommandParent, Committed, Locked, Tx};
 use crate::{
     persistence::{
         NewActivityRow, NewApprovalRow, NewScheduleRunRow, NewScheduleStateRow, NewTopicLockRow,
@@ -34,8 +34,8 @@ pub(crate) async fn transaction<'a, 'conn, R, E, F>(
     callback: F,
 ) -> Result<R, E>
 where
-    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<R, E>
-        + TransactionCallback<Tx<'r>, Result<R, E>, Fut: Send>
+    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<Committed<R>, E>
+        + TransactionCallback<Tx<'r>, Result<Committed<R>, E>, Fut: Send>
         + Send
         + 'a,
     E: From<diesel::result::Error> + Send + 'a,

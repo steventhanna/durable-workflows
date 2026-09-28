@@ -92,62 +92,69 @@ impl ProgressReporter {
         let attempt_number = self.attempt_number;
         let lease_token = self.lease_token.clone();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
-            let fenced = durable_activity::table
-                .find(activity_id)
-                .filter(durable_activity::status.eq(ActivityStatus::Running))
-                .filter(durable_activity::attempt_count.eq(attempt_number))
-                .filter(durable_activity::lease_token.eq(&lease_token))
-                .for_update()
-                .select(durable_activity::id)
-                .first::<ActivityId>(connection)
-                .await
-                .optional()?;
-            if fenced.is_none() {
-                return Err(DurableError::FencedWrite);
-            }
-            // T-W4 writes only durable_progress_event, which the model does not cover.
-            crate::trace::declare_unmodeled("progress", false);
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection, trace, ..
+                        }| {
+                let fenced = durable_activity::table
+                    .find(activity_id)
+                    .filter(durable_activity::status.eq(ActivityStatus::Running))
+                    .filter(durable_activity::attempt_count.eq(attempt_number))
+                    .filter(durable_activity::lease_token.eq(&lease_token))
+                    .for_update()
+                    .select(durable_activity::id)
+                    .first::<ActivityId>(connection)
+                    .await
+                    .optional()?;
+                if fenced.is_none() {
+                    return Err(DurableError::FencedWrite);
+                }
+                // T-W4 writes only durable_progress_event, which the model does not cover.
+                let trace = trace.declare_unmodeled("progress", false);
 
-            let last = durable_progress_event::table
-                .filter(durable_progress_event::activity_id.eq(activity_id))
-                .filter(durable_progress_event::attempt_number.eq(attempt_number))
-                .select(diesel::dsl::max(durable_progress_event::sequence))
-                .get_result::<Option<i32>>(connection)
-                .await?
-                .unwrap_or(0);
-            if last >= MAX_PROGRESS_EVENTS_PER_ATTEMPT {
-                return Ok(ProgressReportOutcome::LimitReached);
-            }
-            let sequence = last.checked_add(1).ok_or_else(|| {
-                DurableError::InvalidState("progress sequence overflow".to_string())
-            })?;
-            diesel::insert_into(durable_progress_event::table)
-                .values(NewProgressEventRow {
-                    activity_id,
-                    attempt_number,
-                    sequence,
-                    code: event.code,
-                    description_bytes: i32::try_from(event.description.len()).map_err(|_| {
-                        DurableError::InvalidState(
-                            "progress description length overflow".to_string(),
-                        )
+                let last = durable_progress_event::table
+                    .filter(durable_progress_event::activity_id.eq(activity_id))
+                    .filter(durable_progress_event::attempt_number.eq(attempt_number))
+                    .select(diesel::dsl::max(durable_progress_event::sequence))
+                    .get_result::<Option<i32>>(connection)
+                    .await?
+                    .unwrap_or(0);
+                if last >= MAX_PROGRESS_EVENTS_PER_ATTEMPT {
+                    return Ok(trace.commit(ProgressReportOutcome::LimitReached));
+                }
+                let sequence = last.checked_add(1).ok_or_else(|| {
+                    DurableError::InvalidState("progress sequence overflow".to_string())
+                })?;
+                diesel::insert_into(durable_progress_event::table)
+                    .values(NewProgressEventRow {
+                        activity_id,
+                        attempt_number,
+                        sequence,
+                        code: event.code,
+                        description_bytes: i32::try_from(event.description.len()).map_err(
+                            |_| {
+                                DurableError::InvalidState(
+                                    "progress description length overflow".to_string(),
+                                )
+                            },
+                        )?,
+                        description: event.description,
+                        completed_units: event.completed_units,
+                        total_units: event.total_units,
+                        severity: event.severity.as_str().to_string(),
+                        metadata_json: event.metadata_json,
+                        created_at: persistence::database_now_millis(connection).await?.get(),
+                    })
+                    .execute(connection)
+                    .await?;
+                Ok(trace.commit(ProgressReportOutcome::Persisted {
+                    sequence: u32::try_from(sequence).map_err(|_| {
+                        DurableError::InvalidState("negative progress sequence".to_string())
                     })?,
-                    description: event.description,
-                    completed_units: event.completed_units,
-                    total_units: event.total_units,
-                    severity: event.severity.as_str().to_string(),
-                    metadata_json: event.metadata_json,
-                    created_at: persistence::database_now_millis(connection).await?.get(),
-                })
-                .execute(connection)
-                .await?;
-            Ok(ProgressReportOutcome::Persisted {
-                sequence: u32::try_from(sequence).map_err(|_| {
-                    DurableError::InvalidState("negative progress sequence".to_string())
-                })?,
-            })
-        })
+                }))
+            },
+        )
         .await
     }
 }

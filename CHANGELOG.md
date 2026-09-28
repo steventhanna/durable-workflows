@@ -126,6 +126,17 @@ Compared with the production-internal version it was extracted from:
   with `DbMillis::from_database_millis(raw)`; replace `now + ms` with
   `now.plus_millis(ms)?` or `now.plus(duration)?`.
 
+- Every library transaction declares its trace step through the type
+  system: a transaction callback gets a `tx::Trace` that starts
+  `Undeclared`, and it can only return success through the `Committed`
+  value a `Declared` trace builds, so an undeclared transaction does not
+  compile. This replaces the source-scan unit test and its allow-list
+  (`every_transaction_site_declares`). `DurableStore::start`,
+  `start_or_restart_recoverable` and
+  `AdminControlService::restart_workflow` no longer open an inner savepoint
+  for the start they run: they run the start in their own transaction with
+  its `Trace`. No public API or recorded trace shape changes (the trace
+  interface version is unchanged).
 - `RetryPolicy` deserialization checks the same bounds as
   `RetryPolicy::fixed` / `exponential` and fails for a policy out of
   bounds (it accepted any value). An activity row whose stored

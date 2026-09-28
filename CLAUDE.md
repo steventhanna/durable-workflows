@@ -54,7 +54,12 @@ system can make the violation fail to compile. In order of preference:
    returns a `DbMillis`, and every function that takes the current time
    takes one, so passing a raw `i64` or a host stamp is E0308:
    `db_millis_raw_i64_argument`; it has no `+`, only named duration methods
-   such as `plus(Duration) -> Result`: `db_millis_add_operator`), an
+   such as `plus(Duration) -> Result`: `db_millis_add_operator`), a
+   typestate (a transaction callback's `tx::Trace` starts `Undeclared`,
+   `declare` makes it `Declared`, and the callback must return the
+   `Committed<R>` that only `Trace<'_, Declared>::commit` builds, so a
+   transaction that does not declare its trace step is E0599/E0308; manual
+   probes 7-9 in `src/tx.rs`), an
    exhaustive `match` that forces every new variant to be decided.
 3. **Checked at the boundary.** A constructor or parser that returns `Result`
    (e.g. `RetryPolicy::fixed`), or a transition that does
@@ -165,9 +170,19 @@ the row `FOR UPDATE`", depend on them.
 
 - A transaction callback (`dialect::transaction`, `tx::caller_transaction`)
   has one argument, `Tx<'r>`, destructured in the closure head:
-  `async move |Tx { connection, scope }| { .. }`, or `Tx { connection, .. }`
-  when the body takes no lock. `TxScope<'tx>` is the transaction's brand;
-  only `tx::enter` makes one.
+  `async move |Tx { connection, scope, trace }| { .. }`, or
+  `Tx { connection, trace, .. }` when the body takes no lock. `TxScope<'tx>`
+  is the transaction's brand; only `tx::enter` makes one.
+- The callback returns `Ok(trace.commit(value))` after
+  `let trace = trace.declare(|| ..)` (or `declare_unmodeled`); `Committed<R>`
+  has no other constructor. A helper that declares for its caller takes
+  `trace: Trace<'tx, Undeclared>` (or any state, for a step appended to a
+  `Batch`) by value and returns `Trace<'tx, Declared>` with its result.
+  `trace.unchanged(value)` and `declare_if` are only for a path that wrote
+  nothing (it records no step; `trace-model` panics if the scope declared or
+  touched a row). Never call `trace::declare` directly; never nest a
+  library transaction inside another to share its declaration (thread the
+  `Trace` instead: `DurableStore::start_prepared_in`).
 - A helper that needs a lock taken earlier in the transaction takes the
   witness `Locked<'tx, &Row>` (a `Copy` token; `locked.as_ref()`) next to
   `connection: &mut DurableConnection`. Locks are taken through
