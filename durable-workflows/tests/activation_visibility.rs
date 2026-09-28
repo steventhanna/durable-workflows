@@ -63,14 +63,8 @@ async fn runtime_rejects_zero_transient_activation_alert_bounds() {
         return;
     };
     let invalid = [
-        RuntimeConfig {
-            max_transient_activation_errors: 0,
-            ..RuntimeConfig::default()
-        },
-        RuntimeConfig {
-            transient_activation_error_window: Duration::ZERO,
-            ..RuntimeConfig::default()
-        },
+        RuntimeConfig::default().with_max_transient_activation_errors(0),
+        RuntimeConfig::default().with_transient_activation_error_window(Duration::ZERO),
     ];
     for config in invalid {
         assert!(matches!(

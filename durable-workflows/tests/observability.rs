@@ -200,10 +200,9 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
         Arc::new(WorkflowRegistry::<()>::new()),
         Arc::new(ActivityRegistry::<()>::new()),
         Arc::new(TopicRegistry::new()),
-        HealthScannerConfig {
-            stale_after: Duration::from_secs(60),
-            max_alerts_per_kind: 10,
-        },
+        HealthScannerConfig::default()
+            .with_stale_after(Duration::from_secs(60))
+            .with_max_alerts_per_kind(10),
     )
     .expect("scanner");
     let report = scanner.scan_once(now).await.expect("health scan");

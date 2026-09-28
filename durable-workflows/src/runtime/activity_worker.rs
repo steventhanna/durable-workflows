@@ -52,6 +52,7 @@ const CLAIM_CANDIDATE_SCAN_LIMIT: i64 = 32;
 const INVALID_ROW_CATEGORY: &str = "invalid_row";
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct WorkerConfig {
     pub heartbeat_interval: Duration,
     pub shutdown_grace: Duration,
@@ -63,6 +64,23 @@ impl Default for WorkerConfig {
             heartbeat_interval: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(30),
         }
+    }
+}
+
+/// Builder-style setters. The struct is `#[non_exhaustive]`: start from
+/// [`WorkerConfig::default`] and override fields with these. Bounds (non-zero
+/// durations and counts) are checked where the config is used, not here.
+impl WorkerConfig {
+    #[must_use]
+    pub const fn with_heartbeat_interval(mut self, heartbeat_interval: Duration) -> Self {
+        self.heartbeat_interval = heartbeat_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_shutdown_grace(mut self, shutdown_grace: Duration) -> Self {
+        self.shutdown_grace = shutdown_grace;
+        self
     }
 }
 

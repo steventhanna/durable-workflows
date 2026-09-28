@@ -19,6 +19,7 @@ use crate::{
 const MAX_HEALTH_ALERTS_PER_KIND: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HealthScannerConfig {
     pub stale_after: Duration,
     pub max_alerts_per_kind: u32,
@@ -30,6 +31,23 @@ impl Default for HealthScannerConfig {
             stale_after: Duration::from_secs(5 * 60),
             max_alerts_per_kind: 25,
         }
+    }
+}
+
+/// Builder-style setters. The struct is `#[non_exhaustive]`: start from
+/// [`HealthScannerConfig::default`] and override fields with these. Bounds (non-zero
+/// durations and counts) are checked where the config is used, not here.
+impl HealthScannerConfig {
+    #[must_use]
+    pub const fn with_stale_after(mut self, stale_after: Duration) -> Self {
+        self.stale_after = stale_after;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_alerts_per_kind(mut self, max_alerts_per_kind: u32) -> Self {
+        self.max_alerts_per_kind = max_alerts_per_kind;
+        self
     }
 }
 

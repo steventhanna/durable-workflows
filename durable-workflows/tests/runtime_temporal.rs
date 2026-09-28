@@ -229,13 +229,11 @@ async fn runtime_supervises_temporal_sources_isolates_schedules_and_stops_cleanl
         Arc::new(ActivityRegistry::new()),
         Arc::new(TopicRegistry::new()),
         "temporal-runtime-test",
-        RuntimeConfig {
-            idle_delay: Duration::from_millis(5),
-            timer_poll_interval: Duration::from_millis(5),
-            approval_expiry_poll_interval: Duration::from_millis(5),
-            schedule_poll_interval: Duration::from_millis(10),
-            ..RuntimeConfig::default()
-        },
+        RuntimeConfig::default()
+            .with_idle_delay(Duration::from_millis(5))
+            .with_timer_poll_interval(Duration::from_millis(5))
+            .with_approval_expiry_poll_interval(Duration::from_millis(5))
+            .with_schedule_poll_interval(Duration::from_millis(10)),
     )
     .expect("runtime definition")
     .with_schedules(schedules);

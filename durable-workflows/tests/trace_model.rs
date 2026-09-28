@@ -155,10 +155,9 @@ async fn activity_happy_path() {
         activities(),
         Arc::new(durable_workflows::register_durable_topics!(Topics::Emails).expect("topics")),
         "rt1:dispatcher",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(60),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(60))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker");
 
@@ -358,10 +357,9 @@ fn worker(pool: &durable_workflows::DurablePool) -> durable_workflows::ActivityW
         activities(),
         Arc::new(durable_workflows::register_durable_topics!(Topics::Emails).expect("topics")),
         "rt1:dispatcher",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(60),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(60))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker")
 }
@@ -450,11 +448,9 @@ async fn activation_failure_retries_then_fails() {
     let mut coordinator = coordinator(
         &pool,
         "rt1:coordinator",
-        CoordinatorConfig {
-            max_activation_attempts: 3,
-            activation_retry_policy: RetryPolicy::fixed(1).expect("policy"),
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default()
+            .with_max_activation_attempts(3)
+            .with_activation_retry_policy(RetryPolicy::fixed(1).expect("policy")),
     );
     let mut failures = 0;
     while failures < 3 {
@@ -482,10 +478,7 @@ async fn stale_coordinator_fence_miss() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let short = CoordinatorConfig {
-        lease_duration: Duration::from_millis(500),
-        ..CoordinatorConfig::default()
-    };
+    let short = CoordinatorConfig::default().with_lease_duration(Duration::from_millis(500));
     let mut stale = coordinator(&pool, "rt1:coordinator", short);
     let mut fresh = coordinator(&pool, "rt2:coordinator", short);
     let claim = stale.claim_one().await.expect("claim").expect("claimed");
@@ -585,10 +578,7 @@ async fn recoverable_start_after_failure() {
     let mut coordinator = coordinator(
         &pool,
         "rt1:coordinator",
-        CoordinatorConfig {
-            max_activation_attempts: 1,
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default().with_max_activation_attempts(1),
     );
     let first = store
         .start_or_restart_recoverable(&FailingFlow, keyed())
@@ -848,10 +838,9 @@ fn named_worker(
         activities(),
         Arc::new(durable_workflows::register_durable_topics!(Topics::Emails).expect("topics")),
         worker_id,
-        WorkerConfig {
-            heartbeat_interval,
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(heartbeat_interval)
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker")
 }

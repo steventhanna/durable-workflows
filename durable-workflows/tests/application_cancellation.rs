@@ -86,10 +86,9 @@ fn worker(
         ),
         Arc::new(durable_workflows::register_durable_topics!(CaptureTopic).expect("topics")),
         "cleanup-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(20),
-            shutdown_grace: Duration::from_millis(150),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(20))
+            .with_shutdown_grace(Duration::from_millis(150)),
     )
     .expect("worker")
 }

@@ -1,0 +1,9 @@
+error[E0639]: cannot create non-exhaustive struct using struct expression
+  --> tests/ui/fail/config_struct_literal.rs:11:13
+   |
+11 |       let _ = CoordinatorConfig {
+   |  _____________^
+12 | |         lease_duration: Duration::from_secs(10),
+13 | |         ..CoordinatorConfig::default()
+14 | |     };
+   | |_____^

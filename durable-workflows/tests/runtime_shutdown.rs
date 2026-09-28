@@ -261,17 +261,16 @@ fn registries() -> (
 }
 
 fn runtime_config() -> RuntimeConfig {
-    RuntimeConfig {
-        idle_delay: Duration::from_millis(5),
-        restart_backoff: Duration::from_millis(10),
-        max_task_restarts: 2,
-        max_workers_per_topic: 1,
-        worker: durable_workflows::WorkerConfig {
-            heartbeat_interval: Duration::from_millis(10),
-            shutdown_grace: Duration::from_millis(100),
-        },
-        ..RuntimeConfig::default()
-    }
+    RuntimeConfig::default()
+        .with_idle_delay(Duration::from_millis(5))
+        .with_restart_backoff(Duration::from_millis(10))
+        .with_max_task_restarts(2)
+        .with_max_workers_per_topic(1)
+        .with_worker(
+            durable_workflows::WorkerConfig::default()
+                .with_heartbeat_interval(Duration::from_millis(10))
+                .with_shutdown_grace(Duration::from_millis(100)),
+        )
 }
 
 fn runtime(
@@ -477,10 +476,7 @@ async fn empty_runtime_starts_ready_and_shuts_down_without_detached_tasks() {
             .with_topic_worker_limit(RuntimeTopic::Test.key(), 0)
             .is_err()
     );
-    let invalid_config = RuntimeConfig {
-        timer_poll_interval: Duration::from_secs(61),
-        ..RuntimeConfig::default()
-    };
+    let invalid_config = RuntimeConfig::default().with_timer_poll_interval(Duration::from_secs(61));
     assert!(matches!(
         DurableRuntime::new(
             pool.clone(),

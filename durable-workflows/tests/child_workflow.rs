@@ -218,10 +218,9 @@ fn activity_worker(
         Arc::new(activities),
         Arc::new(topics),
         worker_id,
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(20),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(20))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker is valid")
 }
@@ -337,10 +336,7 @@ async fn cancelled_child_delivers_child_failed_and_fails_the_parent() {
     let mut coordinator = coordinator(
         &pool,
         "cancel-coordinator",
-        CoordinatorConfig {
-            max_activation_attempts: 1,
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default().with_max_activation_attempts(1),
     );
 
     // Parent suspends at the child; the child parks on its unserved activity.

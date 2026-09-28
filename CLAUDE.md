@@ -97,7 +97,12 @@ type system cannot express the rule.
   on purpose: `WorkflowEvent`, because a workflow handler must decide every
   event (a new event must break its `match`, not fall into a `_` arm that
   drops it), and `BackendKind`, because code that picks backend SQL (tests,
-  `tools/durable-trace`) must decide a new backend.
+  `tools/durable-trace`) must decide a new backend. Public config structs
+  (`RuntimeConfig`, `CoordinatorConfig`, `WorkerConfig`,
+  `HealthScannerConfig`) are `#[non_exhaustive]` with `Default` and a
+  `with_<field>` setter per field; add a setter with each new field
+  (`config_struct_literal` compile-fail case: a struct expression outside
+  the crate is E0639).
 - Never persist or compare host wall-clock time with a database timestamp.
   Persisted times and due/expiry comparisons use the database clock; process
   time (`tokio::time::Instant`) is only for local deadlines, timeouts and

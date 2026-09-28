@@ -102,6 +102,16 @@ Compared with the production-internal version it was extracted from:
   and `admin::TimelineEntry`. Building their values is unchanged.
   `WorkflowEvent` and `BackendKind` stay exhaustive: a new event or backend
   is meant to break every `match` that must handle it.
+- `RuntimeConfig`, `CoordinatorConfig`, `WorkerConfig` and
+  `observability::HealthScannerConfig` are `#[non_exhaustive]` and have a
+  `with_<field>` setter for every field, so fields can be added in a minor
+  release. A struct expression outside the crate, including
+  `RuntimeConfig { idle_delay, ..RuntimeConfig::default() }`, no longer
+  compiles (E0639). Migration: start from `default()` and chain setters,
+  `RuntimeConfig::default().with_idle_delay(Duration::from_millis(150))`.
+  Fields stay public for reading and assignment. Bounds are still checked
+  where the config is used (`DurableRuntime::new`,
+  `WorkflowCoordinator::new`, `ActivityWorker::new`, `HealthScanner::new`).
 - The remaining string-typed status and kind columns of the public row
   types are enums, like `WorkflowStatus`: `WorkflowRow::wait_kind` and
   `NewWorkflowRow::wait_kind` are `Option<persistence::WaitKind>`,

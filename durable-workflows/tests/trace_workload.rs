@@ -390,19 +390,15 @@ fn registries() -> Registries {
 }
 
 fn runtime_config() -> RuntimeConfig {
-    RuntimeConfig {
-        coordinator: CoordinatorConfig {
-            lease_duration: Duration::from_secs(2),
-            ..CoordinatorConfig::default()
-        },
-        worker: WorkerConfig {
-            heartbeat_interval: Duration::from_millis(500),
-            shutdown_grace: Duration::from_millis(500),
-        },
-        idle_delay: Duration::from_millis(150),
-        restart_backoff: Duration::from_millis(100),
-        ..RuntimeConfig::default()
-    }
+    RuntimeConfig::default()
+        .with_coordinator(CoordinatorConfig::default().with_lease_duration(Duration::from_secs(2)))
+        .with_worker(
+            WorkerConfig::default()
+                .with_heartbeat_interval(Duration::from_millis(500))
+                .with_shutdown_grace(Duration::from_millis(500)),
+        )
+        .with_idle_delay(Duration::from_millis(150))
+        .with_restart_backoff(Duration::from_millis(100))
 }
 
 struct LiveRuntime {

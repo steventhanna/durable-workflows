@@ -28,6 +28,7 @@ use crate::{
 const MAX_TEMPORAL_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RuntimeConfig {
     pub coordinator: CoordinatorConfig,
     pub worker: WorkerConfig,
@@ -76,6 +77,119 @@ impl Default for RuntimeConfig {
             max_transient_activation_errors: DEFAULT_MAX_TRANSIENT_ACTIVATION_ERRORS,
             transient_activation_error_window: DEFAULT_TRANSIENT_ACTIVATION_WINDOW,
         }
+    }
+}
+
+/// Builder-style setters. The struct is `#[non_exhaustive]`: start from
+/// [`RuntimeConfig::default`] and override fields with these. Bounds (non-zero
+/// durations and counts) are checked where the config is used, not here.
+impl RuntimeConfig {
+    #[must_use]
+    pub const fn with_coordinator(mut self, coordinator: CoordinatorConfig) -> Self {
+        self.coordinator = coordinator;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_worker(mut self, worker: WorkerConfig) -> Self {
+        self.worker = worker;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_idle_delay(mut self, idle_delay: Duration) -> Self {
+        self.idle_delay = idle_delay;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_restart_backoff(mut self, restart_backoff: Duration) -> Self {
+        self.restart_backoff = restart_backoff;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_forced_shutdown_timeout(mut self, forced_shutdown_timeout: Duration) -> Self {
+        self.forced_shutdown_timeout = forced_shutdown_timeout;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_task_restarts(mut self, max_task_restarts: u32) -> Self {
+        self.max_task_restarts = max_task_restarts;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_restart_window(mut self, restart_window: Duration) -> Self {
+        self.restart_window = restart_window;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_workers_per_topic(mut self, max_workers_per_topic: u32) -> Self {
+        self.max_workers_per_topic = max_workers_per_topic;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_scan_interval(mut self, health_scan_interval: Duration) -> Self {
+        self.health_scan_interval = health_scan_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_stale_after(mut self, health_stale_after: Duration) -> Self {
+        self.health_stale_after = health_stale_after;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_health_alerts_per_kind(
+        mut self,
+        max_health_alerts_per_kind: u32,
+    ) -> Self {
+        self.max_health_alerts_per_kind = max_health_alerts_per_kind;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_timer_poll_interval(mut self, timer_poll_interval: Duration) -> Self {
+        self.timer_poll_interval = timer_poll_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_approval_expiry_poll_interval(
+        mut self,
+        approval_expiry_poll_interval: Duration,
+    ) -> Self {
+        self.approval_expiry_poll_interval = approval_expiry_poll_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_schedule_poll_interval(mut self, schedule_poll_interval: Duration) -> Self {
+        self.schedule_poll_interval = schedule_poll_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_transient_activation_errors(
+        mut self,
+        max_transient_activation_errors: u32,
+    ) -> Self {
+        self.max_transient_activation_errors = max_transient_activation_errors;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_transient_activation_error_window(
+        mut self,
+        transient_activation_error_window: Duration,
+    ) -> Self {
+        self.transient_activation_error_window = transient_activation_error_window;
+        self
     }
 }
 

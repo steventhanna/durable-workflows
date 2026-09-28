@@ -534,10 +534,9 @@ fn worker(pool: &DurablePool, context: Arc<GapContext>) -> ActivityWorker<GapCon
         activities(),
         topics(),
         "gap-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(50),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(50))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker is valid")
 }
@@ -1237,12 +1236,10 @@ async fn g1_repeated_operator_pauses_do_not_stop_the_runtime() {
         activities(),
         topics(),
         "gap-runtime",
-        RuntimeConfig {
-            idle_delay: Duration::from_millis(5),
-            restart_backoff: Duration::from_millis(10),
-            max_task_restarts: 1,
-            ..RuntimeConfig::default()
-        },
+        RuntimeConfig::default()
+            .with_idle_delay(Duration::from_millis(5))
+            .with_restart_backoff(Duration::from_millis(10))
+            .with_max_task_restarts(1),
     )
     .expect("runtime definition");
     let handle = runtime.spawn().await.expect("runtime spawns");
@@ -1351,10 +1348,7 @@ where
         workflows(),
         activities(),
         "n4-stale-coordinator",
-        CoordinatorConfig {
-            lease_duration: Duration::from_millis(300),
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default().with_lease_duration(Duration::from_millis(300)),
     )
     .expect("coordinator is valid");
     let activation = tokio::spawn(async move {
@@ -1863,10 +1857,7 @@ async fn g3_panicking_step_fails_at_the_activation_cap() {
     let mut coordinator = coordinator(
         &pool,
         Arc::new(GapContext::default()),
-        CoordinatorConfig {
-            max_activation_attempts: 2,
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default().with_max_activation_attempts(2),
     );
     let (activations, row) = activate_until_failed(&pool, &mut coordinator, workflow_id).await;
     assert_eq!(activations, 2);
@@ -1890,11 +1881,9 @@ async fn g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts() {
     let mut coordinator = coordinator(
         &pool,
         Arc::new(GapContext::default()),
-        CoordinatorConfig {
-            max_activation_attempts: 2,
-            step_timeout: Duration::from_millis(100),
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default()
+            .with_max_activation_attempts(2)
+            .with_step_timeout(Duration::from_millis(100)),
     );
     let (activations, row) = activate_until_failed(&pool, &mut coordinator, workflow_id).await;
     assert_eq!(activations, 2);
@@ -2290,10 +2279,9 @@ fn n2_worker(
             durable_workflows::register_durable_topics!(N2Topic).expect("topic registry is valid"),
         ),
         worker_id,
-        WorkerConfig {
-            heartbeat_interval: N2_HEARTBEAT,
-            shutdown_grace: N2_SHUTDOWN_GRACE,
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(N2_HEARTBEAT)
+            .with_shutdown_grace(N2_SHUTDOWN_GRACE),
     )
     .expect("worker is valid")
 }

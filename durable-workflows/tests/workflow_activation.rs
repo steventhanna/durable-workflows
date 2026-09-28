@@ -723,10 +723,7 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
         durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
             .expect("registry is valid"),
     );
-    let config = CoordinatorConfig {
-        lease_duration: Duration::from_millis(2),
-        ..CoordinatorConfig::default()
-    };
+    let config = CoordinatorConfig::default().with_lease_duration(Duration::from_millis(2));
     let mut first = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
@@ -1141,10 +1138,7 @@ async fn activation_errors_back_off_then_fail_at_the_configured_cap() {
         Arc::new(registry),
         Arc::new(durable_workflows::ActivityRegistry::new()),
         "failure-worker",
-        CoordinatorConfig {
-            max_activation_attempts: 2,
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default().with_max_activation_attempts(2),
     )
     .expect("coordinator is valid");
     coordinator

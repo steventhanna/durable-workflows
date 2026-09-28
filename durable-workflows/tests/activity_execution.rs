@@ -253,10 +253,9 @@ fn worker(
         pool,
         context,
         worker_id,
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(20),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(20))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
 }
 
@@ -1034,10 +1033,9 @@ async fn stale_lease_cannot_emit_progress_or_commit_a_result() {
         pool.clone(),
         context.clone(),
         "stale-progress-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(2),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(2))
+            .with_shutdown_grace(Duration::from_secs(1)),
     ));
     let (_, activity_id) = schedule_activity(&pool, "external", 3, 5_000, 10_000).await;
     let executing = worker.clone();
@@ -1296,10 +1294,9 @@ async fn stale_completion_is_rejected_after_the_lease_changes() {
         pool.clone(),
         context,
         "stale-result-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(5),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(5))
+            .with_shutdown_grace(Duration::from_secs(1)),
     ));
     let running_worker = worker.clone();
     let execution = tokio::spawn(async move { running_worker.run_one("external").await });

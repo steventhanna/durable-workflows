@@ -115,10 +115,9 @@ fn leased_cleanup_worker(
         ),
         Arc::new(durable_workflows::register_durable_topics!(CaptureTopic).expect("topics")),
         id,
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(20),
-            shutdown_grace: Duration::from_secs(2),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(20))
+            .with_shutdown_grace(Duration::from_secs(2)),
     )
     .expect("worker")
 }
@@ -402,10 +401,9 @@ async fn timed_out_handler_holding_the_activity_row_lock_does_not_block_its_fini
         ),
         Arc::new(durable_workflows::register_durable_topics!(CaptureTopic).expect("topics")),
         "locking-progress-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(10),
-            shutdown_grace: Duration::from_millis(150),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(10))
+            .with_shutdown_grace(Duration::from_millis(150)),
     )
     .expect("worker");
     let run = tokio::spawn(async move { worker.run_one("capture").await });

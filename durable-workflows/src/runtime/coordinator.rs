@@ -41,6 +41,7 @@ macro_rules! fenced_workflow {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CoordinatorConfig {
     pub lease_duration: Duration,
     pub max_activation_attempts: u32,
@@ -67,6 +68,53 @@ impl Default for CoordinatorConfig {
             continuation_delay: Duration::from_millis(100),
             step_timeout: Duration::from_secs(30),
         }
+    }
+}
+
+/// Builder-style setters. The struct is `#[non_exhaustive]`: start from
+/// [`CoordinatorConfig::default`] and override fields with these. Bounds (non-zero
+/// durations and counts) are checked where the config is used, not here.
+impl CoordinatorConfig {
+    #[must_use]
+    pub const fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_activation_attempts(mut self, max_activation_attempts: u32) -> Self {
+        self.max_activation_attempts = max_activation_attempts;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_activation_retry_policy(
+        mut self,
+        activation_retry_policy: RetryPolicy,
+    ) -> Self {
+        self.activation_retry_policy = activation_retry_policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_consecutive_continuations(
+        mut self,
+        max_consecutive_continuations: u32,
+    ) -> Self {
+        self.max_consecutive_continuations = max_consecutive_continuations;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_continuation_delay(mut self, continuation_delay: Duration) -> Self {
+        self.continuation_delay = continuation_delay;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_step_timeout(mut self, step_timeout: Duration) -> Self {
+        self.step_timeout = step_timeout;
+        self
     }
 }
 
