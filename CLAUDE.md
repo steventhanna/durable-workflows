@@ -32,7 +32,11 @@ system can make the violation fail to compile. In order of preference:
 2. **Uncompilable.** Make the wrong use a compile error: a borrow guard
    (`WorkflowCoordinator::claim_one(&mut self)` returns a `WorkflowClaim<'_, C>`,
    so a second claim while one is alive is E0499), a method that consumes
-   `self` for a one-shot transition (`claim.activate()`), a proof token with a
+   `self` for a one-shot transition (`claim.activate()`), a function that
+   takes an enum of only the variants it handles instead of returning an
+   error for the others (the coordinator's `commit_wait_transition` takes a
+   `WaitTransition`, not a `StoredTransition` it would have to reject
+   `Continue`/`Complete` from), a proof token with a
    private constructor that a function must receive before it may act (a
    `tx::Locked<'tx, Row>` row-lock witness: `insert_activity` takes the
    `Locked<ClaimFence>` that `lock_fence` returns, N4; `commit_child`'s parent

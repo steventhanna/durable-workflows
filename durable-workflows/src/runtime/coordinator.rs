@@ -859,10 +859,66 @@ async fn commit_on_connection<'tx>(
             .await?;
             Ok(())
         }
-        transition => {
-            commit_wait_transition(connection, scope, claim, delivered, transition, now).await
+        StoredTransition::SleepUntil {
+            state_json,
+            wake_at_millis,
+        } => {
+            let wait = WaitTransition::SleepUntil {
+                state_json,
+                wake_at_millis,
+            };
+            commit_wait_transition(connection, scope, claim, delivered, wait, now).await
+        }
+        StoredTransition::WaitForApproval {
+            state_json,
+            approval_json,
+            expires_at_millis,
+        } => {
+            let wait = WaitTransition::WaitForApproval {
+                state_json,
+                approval_json,
+                expires_at_millis,
+            };
+            commit_wait_transition(connection, scope, claim, delivered, wait, now).await
+        }
+        StoredTransition::RunActivity {
+            state_json,
+            activity,
+        } => {
+            let wait = WaitTransition::RunActivity {
+                state_json,
+                activity,
+            };
+            commit_wait_transition(connection, scope, claim, delivered, wait, now).await
+        }
+        StoredTransition::RunChild { state_json, child } => {
+            let wait = WaitTransition::RunChild { state_json, child };
+            commit_wait_transition(connection, scope, claim, delivered, wait, now).await
         }
     }
+}
+
+/// The [`StoredTransition`]s that leave the workflow waiting, which
+/// `commit_wait_transition` commits. A separate enum, so that function has no
+/// arm for `Continue` or `Complete` to reject at run time.
+enum WaitTransition {
+    SleepUntil {
+        state_json: String,
+        wake_at_millis: i64,
+    },
+    WaitForApproval {
+        state_json: String,
+        approval_json: String,
+        expires_at_millis: Option<i64>,
+    },
+    RunActivity {
+        state_json: String,
+        activity: crate::ActivityCommand,
+    },
+    RunChild {
+        state_json: String,
+        child: crate::ChildWorkflowCommand,
+    },
 }
 
 async fn commit_wait_transition<'tx>(
@@ -870,7 +926,7 @@ async fn commit_wait_transition<'tx>(
     scope: TxScope<'tx>,
     claim: &ClaimedRow,
     delivered: i32,
-    transition: StoredTransition,
+    transition: WaitTransition,
     now: i64,
 ) -> Result<(), DurableError> {
     use crate::persistence::NewApprovalRow;
@@ -878,7 +934,7 @@ async fn commit_wait_transition<'tx>(
     let workflow_id = claim.workflow_id()?;
     let command = claim.row.command_sequence.saturating_add(1);
     match transition {
-        StoredTransition::SleepUntil {
+        WaitTransition::SleepUntil {
             state_json,
             wake_at_millis,
         } => {
@@ -912,7 +968,7 @@ async fn commit_wait_transition<'tx>(
             declare_unmodeled("timer");
             append_history(connection, workflow_id, "timer_scheduled", now).await
         }
-        StoredTransition::WaitForApproval {
+        WaitTransition::WaitForApproval {
             state_json,
             approval_json,
             expires_at_millis,
@@ -962,7 +1018,7 @@ async fn commit_wait_transition<'tx>(
             declare_unmodeled("approval");
             append_history(connection, workflow_id, "approval_requested", now).await
         }
-        StoredTransition::RunActivity {
+        WaitTransition::RunActivity {
             state_json,
             activity,
         } => {
@@ -971,15 +1027,12 @@ async fn commit_wait_transition<'tx>(
             )
             .await
         }
-        StoredTransition::RunChild { state_json, child } => {
+        WaitTransition::RunChild { state_json, child } => {
             commit_child(
                 connection, scope, claim, delivered, command, state_json, child, now,
             )
             .await
         }
-        StoredTransition::Continue { .. } | StoredTransition::Complete { .. } => Err(
-            DurableError::InvalidState("transition routed to the wrong commit path".to_string()),
-        ),
     }
 }
 
