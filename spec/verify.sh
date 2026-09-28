@@ -16,7 +16,12 @@ SUM=results/apalache_summary.txt
 check() { # module kind name steps
   local mod=$1 kind=$2 name=$3 steps=$4 out="results/apalache_${1}_${3}_${4}.txt" start=$(date +%s)
   npx quint verify durable_mc.qnt --main "$mod" "--$kind" "$name" --max-steps "$steps" > "$out" 2>&1
-  printf "apalache %-12s %-9s %-12s max-steps=%-2s %-20s %ss\n" "$mod" "$kind" "$name" "$steps" \
+  printf "apalache %-14s %-9s %-20s max-steps=%-2s %-20s %ss\n" "$mod" "$kind" "$name" "$steps" \
     "$(grep -oE 'No violation found|Found an issue|Ran out of heap memory|^error'  "$out" | head -1)" "$(( $(date +%s) - start ))" | tee -a "$SUM"
 }
-check durable_mc invariant safetyRc "$STEPS"
+# Up to depth 3 durable_mc_d3 (MAX_WF = 3, MAX_ACT = 1) reaches the same states as
+# durable_mc (the reach bound in README.md, "Apalache"); deeper runs need durable_mc.
+if [ "$STEPS" -le 3 ]; then MC=durable_mc_d3; else MC=durable_mc; fi
+check "$MC" invariant safetyRc "$STEPS"
+# The G11 cascade the actions use equals its reference form (README.md, "Apalache")
+check "$MC" invariant inv_cancelFormsAgree "$STEPS"

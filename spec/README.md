@@ -11,7 +11,7 @@ T-W1 is kept as the historical instances `durable_mc_rr` and
 | File | Contents |
 |---|---|
 | `durable.qnt` | The parameterized model: state, one action per DB transaction (T-W1 split by statement), invariants, witnesses, temporal properties. The header maps actions to code and invariants to S/G/N ids. |
-| `durable_mc.qnt` | Instances: `durable_mc` (the code), `durable_mc_drift` (process clock lags DB time), `durable_mc_act` (activity-only, small), `durable_mc_rr` and `durable_mc_act_rr` (historical: T-W1 under REPEATABLE READ). |
+| `durable_mc.qnt` | Instances: `durable_mc` (the code), `durable_mc_drift` (process clock lags DB time), `durable_mc_act` (activity-only, small), `durable_mc_rr` and `durable_mc_act_rr` (historical: T-W1 under REPEATABLE READ), `durable_mc_d3` (Apalache only: `durable_mc` with `MAX_WF = 3`, `MAX_ACT = 1`, exact up to depth 3; see "Apalache"). |
 | `durable_tests.qnt` | Directed scenarios (`quint test`): `durable_tests` (READ COMMITTED) and `durable_tests_rr` (historical RR). |
 | `check.sh` | Typecheck, the directed test modules, and random simulation of every invariant and witness (`--quick`: a smoke budget, about 5 minutes; `--full`, the default: the budget reported below). Each row is `hold`, `violate` (a witness sampling must reach; a miss fails `--full` and is a WARN in `--quick`) or `seek` (not reached by sampling; a named directed test is the evidence). |
 | `verify.sh` | Bounded model checking with Apalache (`quint verify`). |
@@ -27,7 +27,7 @@ npx quint test durable_tests.qnt --main durable_tests
 npx quint test durable_tests.qnt --main durable_tests_rr
 ./check.sh --quick               # smoke budget; writes results/summary.txt
 ./check.sh --full                # the thorough budget (default)
-./verify.sh 3                    # needs Java 17+; downloads Apalache on first use (depth 4: > 2 h)
+./verify.sh 3                    # needs Java 17+; downloads Apalache on first use (depth <= 3 on durable_mc_d3)
 ```
 
 One invariant by hand:
@@ -261,7 +261,11 @@ Changes in v5 (from v4):
   `store.rs` `cancel_owned_descendants`), each with `cancelActivities`. The
   chain walk passes terminal generations; recursion into a generation's own
   children happens only for generations the cascade cancels. `cancelOk` requires no T-W1 lock on any target or its
-  activities. Domain-keyed children are not owned. The recorder already
+  activities. The actions compute the targets once per step, in a form
+  Apalache translates quickly (boolean vectors over `WF_IDS`, a pointwise
+  write); the first definitions are kept as `cancelTargetsRef` and
+  `cancelWriteRef`, and `inv_cancelFormsAgree` (a `check.sh` row, not part
+  of `safety`) checks that both forms agree (see "Apalache"). Domain-keyed children are not owned. The recorder already
   touches every cascaded workflow, activity and attempt row in the same
   record (`cancel_locked_workflow` calls `touch_wf`/`touch_act` per row), so
   `durable-trace gen` is unchanged. `inv_G11_cancelReachesChildren` is
@@ -539,33 +543,119 @@ every gap.
 
 ### Apalache (`quint verify`)
 
-On 2026-09-27 `./verify.sh 3` on the interface-v5 model (commit 1ae02cd, and
-the same with the step-outcome change after it) ran out of the default 4 GB JVM
-heap in step 2 after about 10 minutes. `quint verify` spawns `apalache-mc
-server` with its own environment, and `apalache-mc` uses 4 GB unless
-`JVM_ARGS` sets `-Xmx`; `verify.sh` now exports `JVM_ARGS=-Xmx12g` (override
-it to change the bound; a server already listening on port 8822 is reused and
-keeps its own heap). With 12 GB the same run no longer runs out of memory,
-but it does not finish in useful time: step 1 checks all 49 transitions (5 enabled) in
-about 3 minutes (transition #7 alone takes 90 s), and step 2 spent 10 minutes
-translating transition #7 to SMT and more than 20 minutes in Z3 on it before
-the run was stopped at 35 minutes (JVM resident size about 4.7 GB, one core).
-Step 2 had 42 transitions left and step 3 has 49, so depth 3 would take many
-hours. Transition #7 is, by Apalache's order of the `step` disjuncts (the
-if/else branches of `TX1_Start` and `TX2_RecoverableStart` are split),
-`TX3_Cancel`: `cancelTargets` (G11) nests a `MAX_WF`-round fold, a filter,
-an `exists` and the `restartOrigins` fold, and `TX3_Cancel` evaluates
-`cancelWrite` twice. `AdminCancel` uses the same cascade. The options, none
-of which removes an invariant from `safetyRc`: a smaller Apalache instance
-(`MAX_WF = 3`) for this row, a lower `--max-steps` for this row, or an
-Apalache-friendly form of `cancelTargets` (computed once per step, or a
-bounded closure without the nested fold). Each is an owner decision. The rows
-below predate N2 and G11 and are the last complete result.
+`./verify.sh [k]` checks `safetyRc` (`safety` + both S17 forms) at depth
+`k` (default 3): every state reachable in at most `k` steps from `init`, all
+interleavings. `JVM_ARGS` defaults to `-Xmx12g` (`quint verify` spawns
+`apalache-mc server` with the caller's environment, and `apalache-mc` uses
+4 GB unless `JVM_ARGS` sets `-Xmx`; a server already listening on port 8822
+is reused and keeps its own heap). For `k <= 3` it runs on `durable_mc_d3`,
+for `k >= 4` on `durable_mc`.
 
-| Property | Bound | Result | Time |
-|---|---|---|---|
-| `safetyRc` (`safety` + both S17 forms) on `durable_mc` | depth 3, all interleavings | no violation | ~4 min |
-| `safetyRc` on `durable_mc` | depth 4 | stopped, no violation so far (10 of ~41 transitions at step 4 checked) | stopped at 36 min; estimated 2 h more |
+**Why depth 3 stopped finishing (2026-09-27).** After N2 and G11, depth 3 on
+`durable_mc` ran out of the 4 GB heap, and with 12 GB it did not finish: step
+2 spent 10 minutes translating transition #7 and more than 20 minutes in Z3
+before the run was stopped at 35 minutes. Transition #7 is `TX3_Cancel`
+(and #35 is `AdminCancel`): confirmed from Apalache's
+`10_OutTransitionFinderPass.tla` (`apalache-mc check --write-intermediate`
+on `quint compile --target json` output), where `Next_si_0007` and
+`Next_si_0035` are the only transitions that assign `lastAction' :=
+"TX3_Cancel"` / `"AdminCancel"`, and from the per-transition times in
+`detailed.log`: at step 1 these two took 88 s and 94 s, every other
+transition at most 1.1 s. The cause was the G11 cascade: `cancelTargets` was
+a `MAX_WF`-round fold whose accumulator is a set (each round a filter with an
+`exists` over the accumulator and the `restartOrigins` fold inside), and
+`cancelWrite` folded the whole `Db` over that symbolic set, twice per step.
+
+**The fix, part 1: the cascade in an Apalache-friendly form.** The actions
+now compute `ts = cancelTargets(db, w)` once per step (a nullary `val`) and
+write `cancelWriteTo(db, ts)`. `cancelTargets` iterates boolean vectors over
+`WF_IDS` (`originsVec`, `ownedGenVec`, then the closure), and
+`cancelWriteTo` is pointwise: a row in `ts` is cancelled, a pending
+activity of a row in `ts` is cancelled, a running one becomes cancelling.
+Why they are equal to the first definitions, kept as `cancelTargetsRef` and
+`cancelWriteRef`:
+- `originsVec(d, g)` runs the same `MAX_WF` rounds as `restartOrigins(d, g)`
+  on a vector instead of a set; the two agree whenever `restartedFrom` is 0
+  or a workflow id (the reference reads the row of every element it holds,
+  so it is undefined otherwise). `ownedGenVec(d, g).get(p)` is then
+  `ownedGenOf(d, g, p)` term by term, and the closure is the reference's
+  round by round (the accumulator only ever holds ids).
+- `cancelOne(acc, x)` changes only row `x` and the activities whose `wf` is
+  `x`, reads exactly those, and changes no activity's `wf`. The targets are
+  distinct, so no row is written twice and each is read unchanged: the fold
+  in any order equals the pointwise write.
+- `inv_cancelFormsAgree` (for every `w`, both targets and both writes are
+  equal; not part of `safety`) checks it. Simulation, 20000 samples x 40
+  steps on each of `durable_mc`, `durable_mc_drift`, `durable_mc_env`,
+  `durable_mc_act`, `durable_mc_rr`, `durable_mc_act_rr`, and 10000 x 80 on
+  `durable_mc`: no violation. Probes showed that these samples reach
+  cascades of two and three rows, cascades through a `restartedFrom`
+  successor, and cascades over live activities of a descendant.
+  Apalache (`verify.sh`, the reach bound below): no violation at depth 3
+  on `durable_mc_d3`, which covers `durable_mc` at depth 3. `check.sh` keeps it as a `hold` row on `durable_mc`
+  (2000/20000 samples; about 30 s in `--quick`).
+
+With the rewrite alone, depth 3 on `durable_mc` finishes: no violation,
+1323 s (22 min; measured while other checks shared the machine); step 1 `TX3_Cancel`
+takes 1.3 s (was 88 s), step 2 5.5 s (was more than 30 minutes).
+
+**The fix, part 2: the reach bound (`durable_mc_d3`).** Apalache at depth
+`k` explores only the states reachable in `k` steps, so ids that no `k`-step
+run can create only cost time. `durable_mc_d3` is `durable_mc` with
+`MAX_WF = 3` and `MAX_ACT = 1` and nothing else changed. Up to depth 3 it
+loses nothing:
+- `init`: every workflow and activity row is empty (status `none`), no
+  events, `nextWf = nextAct = nextToken = 1`, no claims, executions,
+  heartbeats or in-flight T-W1.
+- Workflow rows: only `TX1_Start` (inserted), `TX2_RecoverableStart`
+  (`TX2_StartNew` and the superseded branch) and `TC2_RunChild_New` insert
+  one, always `db.nextWf`, and bump `nextWf` by one. No action inserts two
+  (`EnvSetWf` is not in `step`). So after `j` steps the rows are among ids
+  `1..j`, and a step `j + 1 <= 3` inserts id `<= 3`: the guard
+  `wNew/sNew/cNew <= MAX_WF` has the same value with 3 as with 4.
+- Activity rows: only `TC2_RunActivity` inserts one (`db.nextAct`). It needs
+  a held claim (`tc2Ok`), which only `TC1_Claim` sets, and that needs a
+  `ready` row, which needs an insert first. So the first activity is
+  inserted at step 3 at the earliest, and at most one exists within 3
+  steps: `aNew <= MAX_ACT` has the same value with 1 as with 3.
+- Choices of an id in `step`: `w` may name an empty row in `durable_mc`;
+  every action that takes it (`TX3_Cancel`, `AdminPause`, `AdminResume`,
+  `AdminCancel`) is then disabled (live, not `none`, or `paused` required).
+  `w0`, `w1` and `from` are filtered by status; `ea` feeds only
+  `EnvCorruptActivityBounds` (off in `durable_mc`); a T-W1 candidate `a` is
+  a pending row.
+- The `MAX_WF`-round folds (`newestGen`, `selfAndAncestors`,
+  `restartOrigins`, `originsVec`, the cascade) follow `parent` and
+  `restartedFrom` links, which always name an older (smaller) existing id,
+  so they reach their fixpoint within 2 rounds when at most 3 rows exist:
+  3 rounds and 4 rounds give the same result.
+- Every other constant is unchanged (`MAX_ATTEMPTS` sets the attempt numbers
+  and the `maxAttempts` choices, so it stays 2).
+- Invariants: every conjunct of `safetyRc` over an empty workflow or
+  activity row holds (status `none`, zero token, lease, counters and
+  links, no events, no attempts), and `inv_S16_successOnce` sums a set of
+  counts to which an empty row adds 0.
+So restricting a state of `durable_mc` reachable in at most 3 steps to
+workflow ids `1..3` and activity id `1` is a bijection onto the states of
+`durable_mc_d3` reachable in the same steps, it preserves the transition
+relation, and `safetyRc` has the same value on both. At depth 4 four
+`TX1_Start` steps create four rows, so `verify.sh 4` uses `durable_mc`.
+
+The reach bound alone was not enough: `durable_mc_d3` with the reference
+cascade took 181 s on step-2 `TX3_Cancel` and 240 s on `AdminCancel`, and
+at step 3 even non-cancel transitions took about 10 minutes each (the
+symbolic state after step 2 carries the cascade's writes); it was stopped
+after 50 minutes, 12 minutes into step-3 transition #7 of 49.
+
+| Property | Instance | Bound | Result | Time |
+|---|---|---|---|---|
+| `safetyRc` | `durable_mc_d3` (= `durable_mc` up to depth 3) | depth 3, all interleavings | no violation | 257 s (`./verify.sh 3`, alone) |
+| `safetyRc` | `durable_mc` | depth 3, all interleavings | no violation | 1323 s (shared machine) |
+| `inv_cancelFormsAgree` | `durable_mc_d3` | depth 3, all interleavings | no violation | 289 s (`./verify.sh 3`, alone) |
+
+Before N2 and G11: `safetyRc` on `durable_mc` at depth 3 took about 4 min
+(no violation); depth 4 was stopped after 36 min with no violation (10 of
+~41 step-4 transitions checked).
 
 The new state (per-runtime T-W1 buffers and locks) makes each Apalache step
 slower than in the first iteration (depth 4 took 16 min then). The depth-4

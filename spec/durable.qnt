@@ -434,19 +434,40 @@ module durable {
   // w and, recursively, every live generation of a child owned by a target. The chain walk
   // passes terminal generations; the recursion into a generation's own children needs it to
   // be cancelled here (a target). MAX_WF rounds reach every depth.
-  pure def cancelTargets(d: Db, w: int): Set[int] =
+  // Reference form; `cancelTargets` below computes the same set (inv_cancelFormsAgree).
+  pure def cancelTargetsRef(d: Db, w: int): Set[int] =
     WF_IDS.fold(Set(w), (acc, i) =>
       acc.union(WF_IDS.filter(g => isLive(d.wf.get(g).status) and acc.exists(p => ownedGenOf(d, g, p)))))
+
+  // The form the actions use. Apalache unrolls a fold whose accumulator is a set into
+  // ever larger symbolic sets, and folding a Db over such a set copies the whole Db per
+  // candidate element: the reference cascade took minutes per step to translate. Here
+  // every set is a boolean vector over WF_IDS, and the write is pointwise.
+  // originsVec(d, g).get(x) iff x is in restartOrigins(d, g) (restartedFrom is 0 or an id)
+  pure def originsVec(d: Db, g: int): int -> bool =
+    WF_IDS.fold(WF_IDS.mapBy(x => x == g), (v, i) =>
+      WF_IDS.mapBy(x => v.get(x) or WF_IDS.exists(y => v.get(y) and d.wf.get(y).restartedFrom == x)))
+  // ownedGenVec(d, g).get(p) iff ownedGenOf(d, g, p)
+  pure def ownedGenVec(d: Db, g: int): int -> bool = {
+    val o = originsVec(d, g)
+    WF_IDS.mapBy(p => d.wf.get(g).status != "none" and WF_IDS.exists(c => o.get(c) and ownedBy(d.wf.get(c), p)))
+  }
+  pure def cancelTargets(d: Db, w: int): Set[int] = {
+    val og = WF_IDS.mapBy(g => ownedGenVec(d, g))
+    val v = WF_IDS.fold(WF_IDS.mapBy(x => x == w), (acc, i) =>
+      WF_IDS.mapBy(g => acc.get(g) or (isLive(d.wf.get(g).status) and WF_IDS.exists(p => acc.get(p) and og.get(g).get(p)))))
+    WF_IDS.filter(x => v.get(x))
+  }
 
   // store.rs cancel_locked_workflow (T-X3 and T-A4): for w and each target of the cascade:
   // cancel_activities, fenced workflow -> cancelled (wait and lease cleared); wake the
   // parents waiting on w with child_cancelled. The parents waiting on a descendant are
   // its owner, cancelled in the same step, so their wake is empty. The cascade waits for
-  // every lock a T-W1 holds on a target or its activities.
-  def cancelOk(w: int): bool = all {
+  // every lock a T-W1 holds on a target or its activities. ts = cancelTargets(db, w).
+  def cancelOk(w: int, ts: Set[int]): bool = all {
     WF_IDS.contains(w),
     isLive(db.wf.get(w).status),
-    cancelTargets(db, w).forall(x => all {
+    ts.forall(x => all {
       not(wfLocked(proc, x)),
       not(ACT_IDS.exists(a => db.act.get(a).wf == x and actLocked(proc, a))),
     }),
@@ -454,14 +475,32 @@ module durable {
   pure def cancelOne(d: Db, w: int): Db =
     setWf(cancelActivities(d, w), w,
           d.wf.get(w).with("status", "cancelled").with("waitKind", "").with("waitRef", 0).with("token", 0).with("leaseExp", 0))
-  pure def cancelWrite(d: Db, w: int): Db =
-    cancelTargets(d, w).fold(d, (acc, x) => cancelOne(acc, x))
+  // Reference form: cancelOne for each target in turn
+  pure def cancelWriteRef(d: Db, w: int): Db =
+    cancelTargetsRef(d, w).fold(d, (acc, x) => cancelOne(acc, x))
+  // The same write, pointwise: cancelOne(acc, x) changes only row x and the activities of x,
+  // and reads them unchanged, so the order and the fold do not matter
+  pure def cancelWriteTo(d: Db, ts: Set[int]): Db =
+    d.with("act", ACT_IDS.mapBy(a => {
+       val ar = d.act.get(a)
+       if (ts.contains(ar.wf) and ar.status == "pending") ar.with("status", "cancelled").with("token", 0).with("leaseExp", 0)
+       else if (ts.contains(ar.wf) and ar.status == "running") ar.with("status", "cancelling")
+       else ar
+     }))
+     .with("wf", WF_IDS.mapBy(x =>
+       if (ts.contains(x)) d.wf.get(x).with("status", "cancelled").with("waitKind", "").with("waitRef", 0).with("token", 0).with("leaseExp", 0)
+       else d.wf.get(x)))
+  pure def cancelWrite(d: Db, w: int): Db = cancelWriteTo(d, cancelTargets(d, w))
 
   // T-X3: cancel_with_conn; on a terminal row it is a no-op (not a step)
-  action TX3_Cancel(w: int, tnow: int): bool = all {
-    cancelOk(w),
-    wakeParentsOk(cancelWrite(db, w), w),
-    commitAt(wakeParents(cancelWrite(db, w), w, "child_cancelled", tnow), proc, ghost, "TX3_Cancel", tnow),
+  action TX3_Cancel(w: int, tnow: int): bool = {
+    val ts = cancelTargets(db, w)
+    val d1 = cancelWriteTo(db, ts)
+    all {
+      cancelOk(w, ts),
+      wakeParentsOk(d1, w),
+      commitAt(wakeParents(d1, w, "child_cancelled", tnow), proc, ghost, "TX3_Cancel", tnow),
+    }
   }
 
   //------------------------------------------------------------ coordinator
@@ -1134,10 +1173,14 @@ module durable {
 
   // T-A4 cancel_workflow: terminal -> Conflict; else cancel_locked_workflow as T-X3, which
   // cancels the owned subtree (G11 fixed).
-  action AdminCancel(w: int, tnow: int): bool = all {
-    cancelOk(w),
-    wakeParentsOk(cancelWrite(db, w), w),
-    commitAt(wakeParents(cancelWrite(db, w), w, "child_cancelled", tnow), proc, ghost, "AdminCancel", tnow),
+  action AdminCancel(w: int, tnow: int): bool = {
+    val ts = cancelTargets(db, w)
+    val d1 = cancelWriteTo(db, ts)
+    all {
+      cancelOk(w, ts),
+      wakeParentsOk(d1, w),
+      commitAt(wakeParents(d1, w, "child_cancelled", tnow), proc, ghost, "AdminCancel", tnow),
+    }
   }
 
   //-------------------------------------------------------------- environment
@@ -1512,6 +1555,11 @@ module durable {
   }
   // safety plus S17 (expected to hold under READ COMMITTED)
   val safetyRc = safety and inv_S17_capAtClaim and inv_S17_capAlways
+
+  // Not a protocol invariant: the cancel cascade the actions use (cancelTargets, cancelWrite)
+  // equals its reference form (cancelTargetsRef, cancelWriteRef) for every workflow id
+  val inv_cancelFormsAgree = WF_IDS.forall(w =>
+    cancelTargets(db, w) == cancelTargetsRef(db, w) and cancelWrite(db, w) == cancelWriteRef(db, w))
 
   //============================================ WITNESSES (expected to fail)
   // Each is the negation of a reachable interesting state; a violation proves reachability.

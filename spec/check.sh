@@ -79,6 +79,7 @@ sim durable_mc         safetyRc                hold    2000   20000   40 # + S17
 sim durable_mc_act     safetyRc                hold    2000   20000   40 # activity-only: more T-W1 interleavings per sample
 sim durable_mc_env     safety                  hold    2000   20000   40 # external writes (invalid bounds) break nothing else
 sim durable_mc_rr      safety                  hold    2000   20000   40 # historical REPEATABLE READ T-W1 (pre-P4)
+sim durable_mc         inv_cancelFormsAgree    hold    2000   20000   40 # G11 cascade: the Apalache form = the reference form
 # witnesses (non-vacuity)
 sim durable_mc_env     wit_quarantined         violate 2000   20000   40 # G10 fixed: an invalid row is quarantined
 sim durable_mc         wit_S3_concurrentStep   violate 2000   20000   40
