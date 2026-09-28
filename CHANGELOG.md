@@ -94,9 +94,10 @@ Compared with the production-internal version it was extracted from:
   quarantines its row (recover it with `retry_activity`). The trace
   interface is v6: activity images record `retry_policy_json`.
 
-- The test-only `fake-clock` feature is a compile error in a build without
-  debug assertions (the `release` profile), so it cannot reach a release
-  binary. Tests build in the dev/test profiles and are not affected.
+- The test-only `fake-clock` and `trace-model` features are a compile
+  error in a build without debug assertions (the `release` profile), so
+  they cannot reach a release binary. Tests and the trace pipeline build in
+  the dev/test profiles and are not affected.
 
 - Removed the public host-clock function `persistence::now_millis()`.
   Persisted times and due/expiry comparisons use the database clock

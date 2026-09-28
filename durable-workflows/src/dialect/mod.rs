@@ -19,6 +19,13 @@ compile_error!(
     "durable-workflows: the test-only `fake-clock` feature must not reach a release build \
      (it lets a session override the database clock)"
 );
+// `trace-model` is test-only for the same reason: it installs triggers on the
+// durable tables and writes a trace row in every engine transaction.
+#[cfg(all(feature = "trace-model", not(debug_assertions)))]
+compile_error!(
+    "durable-workflows: the test-only `trace-model` feature must not reach a release build \
+     (it records every engine transaction into trace tables)"
+);
 
 #[cfg(feature = "mysql")]
 mod mysql;

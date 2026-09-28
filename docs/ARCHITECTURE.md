@@ -389,7 +389,9 @@ The `dialect` module is the only place that names a backend. It isolates:
 
 The migrations exist once per backend. The test-only features `fake-clock`
 (overrides the database clock) and `trace-model` (records traces) must never
-be enabled in production. The reasoning is in
+be enabled in production; a build without debug assertions (the release
+profile) that enables either fails to compile (`src/dialect/mod.rs`). The
+reasoning is in
 [`design/multi-backend.md`](design/multi-backend.md).
 
 ## 9. Verification architecture

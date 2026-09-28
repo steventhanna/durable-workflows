@@ -38,7 +38,8 @@ postgres = ["diesel/postgres", "diesel-async/postgres"]
 # Test-only database clock override. Never enable in production.
 fake-clock = []
 # Test-only trace recorder for checking runs against the Quint model
-# (docs/design/trace-checking.md). Never enable in production.
+# (docs/design/trace-checking.md). Never enable in production; a release
+# build (no debug assertions) with it is a compile error.
 trace-model = []
 
 [package.metadata.docs.rs]
