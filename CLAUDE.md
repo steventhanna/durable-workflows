@@ -22,7 +22,11 @@ system can make the violation fail to compile. In order of preference:
    enum instead of a combination of `Option` fields, a newtype instead of a
    raw `i64`/`String`, a parsed type instead of a validated one (a schedule's
    local occurrence key is a `LocalOccurrence`, the one parser and formatter
-   of the persisted text, ordered like it), an outcome
+   of the persisted text, ordered like it; a `RetryPolicy` has a private
+   field and only checked constructors and a checked decode, so a policy
+   outside the retry bounds has no value outside the crate:
+   `retry_policy_unchecked_constructor` and `retry_policy_field_private`
+   compile-fail cases), an outcome
    enum instead of a flag (a lease renewal returns `Renewed::Held` or
    `Renewed::Revoked`; a revoked execution finishes as
    `ExecutionOutcome::Revoked`), one enum for fields that exclude each other

@@ -1,0 +1,5 @@
+error[E0451]: field `backoff` of struct `RetryPolicy` is private
+  --> tests/ui/fail/retry_policy_field_private.rs:12:27
+   |
+12 |     let _ = RetryPolicy { backoff };
+   |                           ^^^^^^^ private field

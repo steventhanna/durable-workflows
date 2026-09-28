@@ -140,14 +140,6 @@ impl RetryPolicy {
         }
     }
 
-    /// Unchecked: skips the bounds. Kept for tests of `delay_for_attempt`
-    /// outside them (it saturates); the engine and the macros use
-    /// [`RetryPolicy::from_checked`].
-    #[doc(hidden)]
-    pub const fn from_validated(backoff: BackoffPolicy) -> Self {
-        Self { backoff }
-    }
-
     fn validated(backoff: BackoffPolicy) -> Result<Self, DurableError> {
         BoundViolation::check(backoff)
             .map(|backoff| Self { backoff })
@@ -250,5 +242,23 @@ mod tests {
                 "{stored} decoded"
             );
         }
+    }
+
+    /// Minimal counterexample for the former wrap-around finding: 2^63 s at
+    /// +100% jitter returned 0 s. The constructors and deserialization reject
+    /// this policy, so only code inside this module can build it; if the
+    /// bounds ever let it through, `delay_for_attempt` saturates instead.
+    #[test]
+    fn jitter_overflow_saturates_outside_the_bounds() {
+        let base = 1_u64 << 63;
+        let policy = RetryPolicy {
+            backoff: BackoffPolicy::Exponential {
+                initial_secs: base,
+                max_secs: base,
+                jitter_percent: 100,
+            },
+        };
+        let delay = policy.delay_for_attempt(1, 100).unwrap();
+        assert_eq!(delay.as_secs(), u64::MAX, "got {delay:?}");
     }
 }

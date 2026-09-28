@@ -221,8 +221,9 @@ proptest! {
 }
 
 /// Minimal counterexample for the former wrap-around finding: 2^63 s at +100%
-/// jitter returned 0 s. The constructors now reject it; a policy that skips
-/// them (a stored `retry_policy_json` or `from_validated`) saturates instead.
+/// jitter returned 0 s. The constructors now reject it. No public path builds
+/// it unchecked; the saturation check for such a policy is the unit test
+/// `policy::tests::jitter_overflow_saturates_outside_the_bounds`.
 #[test]
 fn jitter_overflow_minimal_counterexample() {
     let base = 1_u64 << 63;
@@ -230,13 +231,6 @@ fn jitter_overflow_minimal_counterexample() {
         RetryPolicy::exponential(base, base, 100),
         Err(DurableError::InvalidDefinition(_))
     ));
-    let policy = RetryPolicy::from_validated(BackoffPolicy::Exponential {
-        initial_secs: base,
-        max_secs: base,
-        jitter_percent: 100,
-    });
-    let delay = policy.delay_for_attempt(1, 100).unwrap();
-    assert_eq!(delay.as_secs(), u64::MAX, "got {delay:?}");
 }
 
 #[test]

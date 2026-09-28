@@ -974,8 +974,9 @@ same holds for `RetryPolicy`: its constructors bound every delay by
 fits the millisecond range. Deserialization checks the same bounds
 (`#[serde(try_from)]`), and `from_checked`, which the derive macros emit
 in a `const` block, fails compilation (or panics outside a const context)
-out of bounds; only the `#[doc(hidden)]` `from_validated`, which the
-engine no longer calls, skips them. A stored `retry_policy_json` that does
+out of bounds. No public constructor skips them (the unchecked
+`from_validated` is removed; `retry_policy_unchecked_constructor`
+compile-fail case). A stored `retry_policy_json` that does
 not decode is quarantined at claim as `invalid_bounds` (G10); lease
 recovery requeues such a running row due now so the next claim quarantines
 it. On a policy outside the bounds, `delay_for_attempt` saturates at

@@ -72,6 +72,13 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- `RetryPolicy::from_validated` is removed (breaking for code that called
+  the `#[doc(hidden)]` hatch): it built a policy without checking the retry
+  bounds. Every `RetryPolicy` outside the crate is now within the bounds
+  (`retry_policy_unchecked_constructor` and `retry_policy_field_private`
+  compile-fail cases). Migration: use
+  `RetryPolicy::fixed` or `RetryPolicy::exponential` (they return `Result`),
+  or `from_checked` in a `const` context.
 - `StartOptions::deduplication_key` is no longer a public field (breaking):
   the key and the engine's restart lineage are one private enum, so a
   start cannot carry both (this was a runtime `InvalidDefinition` check,
@@ -89,8 +96,7 @@ Compared with the production-internal version it was extracted from:
   so the next claim quarantines it. The worker decodes the policy once, at
   claim. The derive macros build the policy with the new `#[doc(hidden)]`
   `RetryPolicy::from_checked`, which checks the bounds too, in a `const`
-  block (a compile error out of bounds); the `#[doc(hidden)]`
-  `from_validated` stays unchecked and the engine no longer uses it. Migration: none for
+  block (a compile error out of bounds). Migration: none for
   policies the engine wrote; a hand-edited out-of-bounds policy now
   quarantines its row (recover it with `retry_activity`). The trace
   interface is v6: activity images record `retry_policy_json`.
@@ -240,7 +246,7 @@ Compared with the production-internal version it was extracted from:
   `retry_activity` replaces it with a row built from the registered
   definition.
 - Retry jitter no longer wraps: a jittered delay above `u64::MAX` seconds
-  (reachable through a stored or `from_validated` policy) saturates at
+  (once reachable through a stored policy) saturates at
   `u64::MAX` instead of wrapping to a short delay, so delays stay within the
   jitter bounds and never shrink as attempts grow.
 - G2: `start_or_restart_recoverable` on a blocked child no longer strands
