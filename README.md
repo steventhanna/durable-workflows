@@ -74,7 +74,9 @@ let manager = AsyncDieselConnectionManager::<durable_workflows::DurableConnectio
 ```
 
 The `fake-clock` feature lets the test suite override the database clock. It
-is for tests only: **never enable `fake-clock` in production.**
+is for tests only: **never enable `fake-clock` in production.** A build
+without debug assertions (the `release` profile) that enables it fails to
+compile.
 
 ### Creating the tables
 
@@ -203,7 +205,8 @@ describes the components, the state machines and the concurrency model.
 - **Keys compare by exact bytes.** Deduplication keys, topic keys, schedule
   keys and operation keys are case- and accent-sensitive on both backends:
   `email` and `Email` are different topics.
-- **`fake-clock` is test-only.** Never enable it in production.
+- **`fake-clock` is test-only.** Never enable it in production. A release
+  build (no debug assertions) with the feature is a compile error.
 
 ## Verification
 

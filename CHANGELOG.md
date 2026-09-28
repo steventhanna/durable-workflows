@@ -72,6 +72,10 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- The test-only `fake-clock` feature is a compile error in a build without
+  debug assertions (the `release` profile), so it cannot reach a release
+  binary. Tests build in the dev/test profiles and are not affected.
+
 - Removed the public host-clock function `persistence::now_millis()`.
   Persisted times and due/expiry comparisons use the database clock
   (`persistence::database_now_millis(&mut connection)`); a caller that

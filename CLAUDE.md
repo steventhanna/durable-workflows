@@ -167,6 +167,9 @@ cd spec && ./check.sh                                   # Quint typecheck, tests
 scripts/trace-pipeline.sh mysql && scripts/trace-pipeline.sh postgres
 ```
 
+- `fake-clock` is test-only: a build without `debug_assertions` (e.g.
+  `--release`) that enables it is a `compile_error!` (`src/dialect/mod.rs`).
+  Never build tests in release with it.
 - Run tests at full parallelism; never `--test-threads=1`. Each test creates
   its own `dwt_*` database.
 - `trace-pipeline.sh` drops every `dwt_*` database on its server: never run it
