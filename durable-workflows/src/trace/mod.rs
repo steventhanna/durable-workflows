@@ -111,6 +111,7 @@ const EXTERNAL_COLUMNS: &[(&str, &[&str])] = &[
             "lease_expires_at",
             "timeout_millis",
             "lease_duration_millis",
+            "retry_policy_json",
         ],
     ),
     (
@@ -737,6 +738,7 @@ fn activity_image(row: &ActivityRow) -> Value {
         "lease_expires_at": row.lease_expires_at,
         "timeout_millis": row.timeout_millis,
         "lease_duration_millis": row.lease_duration_millis,
+        "retry_policy_json": row.retry_policy_json,
     })
 }
 

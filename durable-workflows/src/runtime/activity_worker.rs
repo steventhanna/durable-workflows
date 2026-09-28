@@ -91,6 +91,8 @@ pub struct ActivityClaim {
     attempt_number: i32,
     lease_token: String,
     lease_deadline: tokio::time::Instant,
+    /// The row's `retry_policy_json`, decoded (and bounds-checked) at claim.
+    retry_policy: RetryPolicy,
 }
 
 impl ActivityClaim {
@@ -480,9 +482,10 @@ where
 
     /// Locks and claims one candidate. A row this runtime cannot run returns
     /// `Ok(None)` so the rest of the T-W1 goes on (G10): a missing definition
-    /// is skipped; a row past its attempt cap or with invalid timeout/lease
-    /// bounds is quarantined (dead-lettered, its workflow blocked) and pushed
-    /// to `quarantined` for the trace.
+    /// is skipped; a row past its attempt cap, with invalid timeout/lease
+    /// bounds or with a stored retry policy that does not decode within the
+    /// `RetryPolicy` bounds is quarantined (dead-lettered, its workflow
+    /// blocked) and pushed to `quarantined` for the trace.
     #[allow(clippy::too_many_arguments)]
     async fn claim_locked_candidate(
         &self,
@@ -555,6 +558,21 @@ where
             }
             return Ok(None);
         }
+        let retry_policy = match serde_json::from_str::<RetryPolicy>(&row.retry_policy_json) {
+            Ok(retry_policy) => retry_policy,
+            Err(error) => {
+                let message = format!("activity {} has an invalid retry policy: {error}", row.id);
+                quarantine_candidate(connection, row.as_ref(), "invalid_bounds", &message, now)
+                    .await?;
+                if crate::trace::ENABLED {
+                    quarantined.push(serde_json::json!({
+                        "activity_id": row.id,
+                        "reason": "invalid_bounds",
+                    }));
+                }
+                return Ok(None);
+            }
+        };
         let mut row = row.into_row();
         let attempt_number = row
             .attempt_count
@@ -612,6 +630,7 @@ where
             schedule_run_id,
             attempt_number,
             lease_token,
+            retry_policy,
         }))
     }
 
@@ -1305,19 +1324,31 @@ async fn reconcile_expired(
             DurableError::InvalidState(format!("running activity {} has no lease token", row.id))
         })?;
         let exhausted = row.attempt_count >= row.max_attempts;
-        let available_at = if exhausted {
-            now
-        } else {
-            let retry_policy: RetryPolicy = serde_json::from_str(&row.retry_policy_json)?;
-            let attempt = u32::try_from(row.attempt_count)
-                .map_err(|_| DurableError::InvalidState("negative activity attempt".to_string()))?;
-            let jitter_percentile = crate::deterministic_jitter_percentile(format!(
-                "activity:{}:lease_recovery:{}",
-                row.id, attempt
-            ));
-            now.saturating_add(duration_millis(
-                retry_policy.delay_for_attempt(attempt, jitter_percentile)?,
-            )?)
+        let retry_policy = serde_json::from_str::<RetryPolicy>(&row.retry_policy_json);
+        let available_at = match retry_policy {
+            _ if exhausted => now,
+            Ok(retry_policy) => {
+                let attempt = u32::try_from(row.attempt_count).map_err(|_| {
+                    DurableError::InvalidState("negative activity attempt".to_string())
+                })?;
+                let jitter_percentile = crate::deterministic_jitter_percentile(format!(
+                    "activity:{}:lease_recovery:{}",
+                    row.id, attempt
+                ));
+                now.saturating_add(duration_millis(
+                    retry_policy.delay_for_attempt(attempt, jitter_percentile)?,
+                )?)
+            }
+            Err(error) => {
+                // Requeued due now instead of failing the T-W1 (G10): the
+                // next claim quarantines the row as `invalid_bounds`.
+                tracing::warn!(
+                    activity_id = row.id,
+                    %error,
+                    "lease recovery found an invalid retry policy; requeueing it for quarantine"
+                );
+                now
+            }
         };
         let changed = diesel::update(
             durable_activity::table
@@ -1616,7 +1647,7 @@ async fn finish_on_connection(
                 declare_finish(claim, "retryable", None);
                 dead_letter(connection, claim, row.as_ref(), &category, &message, now).await
             } else {
-                let retry_policy: RetryPolicy = serde_json::from_str(&claim.row.retry_policy_json)?;
+                let retry_policy = claim.retry_policy;
                 let attempt = u32::try_from(claim.attempt_number).map_err(|_| {
                     DurableError::InvalidState("negative activity attempt".to_string())
                 })?;

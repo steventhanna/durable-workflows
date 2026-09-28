@@ -169,13 +169,22 @@ concurrent insert falls back to `DeduplicationConflict` and a locking reload).
 
 ## Trace-checking interface
 
-`pure val TRACE_IFACE_VERSION = 5` (in `durable.qnt`) versions the action
+`pure val TRACE_IFACE_VERSION = 6` (in `durable.qnt`) versions the action
 names, parameters and views below. Every action takes all its choices as
 parameters; there is no `nondet` inside an action (only in `step`). A trace
 checker calls `all { keepPrev, Action(args) }` once per record, in commit
 order. After each call `lastAction` names the branch taken (for example
 `TX1_StartConflict`, `TX2_ReturnLatest`, `TC2_RunChild_AttachTerminal`,
 `TW3_DeadLetter`); a checker compares it with the outcome in the record.
+
+Changes in v6 (from v5):
+
+- The recorded activity image (post-images and trigger-captured `External`
+  rows) carries `retry_policy_json`. `durable-trace gen` sets a row's
+  `invalidBounds` also when that text does not decode as a `RetryPolicy`
+  (its bounds are checked on decode), the check `claim_locked_candidate`
+  now makes before a claim; such a row is quarantined as
+  `"invalid_bounds"`. The model is unchanged.
 
 Changes in v5 (from v4):
 

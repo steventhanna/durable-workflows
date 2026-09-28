@@ -72,6 +72,20 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- `RetryPolicy` deserialization checks the same bounds as
+  `RetryPolicy::fixed` / `exponential` and fails for a policy out of
+  bounds (it accepted any value). An activity row whose stored
+  `retry_policy_json` does not decode is quarantined at claim
+  (`invalid_row`, reason `invalid_bounds`, G10) instead of failing later
+  with a decode error; lease recovery requeues such a running row due now
+  so the next claim quarantines it. The worker decodes the policy once, at
+  claim. The `#[doc(hidden)]` `RetryPolicy::from_validated` checks the
+  bounds too (a compile error in a `const` context, a panic otherwise), and
+  the derive macros call it in a `const` block. Migration: none for
+  policies the engine wrote; a hand-edited out-of-bounds policy now
+  quarantines its row (recover it with `retry_activity`). The trace
+  interface is v6: activity images record `retry_policy_json`.
+
 - The test-only `fake-clock` feature is a compile error in a build without
   debug assertions (the `release` profile), so it cannot reach a release
   binary. Tests build in the dev/test profiles and are not affected.

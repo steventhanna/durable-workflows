@@ -120,7 +120,7 @@ module durable {
   const MAX_TASK_RESTARTS: int    // RuntimeConfig.max_task_restarts (per task; supervisor.rs)
 
   // version of the trace-checking interface (action names and parameters, views)
-  pure val TRACE_IFACE_VERSION = 5
+  pure val TRACE_IFACE_VERSION = 6
 
   pure val WF_IDS = 1.to(MAX_WF)
   pure val ACT_IDS = 1.to(MAX_ACT)
@@ -139,7 +139,7 @@ module durable {
   type ActRow = {
     status: str, wf: int, topic: str, attemptCount: int, maxAttempts: int,
     availableAt: int, token: int, leaseExp: int,
-    invalidBounds: bool           // timeout_millis <= 0 or lease_duration_millis <= timeout_millis
+    invalidBounds: bool           // timeout_millis <= 0, lease_duration_millis <= timeout_millis, or retry_policy_json out of RetryPolicy bounds
   }
   type AttRow = { used: bool, token: int, open: bool }
   type Event = { dseq: int, typ: str, ref: int, cmd: int }  // cmd = workflow commandSequence at append
@@ -695,8 +695,8 @@ module durable {
     cur.status == "pending" and cur.availableAt <= tnow and waitsOnAct(v, cur.wf, a)
   }
   // G10 (fixed): claim_locked_candidate quarantines a locked claimable row that is past its
-  // attempt cap ("attempt_cap", checked first) or has invalid timeout/lease bounds
-  // ("invalid_bounds"): the row is dead-lettered (invalid_row) and its workflow blocked, and the
+  // attempt cap ("attempt_cap", checked first) or has invalid timeout/lease bounds or retry
+  // policy ("invalid_bounds"): the row is dead-lettered (invalid_row) and its workflow blocked, and the
   // T-W1 goes on. ("missing_definition" is a skip, not modeled: every runtime has every
   // definition, F3.)
   pure def quarantineReason(v: Db, a: int): str = {

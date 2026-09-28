@@ -16,7 +16,7 @@ use std::{
 use serde_json::{json, Map, Value};
 
 /// `TRACE_IFACE_VERSION` in `spec/durable.qnt` this generator targets.
-const IFACE_VERSION: i64 = 5;
+const IFACE_VERSION: i64 = 6;
 
 /// Invariants checked after every step.
 const STEP_INVARIANTS: &[&str] = &["safety", "inv_S17_capAtClaim"];
@@ -1245,17 +1245,22 @@ fn act_row(ctx: &mut Ctx, row: &Value, seq: i64) -> Result<String, Excluded> {
     ))
 }
 
-/// `invalidBounds` of a recorded activity row: the check in
+/// `invalidBounds` of a recorded activity row: the checks in
 /// `claim_locked_candidate` (`timeout_millis <= 0 || lease_duration_millis <=
-/// timeout_millis`); false when the image has no bounds.
+/// timeout_millis`, or a `retry_policy_json` that does not decode as a
+/// `RetryPolicy`); false when the image has no bounds.
 fn invalid_bounds(row: &Value) -> bool {
-    match (
+    let timeout_lease = match (
         opt_int(row, "timeout_millis"),
         opt_int(row, "lease_duration_millis"),
     ) {
         (Some(timeout), Some(lease)) => timeout <= 0 || lease <= timeout,
         _ => false,
-    }
+    };
+    let retry_policy = row["retry_policy_json"]
+        .as_str()
+        .is_some_and(|json| serde_json::from_str::<durable_workflows::RetryPolicy>(json).is_err());
+    timeout_lease || retry_policy
 }
 
 /// `KeyMap`: NULL -> 0, `child:{P}:{C}` -> `autoKey(WfMap[P], C)`, else 1..j.

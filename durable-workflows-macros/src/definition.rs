@@ -544,23 +544,29 @@ pub fn derive_activity(input: DeriveInput) -> TokenStream {
             let timeout_secs = metadata.timeout_secs;
             let lease_secs = metadata.lease_secs;
             let retry_policy = match metadata.backoff {
+                // `const { .. }`: the library checks the same bounds again at
+                // compile time (E0080), so the macro's copy cannot drift.
                 BackoffMetadata::Fixed { delay_secs } => quote! {
-                    ::durable_workflows::RetryPolicy::from_validated(
-                        ::durable_workflows::BackoffPolicy::Fixed { delay_secs: #delay_secs }
-                    )
+                    const {
+                        ::durable_workflows::RetryPolicy::from_validated(
+                            ::durable_workflows::BackoffPolicy::Fixed { delay_secs: #delay_secs }
+                        )
+                    }
                 },
                 BackoffMetadata::Exponential {
                     initial_secs,
                     max_secs,
                     jitter_percent,
                 } => quote! {
-                    ::durable_workflows::RetryPolicy::from_validated(
-                        ::durable_workflows::BackoffPolicy::Exponential {
-                            initial_secs: #initial_secs,
-                            max_secs: #max_secs,
-                            jitter_percent: #jitter_percent,
-                        }
-                    )
+                    const {
+                        ::durable_workflows::RetryPolicy::from_validated(
+                            ::durable_workflows::BackoffPolicy::Exponential {
+                                initial_secs: #initial_secs,
+                                max_secs: #max_secs,
+                                jitter_percent: #jitter_percent,
+                            }
+                        )
+                    }
                 },
             };
             quote! {

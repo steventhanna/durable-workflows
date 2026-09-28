@@ -32,31 +32,122 @@ pub enum BackoffPolicy {
     },
 }
 
+/// A validated retry policy. Every value, including one deserialized from a
+/// stored `retry_policy_json`, is within the bounds [`RetryPolicy::fixed`]
+/// and [`RetryPolicy::exponential`] check (`#[serde(try_from)]`), so a
+/// corrupt stored policy is a decode error, never an unchecked delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "StoredRetryPolicy")]
 pub struct RetryPolicy {
     backoff: BackoffPolicy,
 }
 
+/// The serialized shape of [`RetryPolicy`], before its bounds are checked.
+#[derive(serde::Deserialize)]
+struct StoredRetryPolicy {
+    backoff: BackoffPolicy,
+}
+
+impl TryFrom<StoredRetryPolicy> for RetryPolicy {
+    type Error = DurableError;
+
+    fn try_from(stored: StoredRetryPolicy) -> Result<Self, Self::Error> {
+        Self::validated(stored.backoff)
+    }
+}
+
+/// A bound a [`BackoffPolicy`] breaks. The one list of retry bounds, shared
+/// by the constructors, deserialization and the const-evaluated
+/// [`RetryPolicy::from_validated`] the derive macros emit.
+#[derive(Debug, Clone, Copy)]
+enum BoundViolation {
+    FixedZero,
+    FixedTooLong,
+    InitialZero,
+    MaxBelowInitial,
+    MaxTooLong,
+    JitterOver100,
+}
+
+impl BoundViolation {
+    const fn check(backoff: BackoffPolicy) -> Result<BackoffPolicy, Self> {
+        match backoff {
+            BackoffPolicy::Fixed { delay_secs } => {
+                if delay_secs == 0 {
+                    Err(Self::FixedZero)
+                } else if delay_secs > MAX_RETRY_DELAY_SECS {
+                    Err(Self::FixedTooLong)
+                } else {
+                    Ok(backoff)
+                }
+            }
+            BackoffPolicy::Exponential {
+                initial_secs,
+                max_secs,
+                jitter_percent,
+            } => {
+                if initial_secs == 0 {
+                    Err(Self::InitialZero)
+                } else if max_secs < initial_secs {
+                    Err(Self::MaxBelowInitial)
+                } else if max_secs > MAX_RETRY_DELAY_SECS {
+                    Err(Self::MaxTooLong)
+                } else if jitter_percent > 100 {
+                    Err(Self::JitterOver100)
+                } else {
+                    Ok(backoff)
+                }
+            }
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FixedZero => "fixed retry delay must be greater than zero",
+            Self::FixedTooLong => "fixed retry delay cannot exceed MAX_RETRY_DELAY_SECS",
+            Self::InitialZero => "exponential initial delay must be greater than zero",
+            Self::MaxBelowInitial => "exponential max delay must be at least the initial delay",
+            Self::MaxTooLong => "exponential max delay cannot exceed MAX_RETRY_DELAY_SECS",
+            Self::JitterOver100 => "retry jitter_percent cannot exceed 100",
+        }
+    }
+
+    fn into_error(self) -> DurableError {
+        DurableError::InvalidDefinition(match self {
+            Self::FixedTooLong => {
+                format!("fixed retry delay cannot exceed {MAX_RETRY_DELAY_SECS} seconds")
+            }
+            Self::MaxTooLong => {
+                format!("exponential max delay cannot exceed {MAX_RETRY_DELAY_SECS} seconds")
+            }
+            Self::FixedZero | Self::InitialZero | Self::MaxBelowInitial | Self::JitterOver100 => {
+                self.as_str().to_string()
+            }
+        })
+    }
+}
+
 impl RetryPolicy {
+    /// For the derive macros, which emit it in a `const` block: a policy out
+    /// of bounds is a compile error (E0080) there, and a panic in a
+    /// non-const call.
     #[doc(hidden)]
+    #[track_caller]
     pub const fn from_validated(backoff: BackoffPolicy) -> Self {
-        Self { backoff }
+        match BoundViolation::check(backoff) {
+            Ok(backoff) => Self { backoff },
+            Err(violation) => panic!("{}", violation.as_str()),
+        }
+    }
+
+    fn validated(backoff: BackoffPolicy) -> Result<Self, DurableError> {
+        BoundViolation::check(backoff)
+            .map(|backoff| Self { backoff })
+            .map_err(BoundViolation::into_error)
     }
 
     pub fn fixed(delay_secs: u64) -> Result<Self, DurableError> {
-        if delay_secs == 0 {
-            return Err(DurableError::InvalidDefinition(
-                "fixed retry delay must be greater than zero".to_string(),
-            ));
-        }
-        if delay_secs > MAX_RETRY_DELAY_SECS {
-            return Err(DurableError::InvalidDefinition(format!(
-                "fixed retry delay cannot exceed {MAX_RETRY_DELAY_SECS} seconds"
-            )));
-        }
-        Ok(Self {
-            backoff: BackoffPolicy::Fixed { delay_secs },
-        })
+        Self::validated(BackoffPolicy::Fixed { delay_secs })
     }
 
     pub fn exponential(
@@ -64,32 +155,10 @@ impl RetryPolicy {
         max_secs: u64,
         jitter_percent: u8,
     ) -> Result<Self, DurableError> {
-        if initial_secs == 0 {
-            return Err(DurableError::InvalidDefinition(
-                "exponential initial delay must be greater than zero".to_string(),
-            ));
-        }
-        if max_secs < initial_secs {
-            return Err(DurableError::InvalidDefinition(
-                "exponential max delay must be at least the initial delay".to_string(),
-            ));
-        }
-        if max_secs > MAX_RETRY_DELAY_SECS {
-            return Err(DurableError::InvalidDefinition(format!(
-                "exponential max delay cannot exceed {MAX_RETRY_DELAY_SECS} seconds"
-            )));
-        }
-        if jitter_percent > 100 {
-            return Err(DurableError::InvalidDefinition(
-                "retry jitter_percent cannot exceed 100".to_string(),
-            ));
-        }
-        Ok(Self {
-            backoff: BackoffPolicy::Exponential {
-                initial_secs,
-                max_secs,
-                jitter_percent,
-            },
+        Self::validated(BackoffPolicy::Exponential {
+            initial_secs,
+            max_secs,
+            jitter_percent,
         })
     }
 
@@ -151,5 +220,27 @@ mod tests {
         let other = deterministic_jitter_percentile(b"activity:2:attempt:2");
         // Different seeds almost always differ; if they collide the bound still holds.
         assert!(other <= 100);
+    }
+
+    #[test]
+    fn stored_policy_round_trips_and_out_of_bounds_is_a_decode_error() {
+        let policy = RetryPolicy::exponential(1, 60, 20).expect("valid policy");
+        let json = serde_json::to_string(&policy).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<RetryPolicy>(&json).expect("decode"),
+            policy
+        );
+        for stored in [
+            r#"{"backoff":{"Fixed":{"delay_secs":0}}}"#,
+            r#"{"backoff":{"Fixed":{"delay_secs":18446744073709551615}}}"#,
+            r#"{"backoff":{"Exponential":{"initial_secs":0,"max_secs":1,"jitter_percent":0}}}"#,
+            r#"{"backoff":{"Exponential":{"initial_secs":5,"max_secs":1,"jitter_percent":0}}}"#,
+            r#"{"backoff":{"Exponential":{"initial_secs":1,"max_secs":2,"jitter_percent":101}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RetryPolicy>(stored).is_err(),
+                "{stored} decoded"
+            );
+        }
     }
 }

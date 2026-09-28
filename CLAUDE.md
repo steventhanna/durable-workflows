@@ -111,7 +111,15 @@ type system cannot express the rule.
   `i64`.
 - `#[doc(hidden)] pub` escape hatches (such as `RetryPolicy::from_validated`)
   exist only for the derive macros, which must validate the same bounds at
-  expansion time.
+  expansion time. Make the hatch a `const fn` that checks the bounds too
+  and have the macro emit it in a `const { .. }` block, so a drift between
+  the two is a compile error (E0080; `#[track_caller]` keeps the error in
+  the caller's code; `retry_policy_out_of_bounds_const` compile-fail case).
+- A value type with bounds that is persisted checks them on decode too:
+  `#[serde(try_from = "Stored..")]` through the same check the constructors
+  use (`RetryPolicy`), and a stored value that fails to decode routes to an
+  existing error path (a stored retry policy: G10 quarantine at claim),
+  never a panic or a default.
 - Guards and tokens that should not be dropped unused are `#[must_use]`.
   Rust types are affine, not linear: document what happens when one is
   dropped.

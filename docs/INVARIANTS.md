@@ -118,7 +118,7 @@ expires (reconcile), which settles it (N2). Unique
 | cancelling | cancelled | revoke settled while the workflow is terminal | activity worker | `src/runtime/activity_worker.rs` `settle_revoked` |
 | running | dead_lettered | permanent failure, or retryable on last attempt | activity worker | `src/runtime/activity_worker.rs` `dead_letter` |
 | running | dead_lettered | expired lease on last attempt | activity worker (claim txn) | `src/runtime/activity_worker.rs` `reconcile_expired` |
-| pending | dead_lettered | quarantine at claim: attempt cap reached or invalid timeout/lease bounds (`invalid_row`, G10) | activity worker (claim txn) | `src/runtime/activity_worker.rs` `quarantine_candidate` |
+| pending | dead_lettered | quarantine at claim: attempt cap reached, invalid timeout/lease bounds or a stored retry policy out of bounds (`invalid_row`, G10) | activity worker (claim txn) | `src/runtime/activity_worker.rs` `quarantine_candidate` |
 | pending | cancelled | workflow cancel / restart | app, admin | `src/store.rs` `cancel_activities` |
 | dead_lettered | cancelled | recoverable start of a blocked/failed lineage | app | `src/store.rs` `DurableStore::start_or_restart_recoverable_with_conn` |
 
@@ -971,9 +971,14 @@ constructor checks; the coordinator does not re-check them. An activity row
 with invalid timeout/lease bounds is quarantined at claim (G10, fixed). The
 same holds for `RetryPolicy`: its constructors bound every delay by
 `MAX_RETRY_DELAY_SECS` (`i64::MAX / 2_000` s), so a delay with +100% jitter
-fits the millisecond range; a deserialized (stored) or `from_validated`
-policy skips that bound, and `delay_for_attempt` then saturates at
-`u64::MAX` seconds instead of wrapping (the jitter overflow, fixed).
+fits the millisecond range. Deserialization checks the same bounds
+(`#[serde(try_from)]`), and `from_validated`, which the derive macros emit
+in a `const` block, fails compilation (or panics outside a const context)
+out of bounds. A stored `retry_policy_json` that does not decode is
+quarantined at claim as `invalid_bounds` (G10); lease recovery requeues
+such a running row due now so the next claim quarantines it.
+`delay_for_attempt` saturates at `u64::MAX` seconds instead of wrapping
+(the jitter overflow, fixed).
 
 **S36. Operator pause fences in-flight work.** Pausing a running workflow
 invalidates the coordinator's token; pausing while an activity runs moves it
@@ -1033,8 +1038,8 @@ Needs F1–F3, `availableAt ≤ now`, free topic capacity, and a T-W1 sweep that
 acquires every registered topic row (all-or-nothing,
 `src/runtime/activity_worker.rs` `ActivityWorker::claim_batch`). System-wide progress holds because a
 sweep that skips a lock implies another sweep holds it. **ENFORCED** for valid
-rows. A row past its attempt cap or with invalid timeout/lease bounds is not
-claimed but quarantined (dead-lettered, its workflow blocked for an operator);
+rows. A row past its attempt cap, with invalid timeout/lease bounds or with
+a stored retry policy out of bounds is not claimed but quarantined (dead-lettered, its workflow blocked for an operator);
 it no longer stops the claims of other rows and topics (G10, fixed).
 
 **L5. An expired activity lease is eventually reconciled.** Needs a dispatcher
