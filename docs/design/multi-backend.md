@@ -111,9 +111,9 @@ Behavior changes:
 - A start that collides on `uq_durable_workflow_restart` returns
   `DurableError::Conflict` on both backends (MySQL returned `InvalidState`,
   `persistence/workflows.rs` `insert_started`).
-- `StartOptions` with both `deduplication_key` and
-  `restarted_from_workflow_id` is rejected by `validate_options`
-  (`store.rs` `validate_options`) with `InvalidDefinition`. No caller sets both today.
+- `StartOptions` cannot carry both a deduplication key and a restart
+  source: both live in one private enum (`store.rs` `StartLineage`). This
+  replaced a runtime `InvalidDefinition` check in `validate_options`.
 - `persistence::connection_last_insert_id` is deleted.
 - `TopicLockRow.max_concurrency` / `NewTopicLockRow.max_concurrency` become
   `i32`; `TopicMetrics.max_concurrency` stays `u32`.
@@ -166,7 +166,8 @@ Defined behavior on both backends:
 - Collision on `uq_durable_workflow_restart` →
   `Err(Conflict("workflow {id} already has a successor"))` (S19); the caller's
   transaction stays usable.
-- Disjoint by construction: `validate_options` rejects both keys together, and
+- Disjoint by construction: a start's `StartLineage` holds one key or the
+  other, and
   `insert_child` never sets a restart id.
 
 ```
