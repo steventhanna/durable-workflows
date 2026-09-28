@@ -116,7 +116,7 @@ type system cannot express the rule.
   sleeps. Keep the two in different types.
 - Ids crossing a function boundary use the id newtypes in `src/ids.rs`, not
   `i64`.
-- `#[doc(hidden)] pub` escape hatches (such as `RetryPolicy::from_validated`)
+- `#[doc(hidden)] pub` escape hatches (such as `RetryPolicy::from_checked`)
   exist only for the derive macros, which must validate the same bounds at
   expansion time. Make the hatch a `const fn` that checks the bounds too
   and have the macro emit it in a `const { .. }` block, so a drift between

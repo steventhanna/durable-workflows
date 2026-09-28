@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: exponential max delay must be at least the initial delay
   --> tests/ui/fail/retry_policy_out_of_bounds_const.rs:6:29
    |
- 6 |   const POLICY: RetryPolicy = RetryPolicy::from_validated(BackoffPolicy::Exponential {
+ 6 |   const POLICY: RetryPolicy = RetryPolicy::from_checked(BackoffPolicy::Exponential {
    |  _____________________________^
  7 | |     initial_secs: 10,
  8 | |     max_secs: 1,

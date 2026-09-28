@@ -58,7 +58,7 @@ impl TryFrom<StoredRetryPolicy> for RetryPolicy {
 
 /// A bound a [`BackoffPolicy`] breaks. The one list of retry bounds, shared
 /// by the constructors, deserialization and the const-evaluated
-/// [`RetryPolicy::from_validated`] the derive macros emit.
+/// [`RetryPolicy::from_checked`] the derive macros emit.
 #[derive(Debug, Clone, Copy)]
 enum BoundViolation {
     FixedZero,
@@ -133,11 +133,19 @@ impl RetryPolicy {
     /// non-const call.
     #[doc(hidden)]
     #[track_caller]
-    pub const fn from_validated(backoff: BackoffPolicy) -> Self {
+    pub const fn from_checked(backoff: BackoffPolicy) -> Self {
         match BoundViolation::check(backoff) {
             Ok(backoff) => Self { backoff },
             Err(violation) => panic!("{}", violation.as_str()),
         }
+    }
+
+    /// Unchecked: skips the bounds. Kept for tests of `delay_for_attempt`
+    /// outside them (it saturates); the engine and the macros use
+    /// [`RetryPolicy::from_checked`].
+    #[doc(hidden)]
+    pub const fn from_validated(backoff: BackoffPolicy) -> Self {
+        Self { backoff }
     }
 
     fn validated(backoff: BackoffPolicy) -> Result<Self, DurableError> {

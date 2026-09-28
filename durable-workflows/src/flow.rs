@@ -501,7 +501,7 @@ mod tests {
         }
 
         fn retry_policy() -> RetryPolicy {
-            RetryPolicy::from_validated(BackoffPolicy::Fixed { delay_secs: 1 })
+            RetryPolicy::from_checked(BackoffPolicy::Fixed { delay_secs: 1 })
         }
     }
 

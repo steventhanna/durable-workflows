@@ -972,13 +972,14 @@ with invalid timeout/lease bounds is quarantined at claim (G10, fixed). The
 same holds for `RetryPolicy`: its constructors bound every delay by
 `MAX_RETRY_DELAY_SECS` (`i64::MAX / 2_000` s), so a delay with +100% jitter
 fits the millisecond range. Deserialization checks the same bounds
-(`#[serde(try_from)]`), and `from_validated`, which the derive macros emit
+(`#[serde(try_from)]`), and `from_checked`, which the derive macros emit
 in a `const` block, fails compilation (or panics outside a const context)
-out of bounds. A stored `retry_policy_json` that does not decode is
-quarantined at claim as `invalid_bounds` (G10); lease recovery requeues
-such a running row due now so the next claim quarantines it.
-`delay_for_attempt` saturates at `u64::MAX` seconds instead of wrapping
-(the jitter overflow, fixed).
+out of bounds; only the `#[doc(hidden)]` `from_validated`, which the
+engine no longer calls, skips them. A stored `retry_policy_json` that does
+not decode is quarantined at claim as `invalid_bounds` (G10); lease
+recovery requeues such a running row due now so the next claim quarantines
+it. On a policy outside the bounds, `delay_for_attempt` saturates at
+`u64::MAX` seconds instead of wrapping (the jitter overflow, fixed).
 
 **S36. Operator pause fences in-flight work.** Pausing a running workflow
 invalidates the coordinator's token; pausing while an activity runs moves it

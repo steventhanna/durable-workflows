@@ -264,6 +264,7 @@ fn external_post(params: &Value, row: &Value) -> Result<Value, String> {
                 "lease_expires_at",
                 "timeout_millis",
                 "lease_duration_millis",
+                "retry_policy_json",
             ]);
         }
         "durable_activity_attempt" => {

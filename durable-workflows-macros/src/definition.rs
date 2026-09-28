@@ -548,7 +548,7 @@ pub fn derive_activity(input: DeriveInput) -> TokenStream {
                 // compile time (E0080), so the macro's copy cannot drift.
                 BackoffMetadata::Fixed { delay_secs } => quote! {
                     const {
-                        ::durable_workflows::RetryPolicy::from_validated(
+                        ::durable_workflows::RetryPolicy::from_checked(
                             ::durable_workflows::BackoffPolicy::Fixed { delay_secs: #delay_secs }
                         )
                     }
@@ -559,7 +559,7 @@ pub fn derive_activity(input: DeriveInput) -> TokenStream {
                     jitter_percent,
                 } => quote! {
                     const {
-                        ::durable_workflows::RetryPolicy::from_validated(
+                        ::durable_workflows::RetryPolicy::from_checked(
                             ::durable_workflows::BackoffPolicy::Exponential {
                                 initial_secs: #initial_secs,
                                 max_secs: #max_secs,

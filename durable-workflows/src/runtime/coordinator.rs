@@ -59,7 +59,7 @@ impl Default for CoordinatorConfig {
         Self {
             lease_duration: Duration::from_secs(30),
             max_activation_attempts: 8,
-            activation_retry_policy: RetryPolicy::from_validated(BackoffPolicy::Exponential {
+            activation_retry_policy: RetryPolicy::from_checked(BackoffPolicy::Exponential {
                 initial_secs: 1,
                 max_secs: 60,
                 jitter_percent: 20,

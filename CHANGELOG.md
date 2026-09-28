@@ -87,9 +87,10 @@ Compared with the production-internal version it was extracted from:
   (`invalid_row`, reason `invalid_bounds`, G10) instead of failing later
   with a decode error; lease recovery requeues such a running row due now
   so the next claim quarantines it. The worker decodes the policy once, at
-  claim. The `#[doc(hidden)]` `RetryPolicy::from_validated` checks the
-  bounds too (a compile error in a `const` context, a panic otherwise), and
-  the derive macros call it in a `const` block. Migration: none for
+  claim. The derive macros build the policy with the new `#[doc(hidden)]`
+  `RetryPolicy::from_checked`, which checks the bounds too, in a `const`
+  block (a compile error out of bounds); the `#[doc(hidden)]`
+  `from_validated` stays unchecked and the engine no longer uses it. Migration: none for
   policies the engine wrote; a hand-edited out-of-bounds policy now
   quarantines its row (recover it with `retry_activity`). The trace
   interface is v6: activity images record `retry_policy_json`.
