@@ -14,5 +14,5 @@ async fn database_clock_uses_database_session_time() {
         .await
         .expect("database time");
 
-    assert_eq!(actual, fixed_millis);
+    assert_eq!(actual.get(), fixed_millis);
 }

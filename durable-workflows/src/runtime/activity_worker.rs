@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::DbMillis;
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, JoinOnDsl, NullableExpressionMethods,
     OptionalExtension, QueryDsl, SelectableHelper,
@@ -499,7 +500,7 @@ where
         scope: TxScope<'_>,
         candidate_id: ActivityId,
         workflow_id: WorkflowId,
-        now: i64,
+        now: DbMillis,
         lease_sample_started: tokio::time::Instant,
         worker_id: &str,
         quarantined: &mut Vec<serde_json::Value>,
@@ -585,9 +586,11 @@ where
             .checked_add(1)
             .ok_or_else(|| DurableError::InvalidState("activity attempt overflow".to_string()))?;
         let lease_token = uuid::Uuid::new_v4().to_string();
-        let lease_expires_at = now.checked_add(row.lease_duration_millis).ok_or_else(|| {
-            DurableError::InvalidState("activity lease timestamp overflow".to_string())
-        })?;
+        let lease_expires_at = now
+            .checked_plus_millis(row.lease_duration_millis)
+            .ok_or_else(|| {
+                DurableError::InvalidState("activity lease timestamp overflow".to_string())
+            })?;
         let changed = diesel::update(
             durable_activity::table
                 .find(row.id)
@@ -611,8 +614,8 @@ where
                 attempt_number,
                 worker_id: worker_id.to_string(),
                 lease_token: lease_token.clone(),
-                started_at: now,
-                heartbeat_at: now,
+                started_at: now.get(),
+                heartbeat_at: now.get(),
                 finished_at: None,
                 outcome: None,
                 error_category: None,
@@ -627,7 +630,7 @@ where
         row.attempt_count = attempt_number;
         row.lease_token = Some(lease_token.clone());
         row.lease_owner = Some(worker_id.to_string());
-        row.lease_expires_at = Some(lease_expires_at);
+        row.lease_expires_at = Some(lease_expires_at.get());
         let lease_deadline =
             lease_deadline_from_sample(lease_sample_started, row.lease_duration_millis)?;
         Ok(Some(ActivityClaim {
@@ -1062,7 +1065,7 @@ async fn heartbeat_once(
             let lease_sample_started = tokio::time::Instant::now();
             let now = persistence::database_now_millis(connection).await?;
             let lease_expires_at = now
-                .checked_add(claim.row.lease_duration_millis)
+                .checked_plus_millis(claim.row.lease_duration_millis)
                 .ok_or_else(|| DurableError::InvalidState("activity lease overflow".to_string()))?;
             let status = leased_activity!(claim)
                 .for_update()
@@ -1250,7 +1253,7 @@ async fn reconcile_expired(
     connection: &mut crate::DurableConnection,
     scope: TxScope<'_>,
     topic: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<Vec<serde_json::Value>, DurableError> {
     let mut reconciled = Vec::new();
     let candidates = durable_activity::table
@@ -1341,7 +1344,7 @@ async fn reconcile_expired(
                     "activity:{}:lease_recovery:{}",
                     row.id, attempt
                 ));
-                now.saturating_add(duration_millis(
+                now.saturating_plus_millis(duration_millis(
                     retry_policy.delay_for_attempt(attempt, jitter_percentile)?,
                 )?)
             }
@@ -1446,7 +1449,7 @@ async fn settle_revoked(
     row: Locked<'_, &ActivityRow>,
     attempt_outcome: AttemptOutcome,
     message: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<SettledRevoke, DurableError> {
     let row = row.row();
     let lease_token = row.lease_token.as_deref().ok_or_else(|| {
@@ -1461,7 +1464,7 @@ async fn settle_revoked(
     let (settled_status, available_at) = if workflow_status.is_terminal() {
         (ActivityStatus::Cancelled, row.available_at)
     } else {
-        (ActivityStatus::Pending, now)
+        (ActivityStatus::Pending, now.get())
     };
     let changed = diesel::update(
         durable_activity::table
@@ -1501,7 +1504,7 @@ async fn quarantine_candidate(
     locked: Locked<'_, &ActivityRow>,
     reason: &str,
     message: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let row = locked.row();
     tracing::warn!(
@@ -1546,7 +1549,7 @@ async fn append_activity_history(
     row: &ActivityRow,
     event_type: &str,
     reason: Option<String>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let workflow_id = row.workflow_id;
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
@@ -1561,7 +1564,7 @@ async fn append_activity_history(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason,
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await
@@ -1662,7 +1665,7 @@ async fn finish_on_connection(
                     claim.row.id, attempt
                 ));
                 let delay = retry_policy.delay_for_attempt(attempt, jitter_percentile)?;
-                let available_at = now.saturating_add(duration_millis(delay)?);
+                let available_at = now.saturating_plus_millis(duration_millis(delay)?);
                 let changed = diesel::update(fenced_activity!(claim))
                     .set((
                         durable_activity::status.eq(ActivityStatus::Pending),
@@ -1675,7 +1678,7 @@ async fn finish_on_connection(
                     .execute(connection)
                     .await?;
                 ensure_fenced(changed)?;
-                declare_finish(claim, "retryable", Some(available_at));
+                declare_finish(claim, "retryable", Some(available_at.get()));
                 finish_attempt(
                     connection,
                     claim,
@@ -1710,7 +1713,7 @@ async fn dead_letter(
     row: Locked<'_, &ActivityRow>,
     category: &str,
     message: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let changed = diesel::update(fenced_activity!(claim))
         .set((
@@ -1744,7 +1747,7 @@ async fn finish_attempt(
     category: Option<String>,
     message: Option<String>,
     provider_result: Option<String>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let changed = diesel::update(
         durable_activity_attempt::table
@@ -1768,7 +1771,7 @@ async fn wake_workflow(
     connection: &mut crate::DurableConnection,
     claim: &ActivityClaim,
     output: String,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let workflow = durable_workflow::table
         .find(claim.row.workflow_id)
@@ -1802,7 +1805,7 @@ async fn wake_workflow(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await?;
@@ -1828,7 +1831,7 @@ async fn block_workflow(
     row: Locked<'_, &ActivityRow>,
     category: &str,
     message: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let row = row.row();
     let changed = diesel::update(
@@ -1859,7 +1862,7 @@ async fn block_workflow(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: Some(message.to_string()),
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await

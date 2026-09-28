@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::DbMillis;
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, NullableExpressionMethods, OptionalExtension,
     QueryDsl, SelectableHelper,
@@ -421,9 +422,13 @@ where
         crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             crate::trace::actor(actor);
             let now = persistence::database_now_millis(connection).await?;
-            let lease_expires_at = now.checked_add(lease_duration_millis).ok_or_else(|| {
-                DurableError::InvalidDefinition("workflow lease timestamp overflow".to_string())
-            })?;
+            let lease_expires_at =
+                now.checked_plus_millis(lease_duration_millis)
+                    .ok_or_else(|| {
+                        DurableError::InvalidDefinition(
+                            "workflow lease timestamp overflow".to_string(),
+                        )
+                    })?;
             // The scan stays unlocked with a per-row relock. Under REPEATABLE READ an empty
             // locking range scan would retain gap locks, and concurrent ready-to-running
             // updates would deadlock inserting into that range; READ COMMITTED takes none.
@@ -471,7 +476,7 @@ where
                         if candidate.status == WorkflowStatus::Running
                             && candidate
                                 .lease_expires_at
-                                .is_some_and(|expiry| expiry <= now)
+                                .is_some_and(|expiry| expiry <= now.get())
                         {
                             break 'expired Some(candidate);
                         }
@@ -574,12 +579,12 @@ where
             crate::trace::touch_wf(row.id);
             declare_workflow_claim(
                 recovered,
-                Some((row.id, &lease_token, lease_expires_at)),
+                Some((row.id, &lease_token, lease_expires_at.get())),
                 row.max_activation_attempts.min(configured_max_activation),
             );
             row.status = WorkflowStatus::Running;
             row.lease_token = Some(lease_token.clone());
-            row.lease_expires_at = Some(lease_expires_at);
+            row.lease_expires_at = Some(lease_expires_at.get());
             Ok(Some(ClaimedRow { row, lease_token }))
         })
         .await
@@ -665,7 +670,7 @@ where
                 let delay = config
                     .activation_retry_policy
                     .delay_for_attempt(attempt_number, jitter_percentile)?;
-                let available_at = now.saturating_add(duration_millis(delay)?);
+                let available_at = now.saturating_plus_millis(duration_millis(delay)?);
                 let error = crate::WorkflowError::new("activation", message);
                 let changed = diesel::update(
                     durable_workflow::table
@@ -755,7 +760,7 @@ async fn commit_on_connection<'tx>(
             let fairness =
                 streak >= i32::try_from(config.max_consecutive_continuations).unwrap_or(i32::MAX);
             let available_at = if fairness {
-                now.saturating_add(duration_millis(config.continuation_delay)?)
+                now.saturating_plus_millis(duration_millis(config.continuation_delay)?)
             } else {
                 now
             };
@@ -806,7 +811,7 @@ async fn commit_on_connection<'tx>(
                     actor_type: Some("system".to_string()),
                     actor_id: None,
                     reason: None,
-                    created_at: now,
+                    created_at: now.get(),
                 },
             )
             .await
@@ -921,7 +926,7 @@ async fn commit_wait_transition<'tx>(
     claim: &ClaimedRow,
     delivered: i32,
     transition: WaitTransition,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     use crate::persistence::NewApprovalRow;
 
@@ -980,7 +985,7 @@ async fn commit_wait_transition<'tx>(
                     validation_schema_json: "{}".to_string(),
                     validation_version: 1,
                     status: ApprovalStatus::Pending,
-                    requested_at: now,
+                    requested_at: now.get(),
                     expires_at: expires_at_millis,
                     decision_payload_json: None,
                     decided_by: None,
@@ -1039,14 +1044,14 @@ async fn commit_activity<'tx>(
     command: i32,
     state_json: String,
     activity: crate::ActivityCommand,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     use crate::persistence::{ActivityStatus, NewActivityRow};
 
     let available_at = if activity.has_continuation_priority() {
         crate::transition::CONTINUATION_READY_AT_MILLIS
     } else {
-        now
+        now.get()
     };
     let fence = lock_fence(connection, scope, claim).await?;
     let activity_id = crate::dialect::insert_activity(
@@ -1080,8 +1085,8 @@ async fn commit_activity<'tx>(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: now.get(),
+            updated_at: now.get(),
             completed_at: None,
         },
     )
@@ -1135,7 +1140,7 @@ async fn commit_child<'tx>(
     command: i32,
     state_json: String,
     child: crate::ChildWorkflowCommand,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let parent_id = claim.row.id;
     let deduplication_key = child
@@ -1251,7 +1256,7 @@ async fn set_child_wait(
     state_json: String,
     command: i32,
     delivered: i32,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let changed = diesel::update(fenced_workflow!(claim))
         .set((
@@ -1304,7 +1309,7 @@ async fn append_history(
     connection: &mut crate::DurableConnection,
     workflow_id: WorkflowId,
     event_type: &str,
-    created_at: i64,
+    created_at: DbMillis,
 ) -> Result<(), DurableError> {
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
     persistence::append_event(
@@ -1318,7 +1323,7 @@ async fn append_history(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at,
+            created_at: created_at.get(),
         },
     )
     .await

@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -212,7 +213,11 @@ async fn runtime_supervises_temporal_sources_isolates_schedules_and_stops_cleanl
     let schedules = Arc::new(schedules);
     for key in [HealthySchedule::KEY, FailingSchedule::KEY] {
         schedules
-            .reconcile_state(key, &pool, now.saturating_sub(3_000))
+            .reconcile_state(
+                key,
+                &pool,
+                DbMillis::from_database_millis(now.saturating_sub(3_000)),
+            )
             .await
             .expect("schedule state");
     }

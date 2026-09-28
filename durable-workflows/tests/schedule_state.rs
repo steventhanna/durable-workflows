@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -172,8 +173,8 @@ async fn concurrent_initialization_inserts_one_state_and_preserves_its_cadence()
         .timestamp_millis();
 
     let (left, right) = tokio::join!(
-        registry.reconcile_state(ScheduleV1::KEY, &pool, now),
-        registry.reconcile_state(ScheduleV1::KEY, &pool, now),
+        registry.reconcile_state(ScheduleV1::KEY, &pool, DbMillis::from_database_millis(now)),
+        registry.reconcile_state(ScheduleV1::KEY, &pool, DbMillis::from_database_millis(now)),
     );
     let outcomes = [
         left.expect("left reconcile"),
@@ -190,7 +191,11 @@ async fn concurrent_initialization_inserts_one_state_and_preserves_its_cadence()
     let later = now + Duration::from_secs(86_400).as_millis() as i64;
     assert_eq!(
         registry
-            .reconcile_state(ScheduleV1::KEY, &pool, later)
+            .reconcile_state(
+                ScheduleV1::KEY,
+                &pool,
+                DbMillis::from_database_millis(later)
+            )
             .await
             .expect("idempotent reconcile"),
         ScheduleStateReconcileOutcome::Preserved
@@ -218,9 +223,13 @@ async fn version_reconciliation_upgrades_once_never_downgrades_and_rejects_drift
         .expect("UTC instant")
         .timestamp_millis();
     assert_eq!(
-        v1.reconcile_state(ScheduleV1::KEY, &pool, initial_now)
-            .await
-            .expect("initial state"),
+        v1.reconcile_state(
+            ScheduleV1::KEY,
+            &pool,
+            DbMillis::from_database_millis(initial_now)
+        )
+        .await
+        .expect("initial state"),
         ScheduleStateReconcileOutcome::Inserted
     );
 
@@ -231,9 +240,13 @@ async fn version_reconciliation_upgrades_once_never_downgrades_and_rejects_drift
         .timestamp_millis();
     let v2 = registry::<ScheduleV2>();
     assert_eq!(
-        v2.reconcile_state(ScheduleV2::KEY, &pool, deployment_now)
-            .await
-            .expect("upgrade"),
+        v2.reconcile_state(
+            ScheduleV2::KEY,
+            &pool,
+            DbMillis::from_database_millis(deployment_now)
+        )
+        .await
+        .expect("upgrade"),
         ScheduleStateReconcileOutcome::Upgraded
     );
     let upgraded = persisted_state(&pool).await;
@@ -241,15 +254,23 @@ async fn version_reconciliation_upgrades_once_never_downgrades_and_rejects_drift
     assert_eq!(upgraded.next_local_occurrence, "2026-01-13T09:30:00");
 
     assert_eq!(
-        v1.reconcile_state(ScheduleV1::KEY, &pool, deployment_now + 1)
-            .await
-            .expect("older process observes newer state"),
+        v1.reconcile_state(
+            ScheduleV1::KEY,
+            &pool,
+            DbMillis::from_database_millis(deployment_now + 1)
+        )
+        .await
+        .expect("older process observes newer state"),
         ScheduleStateReconcileOutcome::NewerPersisted
     );
     assert_eq!(persisted_state(&pool).await.definition_version, 2);
 
     let drift = registry::<ScheduleV2Drift>()
-        .reconcile_state(ScheduleV2Drift::KEY, &pool, deployment_now + 1)
+        .reconcile_state(
+            ScheduleV2Drift::KEY,
+            &pool,
+            DbMillis::from_database_millis(deployment_now + 1),
+        )
         .await
         .expect_err("same-version drift must fail closed");
     assert!(matches!(drift, DurableError::Conflict(_)));
@@ -268,7 +289,11 @@ async fn reconcile_in_the_second_pass_of_a_fall_back_hour_yields_a_cursor_after_
     let second_pass = utc(11, 1, 8, 20);
     assert_eq!(
         registry::<FoldV1>()
-            .reconcile_state(FoldV1::KEY, &pool, second_pass)
+            .reconcile_state(
+                FoldV1::KEY,
+                &pool,
+                DbMillis::from_database_millis(second_pass)
+            )
             .await
             .expect("initial state"),
         ScheduleStateReconcileOutcome::Inserted
@@ -290,15 +315,22 @@ async fn upgrade_in_the_second_pass_does_not_retarget_the_materialized_occurrenc
         return;
     };
     let v1 = Arc::new(registry::<FoldV1>());
-    v1.reconcile_state(FoldV1::KEY, &pool, utc(10, 31, 12, 0))
-        .await
-        .expect("initial state");
+    v1.reconcile_state(
+        FoldV1::KEY,
+        &pool,
+        DbMillis::from_database_millis(utc(10, 31, 12, 0)),
+    )
+    .await
+    .expect("initial state");
     assert_eq!(
         persisted_state(&pool).await.next_local_occurrence,
         "2026-11-01T01:30:00"
     );
     let first_pass = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v1)
-        .materialize_schedule(FoldV1::KEY, utc(11, 1, 7, 35))
+        .materialize_schedule(
+            FoldV1::KEY,
+            DbMillis::from_database_millis(utc(11, 1, 7, 35)),
+        )
         .await
         .expect("first-pass tick");
     assert_eq!(first_pass.started, 1);
@@ -306,9 +338,13 @@ async fn upgrade_in_the_second_pass_does_not_retarget_the_materialized_occurrenc
     let second_pass = utc(11, 1, 8, 20);
     let v2 = Arc::new(registry::<FoldV2>());
     assert_eq!(
-        v2.reconcile_state(FoldV2::KEY, &pool, second_pass)
-            .await
-            .expect("upgrade"),
+        v2.reconcile_state(
+            FoldV2::KEY,
+            &pool,
+            DbMillis::from_database_millis(second_pass)
+        )
+        .await
+        .expect("upgrade"),
         ScheduleStateReconcileOutcome::Upgraded
     );
     let upgraded = persisted_state(&pool).await;
@@ -317,7 +353,10 @@ async fn upgrade_in_the_second_pass_does_not_retarget_the_materialized_occurrenc
     assert!(upgraded.next_occurrence_at > second_pass);
 
     let next_day = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v2)
-        .materialize_schedule(FoldV2::KEY, utc(11, 2, 8, 31))
+        .materialize_schedule(
+            FoldV2::KEY,
+            DbMillis::from_database_millis(utc(11, 2, 8, 31)),
+        )
         .await
         .expect("tick after the upgrade");
     assert_eq!(next_day.started, 1);
@@ -339,11 +378,18 @@ async fn upgrade_to_an_earlier_slot_runs_it_today() {
         return;
     };
     let v1 = Arc::new(registry::<DailyV1>());
-    v1.reconcile_state(DailyV1::KEY, &pool, utc(1, 9, 16, 0))
-        .await
-        .expect("initial state");
+    v1.reconcile_state(
+        DailyV1::KEY,
+        &pool,
+        DbMillis::from_database_millis(utc(1, 9, 16, 0)),
+    )
+    .await
+    .expect("initial state");
     let yesterday = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v1)
-        .materialize_schedule(DailyV1::KEY, utc(1, 10, 15, 5))
+        .materialize_schedule(
+            DailyV1::KEY,
+            DbMillis::from_database_millis(utc(1, 10, 15, 5)),
+        )
         .await
         .expect("yesterday's tick");
     assert_eq!(yesterday.started, 1);
@@ -355,9 +401,13 @@ async fn upgrade_to_an_earlier_slot_runs_it_today() {
     // 05:00 MST.
     let v2 = Arc::new(registry::<EarlierV2>());
     assert_eq!(
-        v2.reconcile_state(EarlierV2::KEY, &pool, utc(1, 11, 12, 0))
-            .await
-            .expect("upgrade"),
+        v2.reconcile_state(
+            EarlierV2::KEY,
+            &pool,
+            DbMillis::from_database_millis(utc(1, 11, 12, 0))
+        )
+        .await
+        .expect("upgrade"),
         ScheduleStateReconcileOutcome::Upgraded
     );
     let upgraded = persisted_state(&pool).await;
@@ -365,7 +415,10 @@ async fn upgrade_to_an_earlier_slot_runs_it_today() {
     assert_eq!(upgraded.next_occurrence_at, utc(1, 11, 14, 0));
 
     let today = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v2)
-        .materialize_schedule(EarlierV2::KEY, utc(1, 11, 14, 1))
+        .materialize_schedule(
+            EarlierV2::KEY,
+            DbMillis::from_database_millis(utc(1, 11, 14, 1)),
+        )
         .await
         .expect("today's tick");
     assert_eq!(today.started, 1);
@@ -387,12 +440,19 @@ async fn upgrade_to_a_western_timezone_does_not_retarget_a_materialized_occurren
     };
     let v1 = Arc::new(registry::<TokyoV1>());
     // 2026-01-11T00:00 in Tokyo.
-    v1.reconcile_state(TokyoV1::KEY, &pool, utc(1, 10, 15, 0))
-        .await
-        .expect("initial state");
+    v1.reconcile_state(
+        TokyoV1::KEY,
+        &pool,
+        DbMillis::from_database_millis(utc(1, 10, 15, 0)),
+    )
+    .await
+    .expect("initial state");
     // 03:30 in Tokyo: 01:00, 02:00 and 03:00 get run rows.
     let tokyo = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v1)
-        .materialize_schedule(TokyoV1::KEY, utc(1, 10, 18, 30))
+        .materialize_schedule(
+            TokyoV1::KEY,
+            DbMillis::from_database_millis(utc(1, 10, 18, 30)),
+        )
         .await
         .expect("Tokyo tick");
     assert_eq!((tokyo.inspected, tokyo.started), (3, 1));
@@ -400,7 +460,7 @@ async fn upgrade_to_a_western_timezone_does_not_retarget_a_materialized_occurren
     let v2 = Arc::new(registry::<UtcV2>());
     let now = utc(1, 10, 18, 30);
     assert_eq!(
-        v2.reconcile_state(UtcV2::KEY, &pool, now)
+        v2.reconcile_state(UtcV2::KEY, &pool, DbMillis::from_database_millis(now))
             .await
             .expect("upgrade"),
         ScheduleStateReconcileOutcome::Upgraded
@@ -410,7 +470,7 @@ async fn upgrade_to_a_western_timezone_does_not_retarget_a_materialized_occurren
     assert!(upgraded.next_occurrence_at > now);
 
     let utc_tick = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v2)
-        .materialize_schedule(UtcV2::KEY, utc(1, 11, 4, 1))
+        .materialize_schedule(UtcV2::KEY, DbMillis::from_database_millis(utc(1, 11, 4, 1)))
         .await
         .expect("tick after the upgrade");
     assert_eq!(utc_tick.started, 1);

@@ -105,6 +105,26 @@ Compared with the production-internal version it was extracted from:
   id columns as the id type (`.first::<WorkflowId>(..)`), write
   `wait_reference_id` and raw-SQL binds as `id.get()`, and drop the
   `?`/`expect` after the two claim id accessors.
+- The database clock is typed (breaking): `persistence::database_now_millis`
+  returns a `DbMillis` (epoch millis on the database clock), not an `i64`,
+  and every function that takes the current time takes one:
+  `TimerMaterializer::wake_one` / `materialize_one`,
+  `ApprovalExpiryMaterializer::expire_one` / `materialize_one`,
+  `ScheduleMaterializer::materialize_schedule`,
+  `ScheduleRegistry::reconcile_state`, `HealthScanner::scan_once`,
+  `observability::emit_schedule_materialization_alert`, and the admin
+  `list_topic_metrics_at` / `list_approvals_at`. A raw `i64` or a host
+  wall-clock stamp passed there is a compile error (E0308;
+  `db_millis_raw_i64_argument` compile-fail case). `DbMillis` has no
+  arithmetic operators (`db_millis_add_operator`, E0369), no `From<i64>`
+  and no `Default`; durations go through `plus(Duration) -> Result`,
+  `plus_millis`, `checked_plus_millis`, `saturating_plus_millis`,
+  `saturating_minus_millis` and `millis_since`. Persisted values are
+  unchanged; row structs and report fields stay `i64`. Migration: pass the
+  value `database_now_millis` returns as is; read the raw millis with
+  `.get()`; wrap a value read from a timestamp column (or a test fixture)
+  with `DbMillis::from_database_millis(raw)`; replace `now + ms` with
+  `now.plus_millis(ms)?` or `now.plus(duration)?`.
 
 - `RetryPolicy` deserialization checks the same bounds as
   `RetryPolicy::fixed` / `exponential` and fails for a policy out of

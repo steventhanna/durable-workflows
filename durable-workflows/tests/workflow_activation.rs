@@ -1251,7 +1251,7 @@ async fn sixteenth_continue_yields_to_another_ready_workflow() {
     assert_eq!(long_row.consecutive_continuations, 0);
     let delay = i64::try_from(CoordinatorConfig::default().continuation_delay.as_millis())
         .expect("continuation delay fits in i64");
-    assert!(long_row.available_at >= before_yield + delay);
+    assert!(long_row.available_at >= before_yield.get() + delay);
     assert_eq!(short_row.status.as_str(), "succeeded");
 
     support::drop_durable_tables(&mut connection).await;

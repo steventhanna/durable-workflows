@@ -1381,7 +1381,8 @@ where
         let now = database_now_millis(&mut connection)
             .await
             .expect("database clock");
-        row.lease_expires_at.is_some_and(|expiry| expiry < now)
+        row.lease_expires_at
+            .is_some_and(|expiry| expiry < now.get())
     })
     .await;
     let recovering_context = Arc::new(GapContext::default());

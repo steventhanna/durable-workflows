@@ -313,7 +313,7 @@ async fn schedule_activity(
             payload_json: serde_json::to_string(&TestActivity { value: 21 }).expect("payload"),
             status: durable_workflows::persistence::ActivityStatus::try_from("pending")
                 .expect("valid fixture status"),
-            available_at: now,
+            available_at: now.get(),
             max_attempts,
             attempt_count: 0,
             timeout_millis,
@@ -329,8 +329,8 @@ async fn schedule_activity(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: now.get(),
+            updated_at: now.get(),
             completed_at: None,
         })
         .execute(&mut connection)
@@ -823,7 +823,7 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .await
         .expect("reconciled activity");
     assert_eq!(status, "pending");
-    assert!(available_at >= recovery_started + 900);
+    assert!(available_at >= recovery_started.get() + 900);
     let now = durable_workflows::persistence::database_now_millis(&mut connection)
         .await
         .expect("database clock");

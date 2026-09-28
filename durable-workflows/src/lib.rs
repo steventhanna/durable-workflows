@@ -1,6 +1,7 @@
 extern crate self as durable_workflows;
 
 pub mod admin;
+mod clock;
 mod definition;
 mod dialect;
 mod error;
@@ -63,6 +64,7 @@ pub use durable_workflows_macros::{
 // do not need matching direct dependencies.
 #[doc(hidden)]
 pub use async_trait;
+pub use clock::DbMillis;
 pub use error::{ActivityError, DurableError, WorkflowError};
 pub use flow::{DurableFlow, FlowJournal, JournalEntry, WfCtx, WfError};
 pub use ids::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};

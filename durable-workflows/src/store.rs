@@ -1,4 +1,5 @@
 use crate::tx::Tx;
+use crate::DbMillis;
 use chrono::{DateTime, Utc};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper, TextExpressionMethods};
 use diesel_async::RunQueryDsl;
@@ -456,7 +457,7 @@ impl DurableStore {
                             actor_type: Some("system".to_string()),
                             actor_id: None,
                             reason: Some("a successor recovery generation was started".to_string()),
-                            created_at: now,
+                            created_at: now.get(),
                         },
                     )
                     .await?;
@@ -595,7 +596,7 @@ impl DurableStore {
             wait_reference_id: None,
             available_at: options
                 .available_at
-                .map_or(now, |available_at| available_at.timestamp_millis()),
+                .map_or(now.get(), |available_at| available_at.timestamp_millis()),
             activation_attempts: 0,
             max_activation_attempts: DEFAULT_MAX_ACTIVATION_ATTEMPTS,
             consecutive_continuations: 0,
@@ -610,8 +611,8 @@ impl DurableStore {
             parent_command_sequence: None,
             command_sequence: 0,
             delivered_event_sequence: 0,
-            created_at: now,
-            updated_at: now,
+            created_at: now.get(),
+            updated_at: now.get(),
             completed_at: None,
         };
 
@@ -708,7 +709,7 @@ impl DurableStore {
             error_message: None,
             wait_kind: None,
             wait_reference_id: None,
-            available_at: now,
+            available_at: now.get(),
             activation_attempts: 0,
             max_activation_attempts: DEFAULT_MAX_ACTIVATION_ATTEMPTS,
             consecutive_continuations: 0,
@@ -723,8 +724,8 @@ impl DurableStore {
             parent_command_sequence: Some(parent_command_sequence),
             command_sequence: 0,
             delivered_event_sequence: 0,
-            created_at: now,
-            updated_at: now,
+            created_at: now.get(),
+            updated_at: now.get(),
             completed_at: None,
         };
         persistence::insert_started(connection, scope, row).await
@@ -792,7 +793,7 @@ async fn hand_waiting_parents_to_successor<'tx>(
     superseded: Locked<'tx, &WorkflowRow>,
     successor: WorkflowId,
     successor_version: i32,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     if successor_version != superseded.version {
         return persistence::wake_waiting_parents_on_child_terminal(
@@ -855,7 +856,7 @@ async fn hand_waiting_parents_to_successor<'tx>(
                     superseded.id,
                     successor.get()
                 )),
-                created_at: now,
+                created_at: now.get(),
             },
         )
         .await?;
@@ -891,7 +892,7 @@ pub(crate) async fn cancel_locked_workflow<'tx>(
     workflow: Locked<'tx, &WorkflowRow>,
     reason: &str,
     operator_id: Option<&str>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     cancel_one_workflow(connection, workflow, reason, operator_id, now).await?;
     cancel_owned_descendants(connection, workflow, reason, operator_id, now).await
@@ -921,7 +922,7 @@ pub(crate) async fn cancel_owned_descendants<'tx>(
     parent: Locked<'tx, &WorkflowRow>,
     reason: &str,
     operator_id: Option<&str>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let scope = parent.scope();
     let mut parents = vec![(parent.id, reason.to_string())];
@@ -987,7 +988,7 @@ async fn cancel_one_workflow<'tx>(
     workflow: Locked<'tx, &WorkflowRow>,
     reason: &str,
     operator_id: Option<&str>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let workflow_id = workflow.id;
     crate::trace::touch_wf(workflow.id);
@@ -1034,7 +1035,7 @@ async fn cancel_one_workflow<'tx>(
             ),
             actor_id: operator_id.map(str::to_string),
             reason: Some(reason.to_string()),
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await?;
@@ -1060,7 +1061,7 @@ pub(crate) async fn cancel_activities(
     workflow_id: WorkflowId,
     reason: &str,
     attempt_outcome: AttemptOutcome,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let activities = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
@@ -1132,7 +1133,7 @@ pub(crate) async fn close_attempt(
     activity: &ActivityRow,
     outcome: AttemptOutcome,
     reason: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let lease_token = activity.lease_token.as_deref().ok_or_else(|| {
         DurableError::InvalidState(format!(
@@ -1162,7 +1163,7 @@ pub(crate) async fn cancel_approvals(
     connection: &mut DurableConnection,
     workflow_id: WorkflowId,
     reason: &str,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let approvals = durable_approval::table
         .filter(durable_approval::workflow_id.eq(workflow_id))

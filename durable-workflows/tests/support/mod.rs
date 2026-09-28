@@ -173,6 +173,7 @@ pub async fn db_now_on(connection: &mut DurableConnection) -> i64 {
     durable_workflows::persistence::database_now_millis(connection)
         .await
         .expect("database clock")
+        .get()
 }
 
 /// A lease expiry already in the past by the database clock. Fixtures that

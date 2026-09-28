@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/db_millis_raw_i64_argument.rs:8:29
+  |
+8 |     let _ = timers.wake_one(host_now).await;
+  |                    -------- ^^^^^^^^ expected `DbMillis`, found `i64`
+  |                    |
+  |                    arguments to this method are incorrect
+  |
+note: method defined here
+ --> src/runtime/temporal.rs
+  |
+  |     pub async fn wake_one(&self, now: DbMillis) -> Result<Option<WorkflowId>, DurableError> {
+  |                  ^^^^^^^^

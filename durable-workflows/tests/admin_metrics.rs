@@ -3,6 +3,7 @@ mod support;
 use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
+use durable_workflows::DbMillis;
 use durable_workflows::DurableConnection;
 use durable_workflows::{
     admin::{
@@ -50,7 +51,11 @@ async fn topic_metrics_report_the_persisted_cap_and_registry_mismatch() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics remain visible during a rolling mismatch");
     let metrics = page.items.as_slice().first().expect("provider metrics");
@@ -357,7 +362,11 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics");
     assert_eq!(page.items.len(), 1);
@@ -478,7 +487,11 @@ async fn topic_metrics_dead_letter_count_excludes_resolved_workflows() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics");
     let metrics = &page.items[0];
@@ -557,7 +570,11 @@ async fn topic_metrics_dead_letter_count_excludes_retried_chains_on_open_workflo
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics");
     let metrics = &page.items[0];
@@ -631,7 +648,11 @@ async fn topic_metrics_batch_counts_stay_isolated_per_topic() {
     topics.register(MetricsTopic::Provider).expect("provider");
     topics.register(MetricsTopic::Fax).expect("fax");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("batched topic metrics");
     assert_eq!(
@@ -734,7 +755,11 @@ async fn topic_metrics_treat_spellings_as_distinct_topics() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("exact-spelling topic metrics");
     assert_eq!(
@@ -1045,7 +1070,7 @@ async fn approval_listing_classifies_expiry_without_loading_decisions() {
                 status: Some("expired".to_string()),
                 ..ApprovalListFilter::default()
             },
-            NOW,
+            DbMillis::from_database_millis(NOW),
         )
         .await
         .expect("expired approvals");
@@ -1097,7 +1122,11 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).unwrap();
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .unwrap();
     assert_eq!(page.items[0].ready_count, 1);

@@ -22,10 +22,12 @@ pub(crate) use workflows::{
     wake_waiting_parents_on_child_terminal, StartedInsert,
 };
 
-pub async fn database_now_millis(connection: &mut DurableConnection) -> Result<i64, DurableError> {
+pub async fn database_now_millis(
+    connection: &mut DurableConnection,
+) -> Result<crate::DbMillis, DurableError> {
     let now = crate::dialect::now_millis(connection).await?;
     crate::trace::sample_now(now);
-    Ok(now)
+    Ok(crate::DbMillis::from_database_millis(now))
 }
 
 macro_rules! string_status {

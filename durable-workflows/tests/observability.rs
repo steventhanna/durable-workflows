@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::{
     io,
     sync::{Arc, Mutex},
@@ -205,7 +206,10 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
             .with_max_alerts_per_kind(10),
     )
     .expect("scanner");
-    let report = scanner.scan_once(now).await.expect("health scan");
+    let report = scanner
+        .scan_once(DbMillis::from_database_millis(now))
+        .await
+        .expect("health scan");
     assert!(report.alerts.iter().any(|alert| matches!(
         alert,
         HealthAlert::MissingWorkflowDefinition { kind, version }
@@ -294,7 +298,11 @@ fn schedule_alerts_classify_failures_without_logging_error_details() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
     for error in &errors {
-        emit_schedule_materialization_alert(&definition, error, 123);
+        emit_schedule_materialization_alert(
+            &definition,
+            error,
+            DbMillis::from_database_millis(123),
+        );
     }
     let logs = buffer.contents();
     for expected in [

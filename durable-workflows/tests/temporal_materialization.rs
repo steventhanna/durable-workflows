@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -107,7 +108,10 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
 
     let first = Arc::new(TimerMaterializer::new(pool.clone()));
     let second = Arc::new(TimerMaterializer::new(pool.clone()));
-    let (left, right) = tokio::join!(first.wake_one(now), second.wake_one(now));
+    let (left, right) = tokio::join!(
+        first.wake_one(DbMillis::from_database_millis(now)),
+        second.wake_one(DbMillis::from_database_millis(now))
+    );
     let outcomes = [left.expect("left"), right.expect("right")];
     assert_eq!(outcomes.iter().filter(|id| **id == Some(due)).count(), 1);
     assert!(outcomes.contains(&None));
@@ -130,7 +134,13 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
             command_sequence: 7
         }
     );
-    assert_eq!(first.wake_one(now + 1).await.expect("paused timer"), None);
+    assert_eq!(
+        first
+            .wake_one(DbMillis::from_database_millis(now + 1))
+            .await
+            .expect("paused timer"),
+        None
+    );
     let paused_row = workflow(&pool, paused).await;
     assert_eq!(paused_row.status.as_str(), "paused");
     assert_eq!(
@@ -146,7 +156,10 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
         .await
         .expect("resume timer");
     assert_eq!(
-        first.wake_one(now + 1).await.expect("resumed timer"),
+        first
+            .wake_one(DbMillis::from_database_millis(now + 1))
+            .await
+            .expect("resumed timer"),
         Some(paused)
     );
     assert_eq!(
@@ -176,7 +189,9 @@ async fn an_inconsistent_due_timer_rolls_back_without_clearing_the_wait() {
         .expect("timer state");
 
     assert!(matches!(
-        TimerMaterializer::new(pool.clone()).wake_one(now).await,
+        TimerMaterializer::new(pool.clone())
+            .wake_one(DbMillis::from_database_millis(now))
+            .await,
         Err(DurableError::InvalidState(_))
     ));
     assert_eq!(workflow(&pool, id).await.status.as_str(), "sleeping");
@@ -244,7 +259,10 @@ async fn approval_expiry_is_typed_atomic_race_safe_and_preserves_pause() {
     let waiting_approval = seed_approval(&pool, waiting, "waiting_approval", 4, now).await;
     let first = Arc::new(ApprovalExpiryMaterializer::new(pool.clone()));
     let second = Arc::new(ApprovalExpiryMaterializer::new(pool.clone()));
-    let (left, right) = tokio::join!(first.expire_one(now), second.expire_one(now));
+    let (left, right) = tokio::join!(
+        first.expire_one(DbMillis::from_database_millis(now)),
+        second.expire_one(DbMillis::from_database_millis(now))
+    );
     let outcomes = [left.expect("left"), right.expect("right")];
     assert_eq!(
         outcomes
@@ -271,7 +289,7 @@ async fn approval_expiry_is_typed_atomic_race_safe_and_preserves_pause() {
     let paused_approval = seed_approval(&pool, paused, "paused", 5, now).await;
     assert_eq!(
         ApprovalExpiryMaterializer::new(pool.clone())
-            .expire_one(now)
+            .expire_one(DbMillis::from_database_millis(now))
             .await
             .expect("paused expiry"),
         Some(paused_approval)
@@ -318,7 +336,7 @@ async fn approval_resolution_and_expiry_have_one_transactional_winner() {
     let operator = Operator::new("42", "resolve versus expiry race").expect("operator");
 
     let (expired, resolved) = tokio::join!(
-        expiry.materialize_one(now + 120_000),
+        expiry.materialize_one(DbMillis::from_database_millis(now + 120_000)),
         controls.resolve_approval(approval_id, "true", &operator),
     );
     let expiry_won = matches!(expired, Ok(Some(id)) if id == approval_id);

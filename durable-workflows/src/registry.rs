@@ -618,7 +618,7 @@ impl TopicRegistry {
                 Ok(NewTopicLockRow {
                     topic: definition.key.clone(),
                     max_concurrency,
-                    updated_at: timestamp,
+                    updated_at: timestamp.get(),
                 })
             })
             .collect::<Result<Vec<_>, DurableError>>()?;

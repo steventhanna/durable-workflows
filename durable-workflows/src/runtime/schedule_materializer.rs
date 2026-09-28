@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::DbMillis;
 use diesel::{
     dsl::not, ExpressionMethods, JoinOnDsl, NullableExpressionMethods, QueryDsl, SelectableHelper,
 };
@@ -75,7 +76,7 @@ where
     pub async fn materialize_schedule(
         &self,
         schedule_key: &str,
-        now: i64,
+        now: DbMillis,
     ) -> Result<ScheduleMaterializationReport, DurableError> {
         match self
             .registry
@@ -228,7 +229,7 @@ fn plan_due_chunk(
     mut occurrence: ScheduleOccurrence,
     policy: MisfirePolicy,
     grace_millis: i64,
-    now: i64,
+    now: DbMillis,
 ) -> Result<
     (
         Vec<ScheduleOccurrence>,
@@ -238,7 +239,7 @@ fn plan_due_chunk(
     DurableError,
 > {
     let mut due = Vec::new();
-    while occurrence.due_at <= now && due.len() < MAX_DUE_OCCURRENCES_PER_TICK {
+    while occurrence.due_at <= now.get() && due.len() < MAX_DUE_OCCURRENCES_PER_TICK {
         due.push(occurrence.clone());
         occurrence = calendar.next_after_local(occurrence.local_datetime)?;
     }
@@ -248,13 +249,13 @@ fn plan_due_chunk(
         MisfirePolicy::CatchUp { max_occurrences } => max_occurrences,
     };
     let mut following_runnable = 0;
-    if occurrence.due_at <= now {
+    if occurrence.due_at <= now.get() {
         if let Some(last) = due.last() {
             let mut after = last.local_datetime;
             // Later runnable slots determine which entries in this chunk are
             // outside the global latest-N budget. They remain pending for the next tick.
             while following_runnable < budget {
-                let Some(next) = calendar.next_runnable_through(after, now)? else {
+                let Some(next) = calendar.next_runnable_through(after, now.get())? else {
                     break;
                 };
                 following_runnable += 1;
@@ -270,7 +271,7 @@ fn classify(
     due: &[ScheduleOccurrence],
     policy: MisfirePolicy,
     grace_millis: i64,
-    now: i64,
+    now: DbMillis,
     following_runnable: u32,
 ) -> Vec<OccurrenceOutcome> {
     let mut outcomes = vec![OccurrenceOutcome::Skip("dst_gap"); due.len()];
@@ -284,7 +285,7 @@ fn classify(
     match policy {
         MisfirePolicy::Skip => {
             for index in runnable {
-                outcomes[index] = if due[index].due_at.saturating_add(grace_millis) < now {
+                outcomes[index] = if due[index].due_at.saturating_add(grace_millis) < now.get() {
                     OccurrenceOutcome::Skip("misfire_skip")
                 } else {
                     OccurrenceOutcome::Start
@@ -326,7 +327,7 @@ struct MaterializationTarget<'a, C> {
     overlap: OverlapPolicy,
     active: &'a mut i64,
     queued: &'a mut bool,
-    now: i64,
+    now: DbMillis,
 }
 
 async fn materialize_occurrence<C>(
@@ -354,12 +355,12 @@ where
                     schedule_key: target.schedule_key.to_string(),
                     local_occurrence: occurrence.local_occurrence,
                     scheduled_for: occurrence.scheduled_for,
-                    materialized_at: target.now,
+                    materialized_at: target.now.get(),
                     status: ScheduleRunStatus::Queued,
                     reason: Some("overlap_queue_one".to_string()),
                     actor_id: None,
                     workflow_id: None,
-                    created_at: target.now,
+                    created_at: target.now.get(),
                 })
                 .execute(connection)
                 .await?;
@@ -382,12 +383,12 @@ where
             schedule_key: target.schedule_key.to_string(),
             local_occurrence: occurrence.local_occurrence,
             scheduled_for: occurrence.scheduled_for,
-            materialized_at: target.now,
+            materialized_at: target.now.get(),
             status,
             reason,
             actor_id: None,
             workflow_id: None,
-            created_at: target.now,
+            created_at: target.now.get(),
         },
     )
     .await?;
@@ -517,12 +518,12 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    fn assert_chunked_matches_full(timezone: &str, start: chrono::DateTime<Utc>, now: i64) {
+    fn assert_chunked_matches_full(timezone: &str, start: chrono::DateTime<Utc>, now: DbMillis) {
         let calendar = ScheduleCalendar::new("0 * * * * *", timezone).expect("calendar");
         let first = calendar.next_after(start).expect("first occurrence");
         let mut next = first.clone();
         let mut all = Vec::new();
-        while next.due_at <= now {
+        while next.due_at <= now.get() {
             all.push(next.clone());
             next = calendar
                 .next_after_local(next.local_datetime)
@@ -541,7 +542,7 @@ mod tests {
             let mut actual = Vec::new();
             let mut occurrence = first.clone();
             let mut ticks = 0;
-            while occurrence.due_at <= now {
+            while occurrence.due_at <= now.get() {
                 let (due, next, outcomes) =
                     plan_due_chunk(&calendar, occurrence.clone(), policy, 60_000, now)
                         .expect("recoverable chunk");
@@ -566,7 +567,11 @@ mod tests {
             .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
             .single()
             .expect("start");
-        assert_chunked_matches_full("UTC", start, start.timestamp_millis() + 20_001 * 60_000);
+        assert_chunked_matches_full(
+            "UTC",
+            start,
+            DbMillis::from_database_millis(start.timestamp_millis() + 20_001 * 60_000),
+        );
     }
 
     #[test]
@@ -580,7 +585,9 @@ mod tests {
             assert_chunked_matches_full(
                 "America/Denver",
                 start,
-                (boundary + chrono::Duration::hours(3)).timestamp_millis(),
+                DbMillis::from_database_millis(
+                    (boundary + chrono::Duration::hours(3)).timestamp_millis(),
+                ),
             );
         }
     }

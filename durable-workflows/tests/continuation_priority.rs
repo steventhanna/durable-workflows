@@ -341,7 +341,7 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
     diesel::update(durable_activity::table.filter(durable_activity::id.eq_any(&claimed_ids)))
         .set((
             durable_activity::status.eq(ActivityStatus::Pending),
-            durable_activity::available_at.eq(now + 60_000),
+            durable_activity::available_at.eq(now.get() + 60_000),
             durable_activity::lease_owner.eq(None::<String>),
             durable_activity::lease_token.eq(None::<String>),
             durable_activity::lease_expires_at.eq(None::<i64>),
@@ -408,7 +408,7 @@ async fn failed_continuation_waits_for_backoff_then_reacquires_priority() {
         .await
         .unwrap();
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(now - 1))
+        .set(durable_activity::available_at.eq(now.get() - 1))
         .execute(&mut conn)
         .await
         .unwrap();

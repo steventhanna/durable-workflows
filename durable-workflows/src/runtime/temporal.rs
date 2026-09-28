@@ -1,4 +1,5 @@
 use crate::tx::Tx;
+use crate::DbMillis;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 
@@ -21,7 +22,7 @@ impl TimerMaterializer {
         Self { pool }
     }
 
-    pub async fn wake_one(&self, now: i64) -> Result<Option<WorkflowId>, DurableError> {
+    pub async fn wake_one(&self, now: DbMillis) -> Result<Option<WorkflowId>, DurableError> {
         self.materialize_one(now).await
     }
 
@@ -32,7 +33,7 @@ impl TimerMaterializer {
         self.materialize_one(now).await
     }
 
-    pub async fn materialize_one(&self, now: i64) -> Result<Option<WorkflowId>, DurableError> {
+    pub async fn materialize_one(&self, now: DbMillis) -> Result<Option<WorkflowId>, DurableError> {
         let mut connection = self.pool.get().await?;
         crate::dialect::transaction(&mut connection, async move |Tx { connection, .. }| {
             let Some(workflow) = durable_workflow::table
@@ -73,7 +74,7 @@ impl ApprovalExpiryMaterializer {
         Self { pool }
     }
 
-    pub async fn expire_one(&self, now: i64) -> Result<Option<ApprovalId>, DurableError> {
+    pub async fn expire_one(&self, now: DbMillis) -> Result<Option<ApprovalId>, DurableError> {
         self.materialize_one(now).await
     }
 
@@ -84,7 +85,7 @@ impl ApprovalExpiryMaterializer {
         self.materialize_one(now).await
     }
 
-    pub async fn materialize_one(&self, now: i64) -> Result<Option<ApprovalId>, DurableError> {
+    pub async fn materialize_one(&self, now: DbMillis) -> Result<Option<ApprovalId>, DurableError> {
         let mut connection = self.pool.get().await?;
         let candidate = durable_approval::table
             .filter(durable_approval::status.eq(ApprovalStatus::Pending))
@@ -117,7 +118,7 @@ impl ApprovalExpiryMaterializer {
             if approval.status != ApprovalStatus::Pending
                 || approval
                     .expires_at
-                    .is_none_or(|expires_at| expires_at > now)
+                    .is_none_or(|expires_at| expires_at > now.get())
             {
                 return Ok(None);
             }
@@ -194,7 +195,7 @@ async fn append_delivery_event(
     workflow: &WorkflowRow,
     event_type: &str,
     event: &WorkflowEvent,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let metadata_json = serde_json::to_string(event)?;
     ensure_size(
@@ -221,7 +222,7 @@ async fn append_delivery_event(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await
@@ -230,7 +231,7 @@ async fn append_delivery_event(
 async fn clear_wait(
     connection: &mut crate::DurableConnection,
     workflow: &WorkflowRow,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let next_status = if workflow.status == WorkflowStatus::Paused {
         WorkflowStatus::Paused

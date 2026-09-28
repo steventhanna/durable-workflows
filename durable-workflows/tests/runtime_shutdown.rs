@@ -353,7 +353,7 @@ async fn schedule_activity_payload(
             payload_json,
             status: durable_workflows::persistence::ActivityStatus::try_from("pending")
                 .expect("valid fixture status"),
-            available_at: now,
+            available_at: now.get(),
             max_attempts,
             attempt_count: 0,
             timeout_millis,
@@ -369,8 +369,8 @@ async fn schedule_activity_payload(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: now.get(),
+            updated_at: now.get(),
             completed_at: None,
         })
         .execute(&mut connection)
@@ -408,7 +408,7 @@ async fn set_activity_available_in(
         .expect("database clock");
     let delay = i64::try_from(delay.as_millis()).expect("delay fits in millis");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(now + delay))
+        .set(durable_activity::available_at.eq(now.get() + delay))
         .execute(&mut connection)
         .await
         .expect("activity availability update");

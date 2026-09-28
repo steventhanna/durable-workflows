@@ -1,3 +1,4 @@
+use crate::DbMillis;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 
@@ -51,7 +52,9 @@ pub(crate) async fn insert_started<'tx>(
                     actor_type: Some("system".to_string()),
                     actor_id: None,
                     reason: None,
-                    created_at: crate::persistence::database_now_millis(connection).await?,
+                    created_at: crate::persistence::database_now_millis(connection)
+                        .await?
+                        .get(),
                 })
                 .execute(connection)
                 .await?;
@@ -143,7 +146,7 @@ pub(crate) async fn wake_waiting_parents_on_child_terminal<'tx>(
     connection: &mut DurableConnection,
     child: Locked<'tx, &WorkflowRow>,
     outcome: Result<String, (String, String)>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let child = child.row();
     let (child_workflow_id, child_kind, child_version) =
@@ -178,7 +181,7 @@ async fn wake_loaded_parent_on_child_terminal(
     child_kind: &str,
     child_version: i32,
     outcome: &Result<String, (String, String)>,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     if !parent.status.awaits_child() || parent.wait()? != Some(Wait::Child(child_workflow_id)) {
         return Ok(());
@@ -233,7 +236,7 @@ async fn wake_loaded_parent_on_child_terminal(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await?;

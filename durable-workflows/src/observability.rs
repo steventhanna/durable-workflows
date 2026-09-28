@@ -399,7 +399,10 @@ where
         })
     }
 
-    pub async fn scan_once(&self, captured_at: i64) -> Result<HealthScanReport, DurableError> {
+    pub async fn scan_once(
+        &self,
+        captured_at: crate::DbMillis,
+    ) -> Result<HealthScanReport, DurableError> {
         let mut connection = self.pool.get().await?;
         let readiness = ReadinessReport::query(
             &mut connection,
@@ -415,7 +418,7 @@ where
                 "health scanner stale duration exceeds the database range".to_string(),
             )
         })?;
-        let stale_before = captured_at.saturating_sub(stale_millis);
+        let stale_before = captured_at.saturating_minus_millis(stale_millis);
 
         let exhausted = durable_workflow::table
             .filter(durable_workflow::status.eq(WorkflowStatus::Failed))
@@ -557,7 +560,7 @@ where
             });
         }
         Ok(HealthScanReport {
-            captured_at,
+            captured_at: captured_at.get(),
             alerts,
         })
     }
@@ -593,9 +596,9 @@ fn readiness_alerts(readiness: &ReadinessReport, limit: usize) -> Vec<HealthAler
     alerts
 }
 
-pub(crate) fn emit_readiness_alerts(readiness: &ReadinessReport, captured_at: i64) {
+pub(crate) fn emit_readiness_alerts(readiness: &ReadinessReport, captured_at: crate::DbMillis) {
     HealthScanReport {
-        captured_at,
+        captured_at: captured_at.get(),
         alerts: readiness_alerts(readiness, MAX_HEALTH_ALERTS_PER_KIND as usize),
     }
     .emit();
@@ -604,7 +607,7 @@ pub(crate) fn emit_readiness_alerts(readiness: &ReadinessReport, captured_at: i6
 pub fn emit_schedule_materialization_alert(
     definition: &ScheduleDefinitionMetadata,
     error: &DurableError,
-    captured_at: i64,
+    captured_at: crate::DbMillis,
 ) {
     let alert_kind = match error {
         DurableError::Conflict(_) => "schedule_definition_drift",
@@ -617,7 +620,7 @@ pub fn emit_schedule_materialization_alert(
         alert_kind,
         schedule_key = %definition.key,
         definition_version = definition.version,
-        captured_at,
+        captured_at = captured_at.get(),
         "durable workflow schedule alert"
     );
 }

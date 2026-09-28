@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::tx::{self, Locked, Tx, TxScope};
+use crate::DbMillis;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 
@@ -135,7 +136,7 @@ where
             .set((
                 durable_workflow::status.eq(status),
                 durable_workflow::available_at.eq(if status == WorkflowStatus::Ready {
-                    now
+                    now.get()
                 } else {
                     workflow.available_at
                 }),
@@ -460,7 +461,7 @@ where
                             topic: command.topic().to_string(),
                             payload_json: command.payload_json().to_string(),
                             status: ActivityStatus::Pending,
-                            available_at: now,
+                            available_at: now.get(),
                             max_attempts: i32::try_from(command.max_attempts()).map_err(|_| {
                                 DurableError::InvalidDefinition(
                                     "activity attempts exceed the database integer range".to_string(),
@@ -479,8 +480,8 @@ where
                             lease_expires_at: None,
                             root_activity_id: Some(root_id),
                             replaces_activity_id: Some(source.id),
-                            created_at: now,
-                            updated_at: now,
+                            created_at: now.get(),
+                            updated_at: now.get(),
                             completed_at: None,
                         },
                     )
@@ -564,7 +565,7 @@ where
             let now = persistence::database_now_millis(connection).await?;
             if approval
                 .expires_at
-                .is_some_and(|expires_at| expires_at <= now)
+                .is_some_and(|expires_at| expires_at <= now.get())
             {
                 return Err(DurableError::Conflict(format!(
                     "approval {approval_id} has expired"
@@ -619,7 +620,7 @@ where
                     actor_type: Some("operator".to_string()),
                     actor_id: Some(operator.actor_id().to_string()),
                     reason: Some(operator.reason().to_string()),
-                    created_at: now,
+                    created_at: now.get(),
                 },
             )
             .await?;
@@ -798,7 +799,7 @@ where
                 .await?;
             let scheduled_for = last_scheduled
                 .and_then(|last| last.checked_add(1))
-                .map_or(now, |next| next.max(now));
+                .map_or(now.get(), |next| next.max(now.get()));
             let schedule_run_id = crate::dialect::insert_schedule_run(
                 connection,
                 NewScheduleRunRow {
@@ -808,12 +809,12 @@ where
                         crate::schedule::MANUAL_OCCURRENCE_PREFIX
                     ),
                     scheduled_for,
-                    materialized_at: now,
+                    materialized_at: now.get(),
                     status: ScheduleRunStatus::Materializing,
                     reason: Some(operator.reason().to_string()),
                     actor_id: Some(actor_id),
                     workflow_id: None,
-                    created_at: now,
+                    created_at: now.get(),
                 },
             )
             .await?;
@@ -925,7 +926,7 @@ async fn pause_activity(
     connection: &mut crate::DurableConnection,
     activity_id: ActivityId,
     operator: &Operator,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let activity = durable_activity::table
         .find(activity_id)
@@ -1059,7 +1060,7 @@ async fn append_operator_event(
     workflow_id: WorkflowId,
     event_type: &str,
     operator: &Operator,
-    now: i64,
+    now: DbMillis,
 ) -> Result<(), DurableError> {
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
     persistence::append_event(
@@ -1073,7 +1074,7 @@ async fn append_operator_event(
             actor_type: Some("operator".to_string()),
             actor_id: Some(operator.actor_id().to_string()),
             reason: Some(operator.reason().to_string()),
-            created_at: now,
+            created_at: now.get(),
         },
     )
     .await

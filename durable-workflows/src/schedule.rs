@@ -383,7 +383,7 @@ where
         &self,
         key: &str,
         pool: &DurablePool,
-        deployed_at: i64,
+        deployed_at: crate::DbMillis,
     ) -> Result<ScheduleStateReconcileOutcome, DurableError> {
         let definition = self
             .definitions
@@ -392,9 +392,12 @@ where
                 resource: "schedule definition",
                 identifier: key.to_string(),
             })?;
-        let deployed_at = DateTime::<Utc>::from_timestamp_millis(deployed_at).ok_or_else(|| {
-            DurableError::InvalidDefinition("schedule deployment timestamp is invalid".to_string())
-        })?;
+        let deployed_at =
+            DateTime::<Utc>::from_timestamp_millis(deployed_at.get()).ok_or_else(|| {
+                DurableError::InvalidDefinition(
+                    "schedule deployment timestamp is invalid".to_string(),
+                )
+            })?;
         let next = definition.calendar.next_after(deployed_at)?;
         let calendar = definition.calendar.clone();
         let metadata = definition.metadata.clone();

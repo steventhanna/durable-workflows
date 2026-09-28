@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::DbMillis;
 use diesel::{
     dsl::{count_star, min, not},
     BoolExpressionMethods, ExpressionMethods, JoinOnDsl, NullableExpressionMethods,
@@ -87,7 +88,7 @@ impl AdminQueryService {
         &self,
         topics: &TopicRegistry,
         page: PageRequest,
-        now: i64,
+        now: DbMillis,
     ) -> Result<AdminPage<TopicMetrics>, DurableError> {
         validate_now(now)?;
         let limit = page.bounded_limit(MAX_ADMIN_PAGE_SIZE)?;
@@ -117,7 +118,7 @@ impl AdminQueryService {
     async fn load_topic_metrics(
         &self,
         definitions: &[TopicDefinition],
-        now: i64,
+        now: DbMillis,
     ) -> Result<Vec<TopicMetrics>, DurableError> {
         if definitions.is_empty() {
             return Ok(Vec::new());
@@ -375,7 +376,7 @@ impl AdminQueryService {
                     hourly_throughput: hourly_by_topic
                         .remove(&definition.key)
                         .unwrap_or_else(|| empty_hourly_throughput(window)),
-                    captured_at: now,
+                    captured_at: now.get(),
                 }
             })
             .collect())
@@ -646,7 +647,7 @@ impl AdminQueryService {
     pub async fn list_approvals_at(
         &self,
         filter: ApprovalListFilter,
-        now: i64,
+        now: DbMillis,
     ) -> Result<AdminPage<ApprovalSummary>, DurableError> {
         validate_now(now)?;
         validate_approval_filter(&filter)?;
@@ -789,10 +790,10 @@ fn schedule_run_summary(row: ScheduleRunProjection) -> Result<ScheduleRunSummary
 
 fn approval_summary(
     row: ApprovalListProjection,
-    now: i64,
+    now: DbMillis,
 ) -> Result<ApprovalSummary, DurableError> {
     let status = if row.status == ApprovalStatus::Pending
-        && row.expires_at.is_some_and(|expiry| expiry <= now)
+        && row.expires_at.is_some_and(|expiry| expiry <= now.get())
     {
         ApprovalStatus::Expired
     } else {
@@ -869,11 +870,11 @@ struct HourlyWindow {
     exclusive_end: i64,
 }
 
-fn hourly_window(now: i64) -> HourlyWindow {
-    let current_hour = hour_bucket_start(now);
+fn hourly_window(now: DbMillis) -> HourlyWindow {
+    let current_hour = hour_bucket_start(now.get());
     HourlyWindow {
         first_hour: current_hour - (HOURLY_BUCKET_COUNT as i64 - 1) * HOUR_MILLIS,
-        exclusive_end: now.saturating_add(1),
+        exclusive_end: now.get().saturating_add(1),
     }
 }
 
@@ -927,8 +928,8 @@ fn empty_hourly_throughput(window: HourlyWindow) -> Vec<HourlyThroughputBucket> 
         .collect()
 }
 
-fn validate_now(now: i64) -> Result<(), DurableError> {
-    if now < 0 {
+fn validate_now(now: DbMillis) -> Result<(), DurableError> {
+    if now.get() < 0 {
         return Err(DurableError::InvalidDefinition(
             "captured time cannot be negative".to_string(),
         ));
@@ -960,8 +961,8 @@ fn nonnegative_count(count: i64) -> Result<u64, DurableError> {
 
 // Clamp future timestamps to 0: metrics freeze `now` once, then can observe
 // rows written with a later DB clock (common for active `started_at`).
-fn age(now: i64, timestamp: Option<i64>) -> Option<u64> {
-    timestamp.map(|timestamp| u64::try_from(now.saturating_sub(timestamp)).unwrap_or(0))
+fn age(now: DbMillis, timestamp: Option<i64>) -> Option<u64> {
+    timestamp.map(|timestamp| u64::try_from(now.get().saturating_sub(timestamp)).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -970,20 +971,27 @@ mod tests {
         age, empty_hourly_throughput, hour_bucket_bounds, hour_bucket_start, hourly_window,
         HOURLY_BUCKET_COUNT, HOUR_MILLIS,
     };
+    use crate::DbMillis;
 
     #[test]
     fn age_is_none_without_timestamp() {
-        assert_eq!(age(1_000, None), None);
+        assert_eq!(age(DbMillis::from_database_millis(1_000), None), None);
     }
 
     #[test]
     fn age_is_delta_when_timestamp_is_in_the_past() {
-        assert_eq!(age(1_000, Some(250)), Some(750));
+        assert_eq!(
+            age(DbMillis::from_database_millis(1_000), Some(250)),
+            Some(750)
+        );
     }
 
     #[test]
     fn age_clamps_future_timestamps_to_zero() {
-        assert_eq!(age(1_000, Some(1_500)), Some(0));
+        assert_eq!(
+            age(DbMillis::from_database_millis(1_000), Some(1_500)),
+            Some(0)
+        );
     }
 
     #[test]
@@ -996,10 +1004,10 @@ mod tests {
 
     #[test]
     fn hourly_window_covers_twenty_four_hours_ending_at_now() {
-        let now = 100_000_000;
+        let now = DbMillis::from_database_millis(100_000_000);
         let window = hourly_window(now);
         assert_eq!(window.first_hour, 14_400_000);
-        assert_eq!(window.exclusive_end, now + 1);
+        assert_eq!(window.exclusive_end, now.get() + 1);
         let buckets = empty_hourly_throughput(window);
         assert_eq!(buckets.len(), HOURLY_BUCKET_COUNT);
         assert_eq!(buckets[0].starts_at, window.first_hour);
@@ -1009,7 +1017,7 @@ mod tests {
 
     #[test]
     fn hour_bucket_bounds_clip_the_current_hour_to_now() {
-        let window = hourly_window(100_000_000);
+        let window = hourly_window(DbMillis::from_database_millis(100_000_000));
         assert_eq!(
             hour_bucket_bounds(window, 0),
             (window.first_hour, window.first_hour + HOUR_MILLIS)

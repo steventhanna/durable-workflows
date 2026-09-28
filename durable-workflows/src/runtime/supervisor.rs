@@ -1337,7 +1337,7 @@ async fn wait_for_work(cancellation: &CancellationToken, idle_delay: Duration) {
     }
 }
 
-async fn database_now(pool: &DurablePool) -> Result<i64, DurableError> {
+async fn database_now(pool: &DurablePool) -> Result<crate::DbMillis, DurableError> {
     let mut connection = pool.get().await?;
     persistence::database_now_millis(&mut connection).await
 }

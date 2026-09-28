@@ -17,8 +17,8 @@ what it should do.
 - `now` always means database time in epoch milliseconds: `UTC_TIMESTAMP(3)`
   on MySQL (`src/dialect/mysql.rs`), `clock_timestamp() AT TIME ZONE 'UTC'`
   on Postgres (`src/dialect/postgres.rs`), read through
-  `persistence::database_now_millis`; sampled once per transaction unless
-  noted.
+  `persistence::database_now_millis` as a `DbMillis` (`src/clock.rs`);
+  sampled once per transaction unless noted.
 - A **fence** is a `WHERE` predicate on an `UPDATE` whose affected-row count
   must be exactly 1; otherwise the code returns `DurableError::FencedWrite`
   and the enclosing transaction rolls back (e.g. `src/runtime/coordinator.rs` `ensure_fenced`,
@@ -1132,8 +1132,13 @@ non-terminating child are stable states that need an operator.
 ### 5.2 Clocks
 
 - Every persisted timestamp and every due/expiry comparison uses DB time
-  (`persistence::database_now_millis`). The process wall clock is not used
-  and the crate exposes no host wall-clock function; test fixtures read the
+  (`persistence::database_now_millis`, which returns a `DbMillis`). The
+  process wall clock is not used and the crate exposes no host wall-clock
+  function; every function that takes the current time takes a `DbMillis`,
+  so a raw `i64` or a host stamp is a type error at the call
+  (`db_millis_raw_i64_argument` compile-fail case). The timestamp columns
+  themselves are still `BIGINT` in `schema.rs`, so a raw `i64` can still be
+  compared with or written to one; test fixtures read the
   database clock too (`tests/support::db_now`). Tests confirm session time is
   honoured (`tests/database_time.rs`).
 - Each transaction samples `now` once, usually at the start, so stored times

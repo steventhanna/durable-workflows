@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -132,19 +133,25 @@ async fn overlap_policies_apply_globally_to_each_selected_occurrence() {
         QueueOneSchedule::KEY,
     ] {
         registry
-            .reconcile_state(key, &pool, at_minute(0))
+            .reconcile_state(key, &pool, DbMillis::from_database_millis(at_minute(0)))
             .await
             .expect("state");
     }
     let materializer = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry);
     let allow = materializer
-        .materialize_schedule(AllowSchedule::KEY, at_minute(3))
+        .materialize_schedule(
+            AllowSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(3)),
+        )
         .await
         .expect("allow");
     assert_eq!((allow.started, allow.queued, allow.skipped), (3, 0, 0));
 
     let skip = materializer
-        .materialize_schedule(SkipActiveSchedule::KEY, at_minute(3))
+        .materialize_schedule(
+            SkipActiveSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(3)),
+        )
         .await
         .expect("skip active");
     assert_eq!((skip.started, skip.queued, skip.skipped), (1, 0, 2));
@@ -169,13 +176,19 @@ async fn overlap_policies_apply_globally_to_each_selected_occurrence() {
         .expect("block exhausted workflow");
     drop(connection);
     let after_block = materializer
-        .materialize_schedule(SkipActiveSchedule::KEY, at_minute(4))
+        .materialize_schedule(
+            SkipActiveSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(4)),
+        )
         .await
         .expect("materialize after blocked occurrence");
     assert_eq!((after_block.started, after_block.skipped), (0, 1));
 
     let queue = materializer
-        .materialize_schedule(QueueOneSchedule::KEY, at_minute(3))
+        .materialize_schedule(
+            QueueOneSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(3)),
+        )
         .await
         .expect("queue one");
     assert_eq!((queue.started, queue.queued, queue.skipped), (1, 1, 1));
@@ -196,12 +209,19 @@ async fn queue_one_promotes_once_after_the_active_workflow_finishes() {
     };
     let registry = registry();
     registry
-        .reconcile_state(QueueOneSchedule::KEY, &pool, at_minute(0))
+        .reconcile_state(
+            QueueOneSchedule::KEY,
+            &pool,
+            DbMillis::from_database_millis(at_minute(0)),
+        )
         .await
         .expect("state");
     let initial = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry.clone());
     initial
-        .materialize_schedule(QueueOneSchedule::KEY, at_minute(3))
+        .materialize_schedule(
+            QueueOneSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(3)),
+        )
         .await
         .expect("initial queue");
     let initial_runs = runs(&pool, QueueOneSchedule::KEY).await;
@@ -220,8 +240,14 @@ async fn queue_one_promotes_once_after_the_active_workflow_finishes() {
     let left = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry.clone());
     let right = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry);
     let (left, right) = tokio::join!(
-        left.materialize_schedule(QueueOneSchedule::KEY, at_minute(3) + 1),
-        right.materialize_schedule(QueueOneSchedule::KEY, at_minute(3) + 1),
+        left.materialize_schedule(
+            QueueOneSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(3) + 1)
+        ),
+        right.materialize_schedule(
+            QueueOneSchedule::KEY,
+            DbMillis::from_database_millis(at_minute(3) + 1)
+        ),
     );
     assert_eq!(
         left.expect("left").started + right.expect("right").started,
@@ -268,11 +294,11 @@ async fn run_now_respects_the_overlap_policy_and_ignores_the_pause() {
         QueueOneSchedule::KEY,
     ] {
         registry
-            .reconcile_state(key, &pool, at_minute(0))
+            .reconcile_state(key, &pool, DbMillis::from_database_millis(at_minute(0)))
             .await
             .expect("state");
         let report = materializer
-            .materialize_schedule(key, at_minute(1))
+            .materialize_schedule(key, DbMillis::from_database_millis(at_minute(1)))
             .await
             .expect("first occurrence");
         assert_eq!(report.started, 1);
