@@ -1876,6 +1876,126 @@ async fn g10_out_of_bounds_retry_policy_is_quarantined() {
     assert_eq!(blocked.error_category.as_deref(), Some("invalid_row"));
 }
 
+/// G10 (fixed), stored retry policy under lease recovery: a running row
+/// whose `retry_policy_json` no longer decodes when its lease expires is
+/// requeued due now (the owner's decision: requeue, then quarantine) instead
+/// of failing the claim's lease reconciliation; the next claim quarantines
+/// it as `invalid_bounds`.
+#[tokio::test]
+async fn g10_lease_recovery_requeues_invalid_retry_policy_for_quarantine() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let store = DurableStore::new(pool.clone());
+    let workflow = store
+        .start(&G10Flow { topic_b: false }, StartOptions::default())
+        .await
+        .expect("topic A workflow starts")
+        .workflow_id;
+    coordinator(&pool, context.clone(), CoordinatorConfig::default())
+        .activate_one()
+        .await
+        .expect("activation")
+        .expect("claim");
+    let bad_activity = load(&pool, workflow)
+        .await
+        .wait_reference_id
+        .expect("topic A activity");
+    let bad_activity_id = ActivityId::new(bad_activity).expect("activity id");
+
+    let worker = worker(&pool, context);
+    let claims = worker
+        .claim_batch(
+            1,
+            &HashMap::from([("gap_g10_a".to_string(), 1), ("gap_g10_b".to_string(), 1)]),
+        )
+        .await
+        .expect("claim_batch");
+    assert_eq!(claims.len(), 1, "the valid row is claimed");
+    assert_eq!(claims[0].activity_id().expect("id"), bad_activity_id);
+    drop(claims);
+
+    // The trace records that no handler holds the claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "gap-worker",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
+    let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
+    diesel::update(durable_activity::table.find(bad_activity))
+        .set((
+            durable_activity::retry_policy_json.eq(r#"{"backoff":{"Fixed":{"delay_secs":0}}}"#),
+            durable_activity::lease_expires_at.eq(Some(expired_at)),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("corrupt the running row's retry policy and expire its lease");
+    drop(connection);
+
+    // Topic A has no local capacity: the claim reconciles its expired lease
+    // but claims nothing from it.
+    let claims = worker
+        .claim_batch(
+            4,
+            &HashMap::from([("gap_g10_a".to_string(), 0), ("gap_g10_b".to_string(), 1)]),
+        )
+        .await
+        .expect("lease reconciliation requeues the row instead of failing");
+    assert!(claims.is_empty());
+    let mut connection = pool.get().await.expect("test connection");
+    let requeued = find_activity_by_id(&mut connection, bad_activity_id)
+        .await
+        .expect("activity row");
+    drop(connection);
+    assert_eq!(requeued.status.as_str(), "pending");
+    assert_eq!(requeued.attempt_count, 1);
+    assert_eq!(
+        requeued.available_at, requeued.updated_at,
+        "the row is due at the reconciliation time, with no retry delay"
+    );
+    assert_eq!(
+        requeued.last_error_category.as_deref(),
+        Some("lease_expired")
+    );
+    assert!(requeued.lease_token.is_none());
+    assert_eq!(
+        load(&pool, workflow).await.status.as_str(),
+        "waiting_activity"
+    );
+
+    let claims = worker
+        .claim_batch(
+            4,
+            &HashMap::from([("gap_g10_a".to_string(), 1), ("gap_g10_b".to_string(), 1)]),
+        )
+        .await
+        .expect("claim_batch quarantines the row instead of failing");
+    assert!(
+        claims.is_empty(),
+        "the row with an invalid retry policy was claimed"
+    );
+    let mut connection = pool.get().await.expect("test connection");
+    let activity = find_activity_by_id(&mut connection, bad_activity_id)
+        .await
+        .expect("activity row");
+    drop(connection);
+    assert_eq!(activity.status.as_str(), "dead_lettered");
+    assert_eq!(activity.attempt_count, 1);
+    assert_eq!(activity.last_error_category.as_deref(), Some("invalid_row"));
+    assert!(activity
+        .last_error_message
+        .as_deref()
+        .is_some_and(|message| message.starts_with("invalid_bounds")));
+    let blocked = load(&pool, workflow).await;
+    assert_eq!(blocked.status.as_str(), "blocked");
+    assert_eq!(blocked.error_category.as_deref(), Some("invalid_row"));
+    assert_eq!(blocked.wait_reference_id, Some(bad_activity));
+}
+
 /// Activates `workflow_id` until it fails, waiting out the activation retry
 /// backoff (1 s) between attempts. Each activation must return promptly.
 async fn activate_until_failed(
