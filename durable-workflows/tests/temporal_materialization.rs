@@ -52,7 +52,7 @@ async fn start(pool: &durable_workflows::DurablePool) -> WorkflowId {
 async fn workflow(pool: &durable_workflows::DurablePool, id: WorkflowId) -> WorkflowRow {
     let mut connection = pool.get().await.expect("connection");
     durable_workflow::table
-        .find(id.get())
+        .find(id)
         .select(WorkflowRow::as_select())
         .first(&mut connection)
         .await
@@ -66,7 +66,7 @@ async fn deliverable_events(
 ) -> Vec<WorkflowEventRow> {
     let mut connection = pool.get().await.expect("connection");
     durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(id))
         .filter(durable_workflow_event::event_type.eq(event_type))
         .order(durable_workflow_event::sequence.asc())
         .select(WorkflowEventRow::as_select())
@@ -90,7 +90,7 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
         (future, "sleeping", now + 60_000, 8_i32),
         (paused, "paused", now + 1, 9_i32),
     ] {
-        diesel::update(durable_workflow::table.find(id.get()))
+        diesel::update(durable_workflow::table.find(id))
             .set((
                 durable_workflow::status.eq(status),
                 durable_workflow::wait_kind.eq(Some("timer".to_string())),
@@ -140,7 +140,7 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
     assert!(deliverable_events(&pool, paused, "timer_fired")
         .await
         .is_empty());
-    diesel::update(durable_workflow::table.find(paused.get()))
+    diesel::update(durable_workflow::table.find(paused))
         .set(durable_workflow::status.eq("sleeping"))
         .execute(&mut pool.get().await.expect("resume connection"))
         .await
@@ -162,7 +162,7 @@ async fn an_inconsistent_due_timer_rolls_back_without_clearing_the_wait() {
     };
     let now = 1_800_000_000_000_i64;
     let id = start(&pool).await;
-    diesel::update(durable_workflow::table.find(id.get()))
+    diesel::update(durable_workflow::table.find(id))
         .set((
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
@@ -195,7 +195,7 @@ async fn seed_approval(
     let mut connection = pool.get().await.expect("connection");
     diesel::insert_into(durable_approval::table)
         .values(NewApprovalRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             command_sequence: command,
             kind: TemporalWorkflow::KIND.to_string(),
             version: TemporalWorkflow::VERSION,
@@ -214,14 +214,13 @@ async fn seed_approval(
         .await
         .expect("approval");
     let approval_id = durable_approval::table
-        .filter(durable_approval::workflow_id.eq(workflow_id.get()))
+        .filter(durable_approval::workflow_id.eq(workflow_id))
         .order(durable_approval::id.desc())
         .select(durable_approval::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ApprovalId>(&mut connection)
         .await
         .expect("approval id");
-    let approval_id = ApprovalId::new(approval_id).expect("typed approval ID");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq(status),
             durable_workflow::wait_kind.eq(Some("approval".to_string())),
@@ -289,7 +288,7 @@ async fn approval_expiry_is_typed_atomic_race_safe_and_preserves_pause() {
 
     let mut connection = pool.get().await.expect("connection");
     let approval = durable_approval::table
-        .find(paused_approval.get())
+        .find(paused_approval)
         .select(ApprovalRow::as_select())
         .first::<ApprovalRow>(&mut connection)
         .await
@@ -328,14 +327,14 @@ async fn approval_resolution_and_expiry_have_one_transactional_winner() {
 
     let mut connection = pool.get().await.expect("connection");
     let approval = durable_approval::table
-        .find(approval_id.get())
+        .find(approval_id)
         .select(ApprovalRow::as_select())
         .first::<ApprovalRow>(&mut connection)
         .await
         .expect("approval");
     assert!(matches!(approval.status.as_str(), "expired" | "resolved"));
     let temporal_events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(
             durable_workflow_event::event_type.eq_any(["approval_expired", "approval_resolved"]),
         )

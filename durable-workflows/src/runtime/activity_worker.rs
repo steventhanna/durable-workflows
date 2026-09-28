@@ -18,8 +18,8 @@ use crate::{
     store::close_attempt,
     tx::{self, Locked, Tx, TxScope},
     ActivityContext, ActivityDispatchError, ActivityError, ActivityId, ActivityRegistry,
-    ActivityResult, DurableError, DurablePool, ProgressReporter, RetryPolicy, TopicRegistry,
-    WorkflowEvent, WorkflowId,
+    ActivityResult, DurableError, DurablePool, ProgressReporter, RetryPolicy, ScheduleRunId,
+    TopicRegistry, WorkflowEvent, WorkflowId,
 };
 
 /// T-W3 writes of a handler outcome. Only a `running` row takes one;
@@ -87,7 +87,7 @@ impl WorkerConfig {
 #[derive(Debug, Clone)]
 pub struct ActivityClaim {
     row: ActivityRow,
-    schedule_run_id: Option<i64>,
+    schedule_run_id: Option<ScheduleRunId>,
     attempt_number: i32,
     lease_token: String,
     lease_deadline: tokio::time::Instant,
@@ -96,8 +96,8 @@ pub struct ActivityClaim {
 }
 
 impl ActivityClaim {
-    pub fn activity_id(&self) -> Result<ActivityId, DurableError> {
-        ActivityId::new(self.row.id)
+    pub fn activity_id(&self) -> ActivityId {
+        self.row.id
     }
 
     pub fn attempt_number(&self) -> Result<u32, DurableError> {
@@ -185,7 +185,7 @@ where
     ) -> Result<ProgressReporter, DurableError> {
         Ok(ProgressReporter::new(
             self.pool.clone(),
-            claim.activity_id()?,
+            claim.activity_id(),
             claim.attempt_number,
             claim.lease_token.clone(),
         ))
@@ -195,13 +195,13 @@ where
         let Some(claim) = self.claim_one(topic).await? else {
             return Ok(None);
         };
-        let activity_id = claim.activity_id()?;
+        let activity_id = claim.activity_id();
         let lease_fingerprint = lease_fingerprint(&claim.lease_token);
         let span = tracing::info_span!(
             "durable.activity.attempt",
             otel.kind = "consumer",
-            workflow_id = claim.row.workflow_id,
-            schedule_run_id = ?claim.schedule_run_id,
+            workflow_id = claim.row.workflow_id.get(),
+            schedule_run_id = ?claim.schedule_run_id.map(ScheduleRunId::get),
             activity_id = activity_id.get(),
             attempt_number = claim.attempt_number,
             kind = %claim.row.kind,
@@ -282,21 +282,24 @@ where
                 .filter(durable_activity::status.eq(ActivityStatus::Pending))
                 .filter(durable_activity::available_at.le(now))
                 .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-                .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+                .filter(
+                    durable_workflow::wait_reference_id
+                        .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+                )
                 .order((
                     durable_activity::available_at.asc(),
                     diesel::dsl::case_when(
                         durable_activity::available_at
                             .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
-                        durable_activity::workflow_id,
+                        crate::ids::untyped_id(durable_activity::workflow_id),
                     )
-                    .otherwise(durable_activity::id)
+                    .otherwise(crate::ids::untyped_id(durable_activity::id))
                     .asc(),
                     durable_activity::id.asc(),
                 ))
                 .select((durable_activity::id, durable_activity::workflow_id))
                 .limit(CLAIM_CANDIDATE_SCAN_LIMIT)
-                .load::<(i64, i64)>(connection)
+                .load::<(ActivityId, WorkflowId)>(connection)
                 .await?;
             let mut quarantined = Vec::new();
             for (candidate_id, workflow_id) in candidates {
@@ -431,21 +434,24 @@ where
                     .filter(durable_activity::status.eq(ActivityStatus::Pending))
                     .filter(durable_activity::available_at.le(now))
                     .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-                    .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+                    .filter(
+                        durable_workflow::wait_reference_id
+                            .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+                    )
                     .order((
                         durable_activity::available_at.asc(),
                         diesel::dsl::case_when(
                             durable_activity::available_at
                                 .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
-                            durable_activity::workflow_id,
+                            crate::ids::untyped_id(durable_activity::workflow_id),
                         )
-                        .otherwise(durable_activity::id)
+                        .otherwise(crate::ids::untyped_id(durable_activity::id))
                         .asc(),
                         durable_activity::id.asc(),
                     ))
                     .select((durable_activity::id, durable_activity::workflow_id))
                     .limit(CLAIM_CANDIDATE_SCAN_LIMIT)
-                    .load::<(i64, i64)>(connection)
+                    .load::<(ActivityId, WorkflowId)>(connection)
                     .await?;
                 for (candidate_id, workflow_id) in candidates {
                     if claims.len() >= limit
@@ -491,8 +497,8 @@ where
         &self,
         connection: &mut crate::DurableConnection,
         scope: TxScope<'_>,
-        candidate_id: i64,
-        workflow_id: i64,
+        candidate_id: ActivityId,
+        workflow_id: WorkflowId,
         now: i64,
         lease_sample_started: tokio::time::Instant,
         worker_id: &str,
@@ -501,11 +507,11 @@ where
         let locked_workflow = durable_workflow::table
             .find(workflow_id)
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(Some(candidate_id)))
+            .filter(durable_workflow::wait_reference_id.eq(Some(candidate_id.get())))
             .for_update()
             .skip_locked()
             .select(durable_workflow::schedule_run_id)
-            .first::<Option<i64>>(connection)
+            .first::<Option<ScheduleRunId>>(connection)
             .await
             .optional()?;
         let Some(schedule_run_id) = locked_workflow else {
@@ -529,7 +535,7 @@ where
         };
         if !self.activities.contains(&row.kind, row.version) {
             tracing::debug!(
-                activity_id = row.id,
+                activity_id = row.id.get(),
                 kind = %row.kind,
                 version = row.version,
                 "skipping a pending activity without a local definition"
@@ -638,13 +644,13 @@ where
         &self,
         claim: ActivityClaim,
     ) -> Result<(), DurableError> {
-        let activity_id = claim.activity_id()?;
+        let activity_id = claim.activity_id();
         let lease_fingerprint = lease_fingerprint(&claim.lease_token);
         let span = tracing::info_span!(
             "durable.activity.attempt",
             otel.kind = "consumer",
-            workflow_id = claim.row.workflow_id,
-            schedule_run_id = ?claim.schedule_run_id,
+            workflow_id = claim.row.workflow_id.get(),
+            schedule_run_id = ?claim.schedule_run_id.map(ScheduleRunId::get),
             activity_id = activity_id.get(),
             attempt_number = claim.attempt_number,
             kind = %claim.row.kind,
@@ -699,13 +705,13 @@ where
         let child_cancellation = self.cancellation.child_token();
         let progress = ProgressReporter::new(
             self.pool.clone(),
-            claim.activity_id()?,
+            claim.activity_id(),
             claim.attempt_number,
             claim.lease_token.clone(),
         );
         let context = ActivityContext::for_execution(
             self.context.as_ref(),
-            claim.activity_id()?,
+            claim.activity_id(),
             claim.attempt_number()?,
             &claim.lease_token,
             claim.row.operation_key.as_deref(),
@@ -1256,7 +1262,7 @@ async fn reconcile_expired(
                 .or(durable_activity::lease_expires_at.is_null()),
         )
         .select((durable_activity::id, durable_activity::workflow_id))
-        .load::<(i64, i64)>(connection)
+        .load::<(ActivityId, WorkflowId)>(connection)
         .await?;
     for (activity_id, workflow_id) in candidates {
         let workflow = durable_workflow::table
@@ -1343,7 +1349,7 @@ async fn reconcile_expired(
                 // Requeued due now instead of failing the T-W1 (G10): the
                 // next claim quarantines the row as `invalid_bounds`.
                 tracing::warn!(
-                    activity_id = row.id,
+                    activity_id = row.id.get(),
                     %error,
                     "lease recovery found an invalid retry policy; requeueing it for quarantine"
                 );
@@ -1399,7 +1405,7 @@ async fn reconcile_expired(
         .await?;
         let blocks = exhausted
             && workflow.0 == WorkflowStatus::WaitingActivity
-            && workflow.1 == Some(row.id);
+            && workflow.1 == Some(row.id.get());
         if blocks {
             block_workflow(
                 connection,
@@ -1499,8 +1505,8 @@ async fn quarantine_candidate(
 ) -> Result<(), DurableError> {
     let row = locked.row();
     tracing::warn!(
-        activity_id = row.id,
-        workflow_id = row.workflow_id,
+        activity_id = row.id.get(),
+        workflow_id = row.workflow_id.get(),
         reason,
         "quarantining an activity row the claim cannot run"
     );
@@ -1542,7 +1548,7 @@ async fn append_activity_history(
     reason: Option<String>,
     now: i64,
 ) -> Result<(), DurableError> {
-    let workflow_id = WorkflowId::new(row.workflow_id)?;
+    let workflow_id = row.workflow_id;
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
     persistence::append_event(
         connection,
@@ -1571,7 +1577,7 @@ async fn finish_on_connection(
         .find(claim.row.workflow_id)
         .for_update()
         .select(durable_workflow::id)
-        .first::<i64>(connection)
+        .first::<WorkflowId>(connection)
         .await?;
     let now = persistence::database_now_millis(connection).await?;
     let row = tx::lock_optional(
@@ -1774,10 +1780,10 @@ async fn wake_workflow(
         ))
         .first::<(WorkflowStatus, Option<i64>, i32)>(connection)
         .await?;
-    if workflow.0 != WorkflowStatus::WaitingActivity || workflow.1 != Some(claim.row.id) {
+    if workflow.0 != WorkflowStatus::WaitingActivity || workflow.1 != Some(claim.row.id.get()) {
         return Err(DurableError::FencedWrite);
     }
-    let workflow_id = WorkflowId::new(claim.row.workflow_id)?;
+    let workflow_id = claim.row.workflow_id;
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
     let event = WorkflowEvent::ActivitySucceeded {
         command_sequence: u32::try_from(claim.row.command_sequence).map_err(|_| {
@@ -1804,7 +1810,7 @@ async fn wake_workflow(
         durable_workflow::table
             .find(claim.row.workflow_id)
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(Some(claim.row.id))),
+            .filter(durable_workflow::wait_reference_id.eq(Some(claim.row.id.get()))),
     )
     .set((
         durable_workflow::status.eq(WorkflowStatus::Ready),
@@ -1829,7 +1835,7 @@ async fn block_workflow(
         durable_workflow::table
             .find(row.workflow_id)
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(Some(row.id))),
+            .filter(durable_workflow::wait_reference_id.eq(Some(row.id.get()))),
     )
     .set((
         durable_workflow::status.eq(WorkflowStatus::Blocked),
@@ -1840,7 +1846,7 @@ async fn block_workflow(
     .execute(connection)
     .await?;
     ensure_fenced(changed)?;
-    let workflow_id = WorkflowId::new(row.workflow_id)?;
+    let workflow_id = row.workflow_id;
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
     persistence::append_event(
         connection,

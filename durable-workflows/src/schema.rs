@@ -1,6 +1,9 @@
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_workflow (id) {
-        id -> Bigint,
+        id -> WorkflowId,
         kind -> Text,
         version -> Integer,
         input_json -> Text,
@@ -20,10 +23,10 @@ diesel::table! {
         lease_token -> Nullable<Text>,
         lease_expires_at -> Nullable<Bigint>,
         deduplication_key -> Nullable<Text>,
-        schedule_run_id -> Nullable<Bigint>,
-        root_workflow_id -> Nullable<Bigint>,
-        restarted_from_workflow_id -> Nullable<Bigint>,
-        parent_workflow_id -> Nullable<Bigint>,
+        schedule_run_id -> Nullable<ScheduleRunId>,
+        root_workflow_id -> Nullable<WorkflowId>,
+        restarted_from_workflow_id -> Nullable<WorkflowId>,
+        parent_workflow_id -> Nullable<WorkflowId>,
         parent_command_sequence -> Nullable<Integer>,
         command_sequence -> Integer,
         delivered_event_sequence -> Integer,
@@ -34,9 +37,12 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_workflow_event (id) {
         id -> Bigint,
-        workflow_id -> Bigint,
+        workflow_id -> WorkflowId,
         sequence -> Integer,
         delivery_sequence -> Nullable<Integer>,
         event_type -> Text,
@@ -49,9 +55,12 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_activity (id) {
-        id -> Bigint,
-        workflow_id -> Bigint,
+        id -> ActivityId,
+        workflow_id -> WorkflowId,
         command_sequence -> Integer,
         replacement_number -> Integer,
         kind -> Text,
@@ -72,8 +81,8 @@ diesel::table! {
         lease_owner -> Nullable<Text>,
         lease_token -> Nullable<Text>,
         lease_expires_at -> Nullable<Bigint>,
-        root_activity_id -> Nullable<Bigint>,
-        replaces_activity_id -> Nullable<Bigint>,
+        root_activity_id -> Nullable<ActivityId>,
+        replaces_activity_id -> Nullable<ActivityId>,
         created_at -> Bigint,
         updated_at -> Bigint,
         completed_at -> Nullable<Bigint>,
@@ -81,8 +90,11 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_activity_attempt (activity_id, attempt_number) {
-        activity_id -> Bigint,
+        activity_id -> ActivityId,
         attempt_number -> Integer,
         worker_id -> Text,
         lease_token -> Text,
@@ -97,8 +109,11 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_progress_event (activity_id, attempt_number, sequence) {
-        activity_id -> Bigint,
+        activity_id -> ActivityId,
         attempt_number -> Integer,
         sequence -> Integer,
         code -> Text,
@@ -113,9 +128,12 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_approval (id) {
-        id -> Bigint,
-        workflow_id -> Bigint,
+        id -> ApprovalId,
+        workflow_id -> WorkflowId,
         command_sequence -> Integer,
         kind -> Text,
         version -> Integer,
@@ -149,8 +167,11 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::ids::sql_types::*;
+
     durable_schedule_run (id) {
-        id -> Bigint,
+        id -> ScheduleRunId,
         schedule_key -> Text,
         local_occurrence -> Text,
         scheduled_for -> Bigint,
@@ -158,7 +179,7 @@ diesel::table! {
         status -> Text,
         reason -> Nullable<Text>,
         actor_id -> Nullable<Integer>,
-        workflow_id -> Nullable<Bigint>,
+        workflow_id -> Nullable<WorkflowId>,
         created_at -> Bigint,
     }
 }

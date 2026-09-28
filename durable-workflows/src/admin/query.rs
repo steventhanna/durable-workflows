@@ -30,14 +30,14 @@ diesel::define_sql_function! {
 
 #[derive(diesel::Queryable)]
 struct WorkflowProjection {
-    id: i64,
+    id: WorkflowId,
     kind: String,
     version: i32,
     status: WorkflowStatus,
     wait_kind: Option<WaitKind>,
-    schedule_run_id: Option<i64>,
-    root_workflow_id: Option<i64>,
-    restarted_from_workflow_id: Option<i64>,
+    schedule_run_id: Option<ScheduleRunId>,
+    root_workflow_id: Option<WorkflowId>,
+    restarted_from_workflow_id: Option<WorkflowId>,
     input_bytes: i64,
     state_bytes: i64,
     result_bytes: Option<i64>,
@@ -50,14 +50,14 @@ struct WorkflowProjection {
 
 #[derive(diesel::Queryable)]
 struct WorkflowDetailProjection {
-    id: i64,
+    id: WorkflowId,
     kind: String,
     version: i32,
     status: WorkflowStatus,
     wait_kind: Option<WaitKind>,
-    schedule_run_id: Option<i64>,
-    root_workflow_id: Option<i64>,
-    restarted_from_workflow_id: Option<i64>,
+    schedule_run_id: Option<ScheduleRunId>,
+    root_workflow_id: Option<WorkflowId>,
+    restarted_from_workflow_id: Option<WorkflowId>,
     input_json: String,
     state_json: String,
     result_json: Option<String>,
@@ -70,8 +70,8 @@ struct WorkflowDetailProjection {
 
 #[derive(diesel::Queryable)]
 struct ActivityProjection {
-    id: i64,
-    workflow_id: i64,
+    id: ActivityId,
+    workflow_id: WorkflowId,
     kind: String,
     version: i32,
     topic: String,
@@ -80,8 +80,8 @@ struct ActivityProjection {
     attempt_count: i32,
     max_attempts: i32,
     operation_key: Option<String>,
-    root_activity_id: Option<i64>,
-    replaces_activity_id: Option<i64>,
+    root_activity_id: Option<ActivityId>,
+    replaces_activity_id: Option<ActivityId>,
     payload_bytes: i64,
     provider_result_bytes: Option<i64>,
     last_error_category: Option<String>,
@@ -94,8 +94,8 @@ struct ActivityProjection {
 
 #[derive(diesel::Queryable)]
 struct ActivityDetailProjection {
-    id: i64,
-    workflow_id: i64,
+    id: ActivityId,
+    workflow_id: WorkflowId,
     kind: String,
     version: i32,
     topic: String,
@@ -104,8 +104,8 @@ struct ActivityDetailProjection {
     attempt_count: i32,
     max_attempts: i32,
     operation_key: Option<String>,
-    root_activity_id: Option<i64>,
-    replaces_activity_id: Option<i64>,
+    root_activity_id: Option<ActivityId>,
+    replaces_activity_id: Option<ActivityId>,
     payload_json: String,
     provider_result_json: Option<String>,
     last_error_category: Option<String>,
@@ -118,7 +118,7 @@ struct ActivityDetailProjection {
 
 #[derive(diesel::Queryable)]
 struct AttemptProjection {
-    activity_id: i64,
+    activity_id: ActivityId,
     attempt_number: i32,
     worker_id: String,
     started_at: i64,
@@ -132,7 +132,7 @@ struct AttemptProjection {
 
 #[derive(diesel::Queryable)]
 struct AttemptDetailProjection {
-    activity_id: i64,
+    activity_id: ActivityId,
     attempt_number: i32,
     worker_id: String,
     started_at: i64,
@@ -146,8 +146,8 @@ struct AttemptDetailProjection {
 
 #[derive(diesel::Queryable)]
 struct ApprovalProjection {
-    id: i64,
-    workflow_id: i64,
+    id: ApprovalId,
+    workflow_id: WorkflowId,
     kind: String,
     version: i32,
     status: ApprovalStatus,
@@ -312,12 +312,16 @@ macro_rules! apply_attempt_timeline_cursor {
                         .or(durable_activity_attempt::started_at
                             .eq(cursor.timestamp)
                             .and(
-                                durable_activity_attempt::activity_id.gt(cursor.id).or(
-                                    durable_activity_attempt::activity_id.eq(cursor.id).and(
+                                crate::ids::untyped_id(durable_activity_attempt::activity_id)
+                                    .gt(cursor.id)
+                                    .or(crate::ids::untyped_id(
+                                        durable_activity_attempt::activity_id,
+                                    )
+                                    .eq(cursor.id)
+                                    .and(
                                         durable_activity_attempt::attempt_number
                                             .gt(cursor.attempt_number),
-                                    ),
-                                ),
+                                    )),
                             )),
                 )
             };
@@ -338,18 +342,20 @@ macro_rules! apply_progress_timeline_cursor {
                 query.filter(
                     durable_progress_event::created_at.gt(cursor.timestamp).or(
                         durable_progress_event::created_at.eq(cursor.timestamp).and(
-                            durable_progress_event::activity_id.gt(cursor.id).or(
-                                durable_progress_event::activity_id.eq(cursor.id).and(
-                                    durable_progress_event::attempt_number
-                                        .gt(cursor.attempt_number)
-                                        .or(durable_progress_event::attempt_number
-                                            .eq(cursor.attempt_number)
-                                            .and(
-                                                durable_progress_event::sequence
-                                                    .gt(cursor.sequence),
-                                            )),
-                                ),
-                            ),
+                            crate::ids::untyped_id(durable_progress_event::activity_id)
+                                .gt(cursor.id)
+                                .or(crate::ids::untyped_id(durable_progress_event::activity_id)
+                                    .eq(cursor.id)
+                                    .and(
+                                        durable_progress_event::attempt_number
+                                            .gt(cursor.attempt_number)
+                                            .or(durable_progress_event::attempt_number
+                                                .eq(cursor.attempt_number)
+                                                .and(
+                                                    durable_progress_event::sequence
+                                                        .gt(cursor.sequence),
+                                                )),
+                                    )),
                         ),
                     ),
                 )
@@ -392,10 +398,10 @@ impl AdminQueryService {
             query = query.filter(durable_workflow::status.eq(status));
         }
         if let Some(schedule_run_id) = filter.schedule_run_id {
-            query = query.filter(durable_workflow::schedule_run_id.eq(schedule_run_id.get()));
+            query = query.filter(durable_workflow::schedule_run_id.eq(schedule_run_id));
         }
         if let Some(root_workflow_id) = filter.root_workflow_id {
-            query = query.filter(durable_workflow::root_workflow_id.eq(root_workflow_id.get()));
+            query = query.filter(durable_workflow::root_workflow_id.eq(root_workflow_id));
         }
         if let Some(created_after) = filter.created_after {
             query = query.filter(durable_workflow::created_at.ge(created_after));
@@ -420,7 +426,7 @@ impl AdminQueryService {
                     .lt(timestamp)
                     .or(durable_workflow::created_at
                         .eq(timestamp)
-                        .and(durable_workflow::id.lt(id))),
+                        .and(crate::ids::untyped_id(durable_workflow::id).lt(id))),
             );
         }
         let mut connection = self.pool.get().await?;
@@ -442,7 +448,7 @@ impl AdminQueryService {
     ) -> Result<WorkflowSummary, DurableError> {
         let mut connection = self.pool.get().await?;
         let row = durable_workflow::table
-            .find(workflow_id.get())
+            .find(workflow_id)
             .select(workflow_detail_selection!())
             .first::<WorkflowDetailProjection>(&mut connection)
             .await
@@ -465,7 +471,7 @@ impl AdminQueryService {
             .transpose()?;
         let mut query = durable_activity::table.into_boxed::<crate::Db>();
         if let Some(workflow_id) = filter.workflow_id {
-            query = query.filter(durable_activity::workflow_id.eq(workflow_id.get()));
+            query = query.filter(durable_activity::workflow_id.eq(workflow_id));
         }
         if let Some(kind) = filter.kind {
             query = query.filter(durable_activity::kind.eq(kind));
@@ -491,7 +497,7 @@ impl AdminQueryService {
                     .lt(timestamp)
                     .or(durable_activity::created_at
                         .eq(timestamp)
-                        .and(durable_activity::id.lt(id))),
+                        .and(crate::ids::untyped_id(durable_activity::id).lt(id))),
             );
         }
         let mut connection = self.pool.get().await?;
@@ -557,14 +563,14 @@ impl AdminQueryService {
             .transpose()?;
         let mut connection = self.pool.get().await?;
         let row = durable_activity::table
-            .find(activity_id.get())
+            .find(activity_id)
             .select(activity_detail_selection!())
             .first::<ActivityDetailProjection>(&mut connection)
             .await
             .optional()?
             .ok_or_else(|| not_found("activity", activity_id))?;
         let mut attempts_query = durable_activity_attempt::table
-            .filter(durable_activity_attempt::activity_id.eq(activity_id.get()))
+            .filter(durable_activity_attempt::activity_id.eq(activity_id))
             .into_boxed::<crate::Db>();
         if let Some(attempt_after) = attempt_after {
             attempts_query =
@@ -610,7 +616,7 @@ impl AdminQueryService {
             .map(attempt_detail_summary)
             .collect::<Result<Vec<_>, _>>()?;
         let mut progress_query = durable_progress_event::table
-            .filter(durable_progress_event::activity_id.eq(activity_id.get()))
+            .filter(durable_progress_event::activity_id.eq(activity_id))
             .into_boxed::<crate::Db>();
         if let Some((attempt_number, sequence)) = progress_after {
             progress_query = progress_query.filter(
@@ -639,7 +645,7 @@ impl AdminQueryService {
                 durable_progress_event::created_at,
             ))
             .load::<(
-                i64,
+                ActivityId,
                 i32,
                 i32,
                 String,
@@ -703,16 +709,16 @@ impl AdminQueryService {
         // Existence only — avoid re-loading/parsing input/state/result payloads
         // that get_workflow already returned to the detail controller.
         durable_workflow::table
-            .find(workflow_id.get())
+            .find(workflow_id)
             .select(durable_workflow::id)
-            .first::<i64>(&mut connection)
+            .first::<WorkflowId>(&mut connection)
             .await
             .optional()?
             .ok_or_else(|| not_found("workflow", workflow_id))?;
         let mut timeline = Vec::new();
 
         let mut events = durable_workflow_event::table
-            .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+            .filter(durable_workflow_event::workflow_id.eq(workflow_id))
             .into_boxed::<crate::Db>();
         events = apply_numeric_timeline_cursor!(
             events,
@@ -759,12 +765,12 @@ impl AdminQueryService {
         }
 
         let mut activities = durable_activity::table
-            .filter(durable_activity::workflow_id.eq(workflow_id.get()))
+            .filter(durable_activity::workflow_id.eq(workflow_id))
             .into_boxed::<crate::Db>();
         activities = apply_numeric_timeline_cursor!(
             activities,
             durable_activity::created_at,
-            durable_activity::id,
+            crate::ids::untyped_id(durable_activity::id),
             1,
             cursor.as_ref(),
         );
@@ -782,7 +788,7 @@ impl AdminQueryService {
             let id = row.id;
             timeline.push(TimelineEnvelope {
                 occurred_at,
-                tie_breaker: timeline_key(1, &[id]),
+                tie_breaker: timeline_key(1, &[id.get()]),
                 entry: TimelineEntry::Activity(activity_summary(row)?),
             });
         }
@@ -792,7 +798,7 @@ impl AdminQueryService {
                 durable_activity::table
                     .on(durable_activity::id.eq(durable_activity_attempt::activity_id)),
             )
-            .filter(durable_activity::workflow_id.eq(workflow_id.get()))
+            .filter(durable_activity::workflow_id.eq(workflow_id))
             .into_boxed::<crate::Db>();
         attempts = apply_attempt_timeline_cursor!(attempts, cursor.as_ref());
         for row in attempts
@@ -819,7 +825,8 @@ impl AdminQueryService {
             .await?
         {
             let occurred_at = row.started_at;
-            let tie_breaker = timeline_key(2, &[row.activity_id, i64::from(row.attempt_number)]);
+            let tie_breaker =
+                timeline_key(2, &[row.activity_id.get(), i64::from(row.attempt_number)]);
             timeline.push(TimelineEnvelope {
                 occurred_at,
                 tie_breaker,
@@ -832,7 +839,7 @@ impl AdminQueryService {
                 durable_activity::table
                     .on(durable_activity::id.eq(durable_progress_event::activity_id)),
             )
-            .filter(durable_activity::workflow_id.eq(workflow_id.get()))
+            .filter(durable_activity::workflow_id.eq(workflow_id))
             .into_boxed::<crate::Db>();
         progress = apply_progress_timeline_cursor!(progress, cursor.as_ref());
         for row in progress
@@ -855,7 +862,7 @@ impl AdminQueryService {
                 durable_progress_event::created_at,
             ))
             .load::<(
-                i64,
+                ActivityId,
                 i32,
                 i32,
                 String,
@@ -868,7 +875,7 @@ impl AdminQueryService {
             .await?
         {
             let occurred_at = row.8;
-            let tie_breaker = timeline_key(3, &[row.0, i64::from(row.1), i64::from(row.2)]);
+            let tie_breaker = timeline_key(3, &[row.0.get(), i64::from(row.1), i64::from(row.2)]);
             timeline.push(TimelineEnvelope {
                 occurred_at,
                 tie_breaker,
@@ -877,12 +884,12 @@ impl AdminQueryService {
         }
 
         let mut approvals = durable_approval::table
-            .filter(durable_approval::workflow_id.eq(workflow_id.get()))
+            .filter(durable_approval::workflow_id.eq(workflow_id))
             .into_boxed::<crate::Db>();
         approvals = apply_numeric_timeline_cursor!(
             approvals,
             durable_approval::requested_at,
-            durable_approval::id,
+            crate::ids::untyped_id(durable_approval::id),
             4,
             cursor.as_ref(),
         );
@@ -913,7 +920,7 @@ impl AdminQueryService {
             let id = row.id;
             timeline.push(TimelineEnvelope {
                 occurred_at,
-                tie_breaker: timeline_key(4, &[id]),
+                tie_breaker: timeline_key(4, &[id.get()]),
                 entry: TimelineEntry::Approval(approval_summary(row)?),
             });
         }
@@ -1012,17 +1019,14 @@ fn page_activities(
 
 fn workflow_summary(row: WorkflowProjection) -> Result<WorkflowSummary, DurableError> {
     Ok(WorkflowSummary {
-        id: WorkflowId::new(row.id)?,
+        id: row.id,
         kind: row.kind,
         version: row.version,
         status: row.status.to_string(),
         wait_kind: row.wait_kind.map(|kind| kind.to_string()),
-        schedule_run_id: row.schedule_run_id.map(ScheduleRunId::new).transpose()?,
-        root_workflow_id: row.root_workflow_id.map(WorkflowId::new).transpose()?,
-        restarted_from_workflow_id: row
-            .restarted_from_workflow_id
-            .map(WorkflowId::new)
-            .transpose()?,
+        schedule_run_id: row.schedule_run_id,
+        root_workflow_id: row.root_workflow_id,
+        restarted_from_workflow_id: row.restarted_from_workflow_id,
         input: required_json_summary(row.input_bytes)?,
         state: required_json_summary(row.state_bytes)?,
         result: optional_json_summary(row.result_bytes)?,
@@ -1036,17 +1040,14 @@ fn workflow_summary(row: WorkflowProjection) -> Result<WorkflowSummary, DurableE
 
 fn workflow_detail_summary(row: WorkflowDetailProjection) -> Result<WorkflowSummary, DurableError> {
     Ok(WorkflowSummary {
-        id: WorkflowId::new(row.id)?,
+        id: row.id,
         kind: row.kind,
         version: row.version,
         status: row.status.to_string(),
         wait_kind: row.wait_kind.map(|kind| kind.to_string()),
-        schedule_run_id: row.schedule_run_id.map(ScheduleRunId::new).transpose()?,
-        root_workflow_id: row.root_workflow_id.map(WorkflowId::new).transpose()?,
-        restarted_from_workflow_id: row
-            .restarted_from_workflow_id
-            .map(WorkflowId::new)
-            .transpose()?,
+        schedule_run_id: row.schedule_run_id,
+        root_workflow_id: row.root_workflow_id,
+        restarted_from_workflow_id: row.restarted_from_workflow_id,
         input: JsonFieldSummary::from_required_json(&row.input_json)?,
         state: JsonFieldSummary::from_required_json(&row.state_json)?,
         result: JsonFieldSummary::from_optional_json(row.result_json.as_deref())?,
@@ -1060,8 +1061,8 @@ fn workflow_detail_summary(row: WorkflowDetailProjection) -> Result<WorkflowSumm
 
 fn activity_summary(row: ActivityProjection) -> Result<ActivitySummary, DurableError> {
     Ok(ActivitySummary {
-        id: ActivityId::new(row.id)?,
-        workflow_id: WorkflowId::new(row.workflow_id)?,
+        id: row.id,
+        workflow_id: row.workflow_id,
         kind: row.kind,
         version: row.version,
         topic: row.topic,
@@ -1070,8 +1071,8 @@ fn activity_summary(row: ActivityProjection) -> Result<ActivitySummary, DurableE
         attempt_count: row.attempt_count,
         max_attempts: row.max_attempts,
         operation_key: row.operation_key,
-        root_activity_id: row.root_activity_id.map(ActivityId::new).transpose()?,
-        replaces_activity_id: row.replaces_activity_id.map(ActivityId::new).transpose()?,
+        root_activity_id: row.root_activity_id,
+        replaces_activity_id: row.replaces_activity_id,
         payload: required_json_summary(row.payload_bytes)?,
         provider_result: optional_json_summary(row.provider_result_bytes)?,
         error_category: row.last_error_category,
@@ -1089,8 +1090,8 @@ fn activity_summary(row: ActivityProjection) -> Result<ActivitySummary, DurableE
 
 fn activity_detail_summary(row: ActivityDetailProjection) -> Result<ActivitySummary, DurableError> {
     Ok(ActivitySummary {
-        id: ActivityId::new(row.id)?,
-        workflow_id: WorkflowId::new(row.workflow_id)?,
+        id: row.id,
+        workflow_id: row.workflow_id,
         kind: row.kind,
         version: row.version,
         topic: row.topic,
@@ -1099,8 +1100,8 @@ fn activity_detail_summary(row: ActivityDetailProjection) -> Result<ActivitySumm
         attempt_count: row.attempt_count,
         max_attempts: row.max_attempts,
         operation_key: row.operation_key,
-        root_activity_id: row.root_activity_id.map(ActivityId::new).transpose()?,
-        replaces_activity_id: row.replaces_activity_id.map(ActivityId::new).transpose()?,
+        root_activity_id: row.root_activity_id,
+        replaces_activity_id: row.replaces_activity_id,
         payload: JsonFieldSummary::from_required_json(&row.payload_json)?,
         provider_result: JsonFieldSummary::from_optional_json(row.provider_result_json.as_deref())?,
         error_category: row.last_error_category,
@@ -1118,7 +1119,7 @@ fn activity_detail_summary(row: ActivityDetailProjection) -> Result<ActivitySumm
 
 fn attempt_summary(row: AttemptProjection) -> Result<ActivityAttemptSummary, DurableError> {
     Ok(ActivityAttemptSummary {
-        activity_id: ActivityId::new(row.activity_id)?,
+        activity_id: row.activity_id,
         attempt_number: row.attempt_number,
         worker_id: row.worker_id,
         started_at: row.started_at,
@@ -1135,7 +1136,7 @@ fn attempt_detail_summary(
     row: AttemptDetailProjection,
 ) -> Result<ActivityAttemptSummary, DurableError> {
     Ok(ActivityAttemptSummary {
-        activity_id: ActivityId::new(row.activity_id)?,
+        activity_id: row.activity_id,
         attempt_number: row.attempt_number,
         worker_id: row.worker_id,
         started_at: row.started_at,
@@ -1150,8 +1151,8 @@ fn attempt_detail_summary(
 
 fn approval_summary(row: ApprovalProjection) -> Result<ApprovalSummary, DurableError> {
     Ok(ApprovalSummary {
-        id: ApprovalId::new(row.id)?,
-        workflow_id: WorkflowId::new(row.workflow_id)?,
+        id: row.id,
+        workflow_id: row.workflow_id,
         kind: row.kind,
         version: row.version,
         status: row.status.to_string(),
@@ -1166,7 +1167,7 @@ fn approval_summary(row: ApprovalProjection) -> Result<ApprovalSummary, DurableE
 
 fn progress_summary(
     row: (
-        i64,
+        ActivityId,
         i32,
         i32,
         String,
@@ -1178,7 +1179,7 @@ fn progress_summary(
     ),
 ) -> Result<ProgressSummary, DurableError> {
     Ok(ProgressSummary {
-        activity_id: ActivityId::new(row.0)?,
+        activity_id: row.0,
         attempt_number: row.1,
         sequence: row.2,
         code: row.3,

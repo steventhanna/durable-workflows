@@ -132,13 +132,12 @@ impl ScheduleHandler for RegisteredSchedule {
     }
 }
 
-async fn start_workflow(pool: &durable_workflows::DurablePool) -> i64 {
+async fn start_workflow(pool: &durable_workflows::DurablePool) -> WorkflowId {
     DurableStore::new(pool.clone())
         .start(&MetricsWorkflow, StartOptions::default())
         .await
         .expect("workflow starts")
         .workflow_id
-        .get()
 }
 
 struct ActivitySeed<'a> {
@@ -152,18 +151,18 @@ struct ActivitySeed<'a> {
 
 async fn insert_activity(
     connection: &mut DurableConnection,
-    workflow_id: i64,
+    workflow_id: durable_workflows::WorkflowId,
     seed: ActivitySeed<'_>,
-) -> i64 {
+) -> durable_workflows::ActivityId {
     insert_activity_on_topic(connection, workflow_id, "provider", seed).await
 }
 
 async fn insert_activity_on_topic(
     connection: &mut DurableConnection,
-    workflow_id: i64,
+    workflow_id: durable_workflows::WorkflowId,
     topic: &str,
     seed: ActivitySeed<'_>,
-) -> i64 {
+) -> durable_workflows::ActivityId {
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
             workflow_id,
@@ -278,7 +277,7 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(ready_id)),
+            durable_workflow::wait_reference_id.eq(Some(ready_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -300,7 +299,7 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(retry_id)),
+            durable_workflow::wait_reference_id.eq(Some(retry_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -621,7 +620,7 @@ async fn topic_metrics_batch_counts_stay_isolated_per_topic() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(fax_ready_id)),
+            durable_workflow::wait_reference_id.eq(Some(fax_ready_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -847,7 +846,7 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
     let active_run_id = durable_schedule_run::table
         .filter(durable_schedule_run::status.eq("started"))
         .select(durable_schedule_run::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ScheduleRunId>(&mut connection)
         .await
         .expect("active run ID");
     diesel::update(durable_workflow::table.find(workflow_id))
@@ -903,7 +902,7 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
     assert_eq!(registered.coalesced_count, 1);
     assert_eq!(registered.recent_runs.len(), 2);
     assert_eq!(
-        registered.last_run.as_ref().map(|run| run.id.get()),
+        registered.last_run.as_ref().map(|run| run.id),
         Some(active_run_id)
     );
 
@@ -1089,7 +1088,7 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -1112,7 +1111,7 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
     assert_eq!(activities.items[0].available_at, NOW - 5_000);
     let detail = query
         .get_activity(
-            durable_workflows::ActivityId::new(activity_id).unwrap(),
+            activity_id,
             durable_workflows::admin::ActivityDetailRequest::default(),
         )
         .await

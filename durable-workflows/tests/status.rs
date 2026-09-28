@@ -15,7 +15,8 @@ async fn persisted_workflow_row_rejects_unknown_status() {
 
     diesel::insert_into(durable_workflow::table)
         .values((
-            durable_workflow::id.eq(1_i64),
+            durable_workflow::id
+                .eq(durable_workflows::WorkflowId::new(1).expect("fixture workflow id")),
             durable_workflow::kind.eq("status_test"),
             durable_workflow::version.eq(1),
             durable_workflow::input_json.eq("null"),
@@ -51,7 +52,8 @@ async fn persisted_activity_row_rejects_unknown_status() {
 
     diesel::insert_into(durable_workflow::table)
         .values((
-            durable_workflow::id.eq(1_i64),
+            durable_workflow::id
+                .eq(durable_workflows::WorkflowId::new(1).expect("fixture workflow id")),
             durable_workflow::kind.eq("status_test"),
             durable_workflow::version.eq(1),
             durable_workflow::input_json.eq("null"),
@@ -68,7 +70,8 @@ async fn persisted_activity_row_rejects_unknown_status() {
 
     diesel::insert_into(durable_activity::table)
         .values((
-            durable_activity::workflow_id.eq(1_i64),
+            durable_activity::workflow_id
+                .eq(durable_workflows::WorkflowId::new(1).expect("fixture workflow id")),
             durable_activity::command_sequence.eq(1),
             durable_activity::kind.eq("status_test"),
             durable_activity::version.eq(1),
@@ -107,7 +110,8 @@ async fn persisted_statuses_preserve_database_and_json_spellings() {
     };
     diesel::insert_into(durable_workflow::table)
         .values((
-            durable_workflow::id.eq(1_i64),
+            durable_workflow::id
+                .eq(durable_workflows::WorkflowId::new(1).expect("fixture workflow id")),
             durable_workflow::kind.eq("status_test"),
             durable_workflow::version.eq(1),
             durable_workflow::input_json.eq("null"),
@@ -124,7 +128,8 @@ async fn persisted_statuses_preserve_database_and_json_spellings() {
 
     diesel::insert_into(durable_activity::table)
         .values((
-            durable_activity::workflow_id.eq(1_i64),
+            durable_activity::workflow_id
+                .eq(durable_workflows::WorkflowId::new(1).expect("fixture workflow id")),
             durable_activity::command_sequence.eq(1),
             durable_activity::kind.eq("status_test"),
             durable_activity::version.eq(1),

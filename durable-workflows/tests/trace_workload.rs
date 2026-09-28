@@ -553,13 +553,13 @@ impl Snapshot {
             .activities
             .iter()
             .filter(|row| row.status.as_str() == "running" && !owner_crashed(row))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect();
         let orphaned: HashSet<i64> = self
             .activities
             .iter()
             .filter(|row| row.status.as_str() == "running" && owner_crashed(row))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect();
         let waits_on = |row: &WorkflowRow, set: &HashSet<i64>| {
             row.status.as_str() == "waiting_activity"
@@ -571,7 +571,7 @@ impl Snapshot {
             .workflows
             .iter()
             .filter(|row| waits_on(row, &running))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect();
         if !hot.is_empty() {
             return hot;
@@ -579,7 +579,7 @@ impl Snapshot {
         self.workflows
             .iter()
             .filter(|row| allowed.contains(&row.status.as_str()) && !waits_on(row, &orphaned))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect()
     }
 
@@ -587,7 +587,7 @@ impl Snapshot {
         self.workflows
             .iter()
             .filter(|row| row.status.as_str() == "paused")
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect()
     }
 
@@ -951,7 +951,7 @@ async fn fence_probe(pool: &DurablePool, store: &DurableStore, workload: &Worklo
 async fn workflow_row(pool: &DurablePool, workflow: i64) -> WorkflowRow {
     let mut connection = pool.get().await.expect("connection");
     durable_workflow::table
-        .find(workflow)
+        .find(durable_workflows::WorkflowId::new(workflow).expect("workflow ID"))
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await

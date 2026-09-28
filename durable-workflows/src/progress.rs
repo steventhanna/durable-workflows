@@ -88,7 +88,7 @@ impl ProgressReporter {
         event: ProgressEvent,
     ) -> Result<ProgressReportOutcome, DurableError> {
         validate_event(&event)?;
-        let activity_id = self.activity_id.get();
+        let activity_id = self.activity_id;
         let attempt_number = self.attempt_number;
         let lease_token = self.lease_token.clone();
         let mut connection = self.pool.get().await?;
@@ -100,7 +100,7 @@ impl ProgressReporter {
                 .filter(durable_activity::lease_token.eq(&lease_token))
                 .for_update()
                 .select(durable_activity::id)
-                .first::<i64>(connection)
+                .first::<ActivityId>(connection)
                 .await
                 .optional()?;
             if fenced.is_none() {

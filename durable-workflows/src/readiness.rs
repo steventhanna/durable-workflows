@@ -71,7 +71,10 @@ impl ReadinessReport {
             .inner_join(
                 durable_workflow::table.on(durable_workflow::id
                     .eq(durable_activity::workflow_id)
-                    .and(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))),
+                    .and(
+                        durable_workflow::wait_reference_id
+                            .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+                    )),
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
             .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
@@ -91,7 +94,10 @@ impl ReadinessReport {
             .inner_join(
                 durable_workflow::table.on(durable_workflow::id
                     .eq(durable_activity::workflow_id)
-                    .and(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))),
+                    .and(
+                        durable_workflow::wait_reference_id
+                            .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+                    )),
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
             .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))

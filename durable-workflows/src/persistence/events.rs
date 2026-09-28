@@ -13,7 +13,7 @@ pub(crate) async fn next_delivery_event(
     delivered_sequence: i32,
 ) -> Result<Option<WorkflowEventRow>, DurableError> {
     Ok(durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::delivery_sequence.gt(delivered_sequence))
         .order(durable_workflow_event::delivery_sequence.asc())
         .select(WorkflowEventRow::as_select())
@@ -27,7 +27,7 @@ pub(crate) async fn next_event_sequence(
     workflow_id: WorkflowId,
 ) -> Result<i32, DurableError> {
     let current = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .select(diesel::dsl::max(durable_workflow_event::sequence))
         .get_result::<Option<i32>>(connection)
         .await?;

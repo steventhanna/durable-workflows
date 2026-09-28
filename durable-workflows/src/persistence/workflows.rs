@@ -28,7 +28,7 @@ pub(crate) async fn find_by_deduplication_key(
 /// Outcome of [`insert_started`]: the new row's id, or the row that already
 /// holds the deduplication key, locked `FOR UPDATE`.
 pub(crate) enum StartedInsert<'tx> {
-    Inserted(i64),
+    Inserted(WorkflowId),
     Existing(Box<Locked<'tx, WorkflowRow>>),
 }
 
@@ -110,7 +110,7 @@ pub(crate) async fn lock_workflow_by_id<'tx>(
         connection,
         scope,
         durable_workflow::table
-            .find(workflow_id.get())
+            .find(workflow_id)
             .for_update()
             .select(WorkflowRow::as_select()),
     )
@@ -122,7 +122,7 @@ pub async fn find_workflow_by_id(
     workflow_id: crate::WorkflowId,
 ) -> Result<WorkflowRow, DurableError> {
     Ok(durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first(connection)
         .await?)
@@ -150,7 +150,7 @@ pub(crate) async fn wake_waiting_parents_on_child_terminal<'tx>(
         (child.id, child.kind.as_str(), child.version);
     let parents = durable_workflow::table
         .filter(durable_workflow::wait_kind.eq(WaitKind::Child))
-        .filter(durable_workflow::wait_reference_id.eq(child_workflow_id))
+        .filter(durable_workflow::wait_reference_id.eq(child_workflow_id.get()))
         .filter(durable_workflow::status.eq_any(WorkflowStatus::CHILD_WAITERS))
         .for_update()
         .select(WorkflowRow::as_select())
@@ -174,15 +174,13 @@ pub(crate) async fn wake_waiting_parents_on_child_terminal<'tx>(
 async fn wake_loaded_parent_on_child_terminal(
     connection: &mut DurableConnection,
     parent: WorkflowRow,
-    child_workflow_id: i64,
+    child_workflow_id: WorkflowId,
     child_kind: &str,
     child_version: i32,
     outcome: &Result<String, (String, String)>,
     now: i64,
 ) -> Result<(), DurableError> {
-    if !parent.status.awaits_child()
-        || parent.wait()? != Some(Wait::Child(WorkflowId::new(child_workflow_id)?))
-    {
+    if !parent.status.awaits_child() || parent.wait()? != Some(Wait::Child(child_workflow_id)) {
         return Ok(());
     }
     let command_sequence = u32::try_from(parent.command_sequence).map_err(|_| {
@@ -216,7 +214,7 @@ async fn wake_loaded_parent_on_child_terminal(
         .ok_or_else(|| {
             DurableError::InvalidState("workflow delivery sequence overflow".to_string())
         })?;
-    let parent_id = WorkflowId::new(parent.id)?;
+    let parent_id = parent.id;
     let sequence = persistence::next_event_sequence(connection, parent_id).await?;
     crate::trace::touch_wf(parent.id);
     // The woken event's reference (the child); the event itself is touched on append.

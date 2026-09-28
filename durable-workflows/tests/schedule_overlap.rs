@@ -239,7 +239,10 @@ async fn queue_one_promotes_once_after_the_active_workflow_finishes() {
     assert!(promoted[1].workflow_id.is_some());
 }
 
-async fn complete_workflow(pool: &durable_workflows::DurablePool, workflow_id: i64) {
+async fn complete_workflow(
+    pool: &durable_workflows::DurablePool,
+    workflow_id: durable_workflows::WorkflowId,
+) {
     let mut connection = pool.get().await.expect("connection");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
@@ -329,5 +332,5 @@ async fn run_now_respects_the_overlap_policy_and_ignores_the_pause() {
         .expect("run-now ignores the pause");
     let queue_runs = runs(&pool, QueueOneSchedule::KEY).await;
     assert_eq!(queue_runs.len(), 2);
-    assert_eq!(queue_runs[1].workflow_id, Some(manual.workflow_id.get()));
+    assert_eq!(queue_runs[1].workflow_id, Some(manual.workflow_id));
 }

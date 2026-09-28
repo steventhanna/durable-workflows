@@ -21,8 +21,8 @@ use crate::{
     },
     store::{cancel_activities, cancel_approvals},
     ActivityId, ActivityRegistry, ApprovalId, ApprovalResult, DurableError, DurablePool,
-    DurableStore, OverlapPolicy, ScheduleRunId, StartOptions, WorkflowEvent, WorkflowId,
-    WorkflowRegistry, MAX_EVENT_METADATA_BYTES,
+    DurableStore, OverlapPolicy, StartOptions, WorkflowEvent, WorkflowId, WorkflowRegistry,
+    MAX_EVENT_METADATA_BYTES,
 };
 
 #[derive(Clone)]
@@ -79,7 +79,7 @@ where
             crate::trace::touch_wf(workflow.id);
             let now = persistence::database_now_millis(connection).await?;
             if let Some(Wait::Activity(activity_id)) = workflow.wait()? {
-                pause_activity(connection, activity_id.get(), &operator, now).await?;
+                pause_activity(connection, activity_id, &operator, now).await?;
             }
             let changed = diesel::update(
                 durable_workflow::table
@@ -238,7 +238,7 @@ where
             let existing_restart = durable_workflow::table
                 .filter(durable_workflow::restarted_from_workflow_id.eq(Some(source.id)))
                 .select(durable_workflow::id)
-                .first::<i64>(connection)
+                .first::<WorkflowId>(connection)
                 .await
                 .optional()?;
             if existing_restart.is_some() {
@@ -256,8 +256,8 @@ where
             };
             let kind = prepared.kind().to_string();
             let version = prepared.version();
-            let root = WorkflowId::new(source.root_workflow_id.unwrap_or(source.id))?;
-            let schedule_run_id = source.schedule_run_id.map(ScheduleRunId::new).transpose()?;
+            let root = source.root_workflow_id.unwrap_or(source.id);
+            let schedule_run_id = source.schedule_run_id;
             let mut options = StartOptions::default().restarted(root, workflow_id);
             options.schedule_run_id = schedule_run_id;
             let outcome =
@@ -324,10 +324,10 @@ where
             if let Some(schedule_run_id) = schedule_run_id {
                 let changed = diesel::update(
                     durable_schedule_run::table
-                        .find(schedule_run_id.get())
+                        .find(schedule_run_id)
                         .filter(durable_schedule_run::workflow_id.eq(Some(source.id))),
                 )
-                .set(durable_schedule_run::workflow_id.eq(Some(outcome.workflow_id.get())))
+                .set(durable_schedule_run::workflow_id.eq(Some(outcome.workflow_id)))
                 .execute(connection)
                 .await?;
                 ensure_changed(changed)?;
@@ -392,20 +392,18 @@ where
     ) -> Result<ActivityRetryOutcome, DurableError> {
         let mut connection = self.pool.get().await?;
         let workflow_id = durable_activity::table
-            .find(activity_id.get())
+            .find(activity_id)
             .select(durable_activity::workflow_id)
-            .first::<i64>(&mut connection)
+            .first::<WorkflowId>(&mut connection)
             .await
             .optional()?
-            .map(WorkflowId::new)
-            .transpose()?
             .ok_or_else(|| not_found("activity", activity_id))?;
         let activities = self.activities.clone();
         crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_retry", true);
                     let workflow = lock_workflow(connection, scope, workflow_id).await?;
                     let source = durable_activity::table
-                        .find(activity_id.get())
+                        .find(activity_id)
                         .for_update()
                         .select(ActivityRow::as_select())
                         .first::<ActivityRow>(connection)
@@ -487,12 +485,12 @@ where
                         },
                     )
                     .await?;
-                    let replacement_id = ActivityId::new(inserted_id)?;
+                    let replacement_id = inserted_id;
                     let changed = diesel::update(
                         durable_workflow::table
                             .find(workflow.id)
                             .filter(durable_workflow::status.eq(WorkflowStatus::Blocked))
-                            .filter(durable_workflow::wait_reference_id.eq(Some(source.id))),
+                            .filter(durable_workflow::wait_reference_id.eq(Some(source.id.get()))),
                     )
                     .set((
                         durable_workflow::status.eq(WorkflowStatus::WaitingActivity),
@@ -542,16 +540,15 @@ where
         crate::dialect::transaction(&mut connection, async move |Tx { connection, scope }| {
             crate::trace::declare_unmodeled("admin_resolve_approval", true);
             let workflow_id = durable_approval::table
-                .find(approval_id.get())
+                .find(approval_id)
                 .select(durable_approval::workflow_id)
-                .first::<i64>(connection)
+                .first::<WorkflowId>(connection)
                 .await
                 .optional()?
                 .ok_or_else(|| not_found("approval", approval_id))?;
-            let workflow_id = WorkflowId::new(workflow_id)?;
             let workflow = lock_workflow(connection, scope, workflow_id).await?;
             let approval = durable_approval::table
-                .find(approval_id.get())
+                .find(approval_id)
                 .for_update()
                 .select(ApprovalRow::as_select())
                 .first::<ApprovalRow>(connection)
@@ -650,7 +647,7 @@ where
                 durable_workflow::table
                     .find(workflow.id)
                     .filter(durable_workflow::status.eq(&workflow.status))
-                    .filter(durable_workflow::wait_reference_id.eq(Some(approval.id))),
+                    .filter(durable_workflow::wait_reference_id.eq(Some(approval.id.get()))),
             )
             .set((
                 durable_workflow::status.eq(next_status),
@@ -802,26 +799,24 @@ where
             let scheduled_for = last_scheduled
                 .and_then(|last| last.checked_add(1))
                 .map_or(now, |next| next.max(now));
-            let schedule_run_id = ScheduleRunId::new(
-                crate::dialect::insert_schedule_run(
-                    connection,
-                    NewScheduleRunRow {
-                        schedule_key: schedule_key.clone(),
-                        local_occurrence: format!(
-                            "{}{scheduled_for}",
-                            crate::schedule::MANUAL_OCCURRENCE_PREFIX
-                        ),
-                        scheduled_for,
-                        materialized_at: now,
-                        status: ScheduleRunStatus::Materializing,
-                        reason: Some(operator.reason().to_string()),
-                        actor_id: Some(actor_id),
-                        workflow_id: None,
-                        created_at: now,
-                    },
-                )
-                .await?,
-            )?;
+            let schedule_run_id = crate::dialect::insert_schedule_run(
+                connection,
+                NewScheduleRunRow {
+                    schedule_key: schedule_key.clone(),
+                    local_occurrence: format!(
+                        "{}{scheduled_for}",
+                        crate::schedule::MANUAL_OCCURRENCE_PREFIX
+                    ),
+                    scheduled_for,
+                    materialized_at: now,
+                    status: ScheduleRunStatus::Materializing,
+                    reason: Some(operator.reason().to_string()),
+                    actor_id: Some(actor_id),
+                    workflow_id: None,
+                    created_at: now,
+                },
+            )
+            .await?;
             let workflow_id = schedules
                 .start_occurrence(
                     &schedule_key,
@@ -833,12 +828,12 @@ where
                 .await?;
             let changed = diesel::update(
                 durable_schedule_run::table
-                    .find(schedule_run_id.get())
+                    .find(schedule_run_id)
                     .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Materializing)),
             )
             .set((
                 durable_schedule_run::status.eq(ScheduleRunStatus::Started),
-                durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
+                durable_schedule_run::workflow_id.eq(Some(workflow_id)),
             ))
             .execute(connection)
             .await?;
@@ -872,7 +867,7 @@ async fn lock_workflow<'tx>(
         connection,
         scope,
         durable_workflow::table
-            .find(workflow_id.get())
+            .find(workflow_id)
             .for_update()
             .select(WorkflowRow::as_select()),
     )
@@ -928,7 +923,7 @@ fn operator_actor_id(operator: &Operator) -> Result<i32, DurableError> {
 
 async fn pause_activity(
     connection: &mut crate::DurableConnection,
-    activity_id: i64,
+    activity_id: ActivityId,
     operator: &Operator,
     now: i64,
 ) -> Result<(), DurableError> {
@@ -995,7 +990,7 @@ async fn resume_status(
         Some(Wait::Timer { .. }) => Ok(WorkflowStatus::Sleeping),
         Some(Wait::Activity(activity_id)) => {
             let status = durable_activity::table
-                .find(activity_id.get())
+                .find(activity_id)
                 .select(durable_activity::status)
                 .first::<ActivityStatus>(connection)
                 .await
@@ -1020,7 +1015,7 @@ async fn resume_status(
         }
         Some(Wait::Child(child_id)) => {
             let status = durable_workflow::table
-                .find(child_id.get())
+                .find(child_id)
                 .select(durable_workflow::status)
                 .first::<WorkflowStatus>(connection)
                 .await
@@ -1040,7 +1035,7 @@ async fn resume_status(
         }
         Some(Wait::Approval(approval_id)) => {
             let status = durable_approval::table
-                .find(approval_id.get())
+                .find(approval_id)
                 .select(durable_approval::status)
                 .first::<ApprovalStatus>(connection)
                 .await
@@ -1070,7 +1065,7 @@ async fn append_operator_event(
     persistence::append_event(
         connection,
         NewWorkflowEventRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             sequence,
             delivery_sequence: None,
             event_type: event_type.to_string(),

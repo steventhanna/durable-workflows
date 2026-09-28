@@ -518,7 +518,7 @@ async fn claim_on_task(
             .expect("claim")
             .expect("workflow claim");
         claimed_sender
-            .send(claim.workflow_id().expect("id"))
+            .send(claim.workflow_id())
             .expect("claim receiver");
         activate_signal.await.expect("activate signal");
         claim.activate().await
@@ -560,15 +560,18 @@ fn id(raw: i64) -> WorkflowId {
     WorkflowId::new(raw).expect("valid workflow id")
 }
 
+fn activity(raw: i64) -> ActivityId {
+    ActivityId::new(raw).expect("valid activity id")
+}
+
 async fn running_workflow(pool: &DurablePool) -> Option<WorkflowId> {
     let mut connection = pool.get().await.expect("test connection");
     durable_workflow::table
         .filter(durable_workflow::status.eq("running"))
         .select(durable_workflow::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::WorkflowId>(&mut connection)
         .await
         .ok()
-        .map(id)
 }
 
 #[derive(QueryableByName)]
@@ -737,7 +740,7 @@ async fn block_child(
 async fn reattached_events(pool: &DurablePool, workflow_id: WorkflowId) -> Vec<Option<String>> {
     let mut connection = pool.get().await.expect("test connection");
     durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq("child_wait_reattached"))
         .order(durable_workflow_event::sequence.asc())
         .select(durable_workflow_event::metadata_json)
@@ -829,14 +832,14 @@ async fn g2_keyed_child_lineage_after_two_recoveries() {
     assert_eq!(keyed.status.as_str(), "cancelled");
     assert_eq!(first_row.status.as_str(), "cancelled");
     assert_eq!(second_row.status.as_str(), "ready");
-    assert_eq!(first_row.restarted_from_workflow_id, Some(keyed_id.get()));
+    assert_eq!(first_row.restarted_from_workflow_id, Some(keyed_id));
     assert_eq!(
         second_row.restarted_from_workflow_id,
-        Some(first.workflow_id.get())
+        Some(first.workflow_id)
     );
-    assert_eq!(keyed.root_workflow_id, Some(parent_id.get()));
-    assert_eq!(first_row.root_workflow_id, Some(parent_id.get()));
-    assert_eq!(second_row.root_workflow_id, Some(parent_id.get()));
+    assert_eq!(keyed.root_workflow_id, Some(parent_id));
+    assert_eq!(first_row.root_workflow_id, Some(parent_id));
+    assert_eq!(second_row.root_workflow_id, Some(parent_id));
     assert_eq!(first_row.deduplication_key, None);
     assert_eq!(second_row.deduplication_key, None);
 
@@ -925,7 +928,7 @@ async fn g11_parent_cancellation_cancels_child_workflow() {
         .expect("child claim");
     let child = load(&pool, child_id).await;
     assert_eq!(child.status.as_str(), "waiting_activity");
-    let activity_id = child.wait_reference_id.expect("activity reference");
+    let activity_id = activity(child.wait_reference_id.expect("activity reference"));
 
     control(&pool)
         .cancel_workflow(parent_id, &operator("cancel the parent"))
@@ -948,7 +951,7 @@ async fn g11_parent_cancellation_cancels_child_workflow() {
     );
 }
 
-async fn activity_status(pool: &DurablePool, activity_id: i64) -> String {
+async fn activity_status(pool: &DurablePool, activity_id: durable_workflows::ActivityId) -> String {
     let mut connection = pool.get().await.expect("test connection");
     durable_activity::table
         .find(activity_id)
@@ -961,7 +964,7 @@ async fn activity_status(pool: &DurablePool, activity_id: i64) -> String {
 async fn cancelled_reason(pool: &DurablePool, workflow_id: WorkflowId) -> Option<String> {
     let mut connection = pool.get().await.expect("test connection");
     durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq("workflow_cancelled"))
         .select(durable_workflow_event::reason)
         .first::<Option<String>>(&mut connection)
@@ -1002,10 +1005,12 @@ async fn g11_cancel_reaches_grandchildren() {
         coordinator.activate_one().await.expect("leaf activates"),
         Some(leaf)
     );
-    let activity_id = load(&pool, leaf)
-        .await
-        .wait_reference_id
-        .expect("activity reference");
+    let activity_id = activity(
+        load(&pool, leaf)
+            .await
+            .wait_reference_id
+            .expect("activity reference"),
+    );
 
     let mut connection = pool.get().await.expect("test connection");
     DurableStore::cancel_with_conn(&mut connection, top, "cancel the grandparent")
@@ -1101,10 +1106,12 @@ async fn g11_domain_keyed_child_survives_parent_cancellation() {
         coordinator.activate_one().await.expect("child activates"),
         Some(child)
     );
-    let activity_id = load(&pool, child)
-        .await
-        .wait_reference_id
-        .expect("activity reference");
+    let activity_id = activity(
+        load(&pool, child)
+            .await
+            .wait_reference_id
+            .expect("activity reference"),
+    );
 
     control(&pool)
         .cancel_workflow(parent, &operator("cancel the parent"))
@@ -1133,10 +1140,12 @@ async fn g11_cascade_revokes_a_running_child_activity() {
         coordinator.activate_one().await.expect("child activates"),
         Some(child)
     );
-    let activity_id = load(&pool, child)
-        .await
-        .wait_reference_id
-        .expect("activity reference");
+    let activity_id = activity(
+        load(&pool, child)
+            .await
+            .wait_reference_id
+            .expect("activity reference"),
+    );
     let runner = worker(&pool, context.clone());
     let run = tokio::spawn(async move { runner.run_one("gap_g11").await });
     let entered = || async {
@@ -1404,13 +1413,13 @@ where
     let mut connection = pool.get().await.expect("test connection");
     let commands = if wait == "activity" {
         durable_activity::table
-            .filter(durable_activity::workflow_id.eq(workflow_id.get()))
+            .filter(durable_activity::workflow_id.eq(workflow_id))
             .count()
             .get_result::<i64>(&mut connection)
             .await
     } else {
         durable_workflow::table
-            .filter(durable_workflow::parent_workflow_id.eq(workflow_id.get()))
+            .filter(durable_workflow::parent_workflow_id.eq(workflow_id))
             .count()
             .get_result::<i64>(&mut connection)
             .await
@@ -1482,7 +1491,7 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
     // own history event, before it locks the parent.
     let mut connection = pool.get().await.expect("test connection");
     let last_child_sequence = durable_workflows::schema::durable_workflow_event::table
-        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(child.get()))
+        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(child))
         .select(diesel::dsl::max(
             durable_workflows::schema::durable_workflow_event::sequence,
         ))
@@ -1554,7 +1563,7 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
     assert_eq!(parent_row.wait_reference_id, None);
     let mut connection = pool.get().await.expect("test connection");
     let parent_history = durable_workflows::schema::durable_workflow_event::table
-        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(parent.get()))
+        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(parent))
         .order(durable_workflows::schema::durable_workflow_event::sequence.asc())
         .select(durable_workflows::schema::durable_workflow_event::event_type)
         .load::<String>(&mut connection)
@@ -1658,9 +1667,10 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
         .filter(durable_workflow::kind.eq("gap_g6_child"))
         .filter(durable_workflow::deduplication_key.eq("g6-key"))
         .select((durable_workflow::id, durable_workflow::version))
-        .first::<(i64, i32)>(&mut connection)
+        .first::<(WorkflowId, i32)>(&mut connection)
         .await
         .expect("keyed child");
+    let child_id = child_id.get();
     assert_eq!(child_version, 1);
     let v1 = load(&pool, parent_v1).await;
     assert_eq!(v1.wait_reference_id, Some(child_id));
@@ -1711,7 +1721,7 @@ async fn g10_invalid_activity_row_does_not_stop_other_claims() {
         .expect("topic B activity");
 
     let mut connection = pool.get().await.expect("test connection");
-    diesel::update(durable_activity::table.find(bad_activity))
+    diesel::update(durable_activity::table.find(activity(bad_activity)))
         .set(durable_activity::lease_duration_millis.eq(durable_activity::timeout_millis))
         .execute(&mut connection)
         .await
@@ -1723,7 +1733,7 @@ async fn g10_invalid_activity_row_does_not_stop_other_claims() {
     let claimed: Vec<i64> = match &outcome {
         Ok(claims) => claims
             .iter()
-            .map(|claim| claim.activity_id().expect("id").get())
+            .map(|claim| claim.activity_id().get())
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -1765,7 +1775,7 @@ async fn g10_quarantined_row_is_dead_lettered_and_blocks_its_workflow() {
         .expect("topic A activity");
 
     let mut connection = pool.get().await.expect("test connection");
-    diesel::update(durable_activity::table.find(bad_activity))
+    diesel::update(durable_activity::table.find(activity(bad_activity)))
         .set(durable_activity::lease_duration_millis.eq(durable_activity::timeout_millis))
         .execute(&mut connection)
         .await
@@ -1795,7 +1805,7 @@ async fn g10_quarantined_row_is_dead_lettered_and_blocks_its_workflow() {
         .is_some_and(|message| message.starts_with("invalid_bounds")));
     assert!(activity.completed_at.is_some());
     let history = durable_workflows::schema::durable_workflow_event::table
-        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(workflow.get()))
+        .filter(durable_workflows::schema::durable_workflow_event::workflow_id.eq(workflow))
         .order(durable_workflows::schema::durable_workflow_event::sequence.asc())
         .select(durable_workflows::schema::durable_workflow_event::event_type)
         .load::<String>(&mut connection)
@@ -1839,7 +1849,7 @@ async fn g10_out_of_bounds_retry_policy_is_quarantined() {
         .expect("topic A activity");
 
     let mut connection = pool.get().await.expect("test connection");
-    diesel::update(durable_activity::table.find(bad_activity))
+    diesel::update(durable_activity::table.find(activity(bad_activity)))
         .set(durable_activity::retry_policy_json.eq(r#"{"backoff":{"Fixed":{"delay_secs":0}}}"#))
         .execute(&mut connection)
         .await
@@ -1913,7 +1923,7 @@ async fn g10_lease_recovery_requeues_invalid_retry_policy_for_quarantine() {
         .await
         .expect("claim_batch");
     assert_eq!(claims.len(), 1, "the valid row is claimed");
-    assert_eq!(claims[0].activity_id().expect("id"), bad_activity_id);
+    assert_eq!(claims[0].activity_id(), bad_activity_id);
     drop(claims);
 
     // The trace records that no handler holds the claim (the model's `Crash`).
@@ -1926,7 +1936,7 @@ async fn g10_lease_recovery_requeues_invalid_retry_policy_for_quarantine() {
     .await;
     let mut connection = pool.get().await.expect("test connection");
     let expired_at = support::expired_lease_at(&mut connection).await;
-    diesel::update(durable_activity::table.find(bad_activity))
+    diesel::update(durable_activity::table.find(activity(bad_activity)))
         .set((
             durable_activity::retry_policy_json.eq(r#"{"backoff":{"Fixed":{"delay_secs":0}}}"#),
             durable_activity::lease_expires_at.eq(Some(expired_at)),
@@ -2103,7 +2113,7 @@ async fn g8_child_key_resolving_to_self_does_not_wait_on_itself() {
         .expect("claim");
     let row = load(&pool, workflow_id).await;
     assert!(
-        !(row.status.as_str() == "waiting_child" && row.wait_reference_id == Some(row.id)),
+        !(row.status.as_str() == "waiting_child" && row.wait_reference_id == Some(row.id.get())),
         "workflow {} waits on itself: status {}",
         row.id,
         row.status.as_str()
@@ -2141,7 +2151,7 @@ async fn g8_child_key_resolving_to_a_grandparent_is_an_activation_failure() {
         .wait_reference_id
         .expect("caller");
     let row = load(&pool, WorkflowId::new(caller).expect("id")).await;
-    assert_eq!(row.parent_workflow_id, Some(parent));
+    assert_eq!(row.parent_workflow_id, Some(id(parent)));
     assert!(
         row.status.as_str() != "waiting_child",
         "workflow {caller} waits on {:?}",
@@ -2236,7 +2246,7 @@ async fn n1_tree(block_sibling: bool) -> Option<N1Tree> {
     activate().await;
     let row = load(&pool, sibling).await;
     assert_eq!(row.kind, "gap_n1_child");
-    assert_eq!(row.root_workflow_id, Some(parent.get()));
+    assert_eq!(row.root_workflow_id, Some(parent));
     assert_ne!(row.deduplication_key.as_deref(), Some("n1-key"));
     assert_eq!(row.status.as_str(), "waiting_activity");
 
@@ -2553,9 +2563,7 @@ async fn n2_cap_holds_after_revoke(revoke: N2Revoke) {
     let second = r2.claim_one("gap_n2").await.expect("claim");
     let second_claimed_at = tokio::time::Instant::now();
     let executing_at_second_claim = context.executing();
-    let second_id = second
-        .as_ref()
-        .map(|claim| claim.activity_id().expect("id").get());
+    let second_id = second.as_ref().map(|claim| claim.activity_id());
 
     let (r1_outcome, r1_returned_at) = tokio::time::timeout(CONDITION_TIMEOUT, r1_task)
         .await
@@ -2586,7 +2594,7 @@ async fn n2_start(
     store: &DurableStore,
     coordinator: &mut WorkflowCoordinator<N2Context>,
     pool: &DurablePool,
-) -> (WorkflowId, i64) {
+) -> (WorkflowId, ActivityId) {
     let workflow_id = store
         .start(&N2Flow {}, StartOptions::default())
         .await
@@ -2601,7 +2609,7 @@ async fn n2_start(
         .await
         .wait_reference_id
         .expect("activity wait");
-    (workflow_id, activity_id)
+    (workflow_id, activity(activity_id))
 }
 
 fn n2_coordinator(pool: &DurablePool, context: Arc<N2Context>) -> WorkflowCoordinator<N2Context> {
@@ -2616,7 +2624,10 @@ fn n2_coordinator(pool: &DurablePool, context: Arc<N2Context>) -> WorkflowCoordi
     .expect("coordinator is valid")
 }
 
-async fn n2_activity(pool: &DurablePool, activity_id: i64) -> (String, i32, i32, Option<String>) {
+async fn n2_activity(
+    pool: &DurablePool,
+    activity_id: durable_workflows::ActivityId,
+) -> (String, i32, i32, Option<String>) {
     let mut connection = pool.get().await.expect("test connection");
     durable_activity::table
         .find(activity_id)
@@ -2631,7 +2642,11 @@ async fn n2_activity(pool: &DurablePool, activity_id: i64) -> (String, i32, i32,
         .expect("activity row")
 }
 
-async fn n2_attempt(pool: &DurablePool, activity_id: i64, attempt: i32) -> (Option<String>, bool) {
+async fn n2_attempt(
+    pool: &DurablePool,
+    activity_id: durable_workflows::ActivityId,
+    attempt: i32,
+) -> (Option<String>, bool) {
     let mut connection = pool.get().await.expect("test connection");
     let (outcome, finished_at) = durable_activity_attempt::table
         .find((activity_id, attempt))
@@ -2697,7 +2712,7 @@ async fn n2_pause_then_resume_does_not_claim_the_next_attempt_until_the_old_one_
         .await
         .expect("claim")
         .expect("attempt 2 is claimable once attempt 1 settled");
-    assert_eq!(second.activity_id().expect("id").get(), a1);
+    assert_eq!(second.activity_id(), a1);
     assert_eq!(second.attempt_number().expect("attempt"), 2);
 }
 
@@ -2745,7 +2760,7 @@ async fn n2_settled_paused_activity_is_pending_with_one_more_attempt() {
     assert_eq!(load(&pool, w1).await.status.as_str(), "paused");
     let mut connection = pool.get().await.expect("test connection");
     let settled = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(w1.get()))
+        .filter(durable_workflow_event::workflow_id.eq(w1))
         .filter(durable_workflow_event::event_type.eq("activity_revoke_settled"))
         .count()
         .get_result::<i64>(&mut connection)
@@ -2771,7 +2786,7 @@ async fn n2_crash_while_cancelling_settles_by_lease_reconciliation() {
         .await
         .expect("claim")
         .expect("a1 claim");
-    assert_eq!(claim.activity_id().expect("id").get(), a1);
+    assert_eq!(claim.activity_id(), a1);
     let mut connection = pool.get().await.expect("test connection");
     DurableStore::cancel_with_conn(&mut connection, w1, "application cancels w1")
         .await
@@ -2799,7 +2814,7 @@ async fn n2_crash_while_cancelling_settles_by_lease_reconciliation() {
         .await
         .expect("claim")
         .expect("reconciliation frees the slot");
-    assert_eq!(second.activity_id().expect("id").get(), a2);
+    assert_eq!(second.activity_id(), a2);
     let (status, _, _, token) = n2_activity(&pool, a1).await;
     assert_eq!(status, "cancelled");
     assert!(token.is_none());

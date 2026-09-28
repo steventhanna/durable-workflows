@@ -457,7 +457,7 @@ async fn activation_persists_continue_then_completion() {
     use diesel_async::RunQueryDsl;
     use durable_workflows::{persistence::WorkflowEventRow, schema::durable_workflow_event};
     let events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(started.workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(started.workflow_id))
         .order(durable_workflow_event::sequence.asc())
         .select(WorkflowEventRow::as_select())
         .load::<WorkflowEventRow>(&mut connection)
@@ -583,10 +583,7 @@ async fn two_coordinators_claim_distinct_ready_workflows() {
     let (left, right) = tokio::join!(first.claim_one(), second.claim_one());
     let left = left.expect("first claim").expect("first workflow");
     let right = right.expect("second claim").expect("second workflow");
-    assert_ne!(
-        left.workflow_id().expect("first id"),
-        right.workflow_id().expect("second id")
-    );
+    assert_ne!(left.workflow_id(), right.workflow_id());
     assert!(third.claim_one().await.expect("third claim").is_none());
 
     let mut connection = pool.get().await.expect("test connection");
@@ -634,13 +631,13 @@ async fn old_coordinator_skips_workflow_versions_it_cannot_execute() {
         .await
         .expect("old claim")
         .expect("locally executable workflow");
-    assert_eq!(claim.workflow_id().expect("claimed workflow"), v1);
+    assert_eq!(claim.workflow_id(), v1);
 
     use diesel::{QueryDsl, SelectableHelper};
     use diesel_async::RunQueryDsl;
     let mut connection = pool.get().await.expect("connection");
     let untouched = durable_workflows::schema::durable_workflow::table
-        .find(v2.get())
+        .find(v2)
         .select(durable_workflows::persistence::WorkflowRow::as_select())
         .first::<durable_workflows::persistence::WorkflowRow>(&mut connection)
         .await
@@ -684,10 +681,10 @@ async fn stale_lease_cannot_commit_a_transition() {
         .await
         .expect("claim succeeds")
         .expect("workflow is claimed");
-    let workflow_id = claim.workflow_id().expect("workflow id is valid");
+    let workflow_id = claim.workflow_id();
 
     let mut connection = pool.get().await.expect("test connection");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set(durable_workflow::lease_token.eq(Some("replacement-token".to_string())))
         .execute(&mut connection)
         .await
@@ -754,10 +751,7 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
         .expect("recovery claim succeeds")
         .expect("expired workflow is recovered");
 
-    assert_eq!(
-        expired.workflow_id().unwrap(),
-        recovered.workflow_id().unwrap()
-    );
+    assert_eq!(expired.workflow_id(), recovered.workflow_id());
     assert_ne!(expired.lease_token(), recovered.lease_token());
     assert!(matches!(
         expired.activate().await,
@@ -769,7 +763,7 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
     use diesel_async::RunQueryDsl;
     use durable_workflows::schema::durable_workflow_event;
     let recovery_events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(recovered.workflow_id().unwrap().get()))
+        .filter(durable_workflow_event::workflow_id.eq(recovered.workflow_id()))
         .filter(durable_workflow_event::event_type.eq("lease_recovered"))
         .count()
         .get_result::<i64>(&mut connection)
@@ -823,7 +817,7 @@ async fn timer_and_approval_transitions_commit_their_wait_state_atomically() {
 
     let mut connection = pool.get().await.expect("test connection");
     let sleep_state = durable_workflow::table
-        .find(sleeping.workflow_id.get())
+        .find(sleeping.workflow_id)
         .select((
             durable_workflow::status,
             durable_workflow::wait_kind,
@@ -844,7 +838,7 @@ async fn timer_and_approval_transitions_commit_their_wait_state_atomically() {
     );
 
     let approval_state = durable_workflow::table
-        .find(approval.workflow_id.get())
+        .find(approval.workflow_id)
         .select((
             durable_workflow::status,
             durable_workflow::wait_kind,
@@ -864,7 +858,7 @@ async fn timer_and_approval_transitions_commit_their_wait_state_atomically() {
         )
     );
     let approval_count = durable_approval::table
-        .filter(durable_approval::workflow_id.eq(approval.workflow_id.get()))
+        .filter(durable_approval::workflow_id.eq(approval.workflow_id))
         .filter(durable_approval::status.eq("pending"))
         .count()
         .get_result::<i64>(&mut connection)
@@ -914,13 +908,13 @@ async fn activity_transition_commits_state_command_and_wait_atomically() {
 
     let mut connection = pool.get().await.expect("test connection");
     let workflow = durable_workflow::table
-        .find(started.workflow_id.get())
+        .find(started.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("workflow loads");
     let activity = durable_activity::table
-        .filter(durable_activity::workflow_id.eq(started.workflow_id.get()))
+        .filter(durable_activity::workflow_id.eq(started.workflow_id))
         .select(ActivityRow::as_select())
         .first::<ActivityRow>(&mut connection)
         .await
@@ -928,7 +922,7 @@ async fn activity_transition_commits_state_command_and_wait_atomically() {
     assert_eq!(workflow.status.as_str(), "waiting_activity");
     assert_eq!(workflow.state_json, "1");
     assert_eq!(workflow.command_sequence, 1);
-    assert_eq!(workflow.wait_reference_id, Some(activity.id));
+    assert_eq!(workflow.wait_reference_id, Some(activity.id.get()));
     assert_eq!(activity.kind, "test_activity");
     assert_eq!(activity.operation_key.as_deref(), Some("op-7"));
 
@@ -979,19 +973,19 @@ async fn timer_and_approval_transitions_persist_their_wait_records() {
 
     let mut connection = pool.get().await.expect("test connection");
     let sleeping_row = durable_workflow::table
-        .find(sleeping.workflow_id.get())
+        .find(sleeping.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("sleep workflow loads");
     let approval_row = durable_workflow::table
-        .find(approval.workflow_id.get())
+        .find(approval.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("approval workflow loads");
     let request = durable_approval::table
-        .filter(durable_approval::workflow_id.eq(approval.workflow_id.get()))
+        .filter(durable_approval::workflow_id.eq(approval.workflow_id))
         .select(ApprovalRow::as_select())
         .first::<ApprovalRow>(&mut connection)
         .await
@@ -1002,7 +996,7 @@ async fn timer_and_approval_transitions_persist_their_wait_records() {
         Some("timer")
     );
     assert_eq!(approval_row.status.as_str(), "waiting_approval");
-    assert_eq!(approval_row.wait_reference_id, Some(request.id));
+    assert_eq!(approval_row.wait_reference_id, Some(request.id.get()));
     assert!(request.prompt_metadata_json.contains("Approve this test"));
 
     support::drop_durable_tables(&mut connection).await;
@@ -1026,7 +1020,7 @@ async fn non_deliverable_history_never_reaches_workflow_code() {
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_workflow_event::table)
         .values(NewWorkflowEventRow {
-            workflow_id: started.workflow_id.get(),
+            workflow_id: started.workflow_id,
             sequence: 2,
             delivery_sequence: None,
             event_type: "operator_note".to_string(),
@@ -1100,7 +1094,7 @@ async fn missing_definition_is_skipped_without_advancing_state_or_attempts() {
 
     let mut connection = pool.get().await.expect("test connection");
     let (status, state, cursor, attempts) = durable_workflow::table
-        .find(missing.workflow_id.get())
+        .find(missing.workflow_id)
         .select((
             durable_workflow::status,
             durable_workflow::state_json,
@@ -1151,7 +1145,7 @@ async fn activation_errors_back_off_then_fail_at_the_configured_cap() {
     let now = durable_workflows::persistence::database_now_millis(&mut connection)
         .await
         .expect("database clock");
-    diesel::update(durable_workflow::table.find(started.workflow_id.get()))
+    diesel::update(durable_workflow::table.find(started.workflow_id))
         .set(durable_workflow::available_at.eq(now))
         .execute(&mut connection)
         .await
@@ -1164,7 +1158,7 @@ async fn activation_errors_back_off_then_fail_at_the_configured_cap() {
 
     let mut connection = pool.get().await.expect("test connection");
     let (status, attempts, cursor) = durable_workflow::table
-        .find(started.workflow_id.get())
+        .find(started.workflow_id)
         .select((
             durable_workflow::status,
             durable_workflow::activation_attempts,
@@ -1178,7 +1172,7 @@ async fn activation_errors_back_off_then_fail_at_the_configured_cap() {
     assert_eq!(cursor, 0);
     assert_eq!(
         durable_workflow_event::table
-            .filter(durable_workflow_event::workflow_id.eq(started.workflow_id.get()))
+            .filter(durable_workflow_event::workflow_id.eq(started.workflow_id))
             .filter(durable_workflow_event::event_type.eq("activation_exhausted"))
             .count()
             .get_result::<i64>(&mut connection)
@@ -1405,7 +1399,7 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
             .workflow_id;
         let mut connection = pool.get().await.expect("fixture connection");
         let expired_at = support::expired_lease_at(&mut connection).await;
-        diesel::update(durable_workflow::table.find(workflow_id.get()))
+        diesel::update(durable_workflow::table.find(workflow_id))
             .set((
                 durable_workflow::status.eq(WorkflowStatus::Running),
                 durable_workflow::lease_token.eq(Some("original-lease")),
@@ -1434,7 +1428,7 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
         let expiry = (current_status == WorkflowStatus::Running).then_some(future_expiry);
         let update = tokio::time::timeout(
             Duration::from_secs(3),
-            diesel::update(durable_workflow::table.find(workflow_id.get()))
+            diesel::update(durable_workflow::table.find(workflow_id))
                 .set((
                     durable_workflow::status.eq(current_status),
                     durable_workflow::lease_token.eq(lease),
@@ -1457,7 +1451,7 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
             .expect("claim result")
             .is_none());
         let row = durable_workflow::table
-            .find(workflow_id.get())
+            .find(workflow_id)
             .select(WorkflowRow::as_select())
             .first::<WorkflowRow>(&mut connection)
             .await
@@ -1466,7 +1460,7 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
         assert_eq!(row.lease_token.as_deref(), lease);
         assert_eq!(row.lease_expires_at, expiry);
         let recoveries = durable_workflow_event::table
-            .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+            .filter(durable_workflow_event::workflow_id.eq(workflow_id))
             .filter(durable_workflow_event::event_type.eq("lease_recovered"))
             .count()
             .get_result::<i64>(&mut connection)
@@ -1491,7 +1485,7 @@ fn claim_with_blocking_probe(
     tokio::task::spawn_blocking(move || {
         runtime.block_on(async move {
             match coordinator.claim_one().await? {
-                Some(claim) => claim.workflow_id().map(Some),
+                Some(claim) => Ok(Some(claim.workflow_id())),
                 None => Ok(None),
             }
         })
@@ -1522,8 +1516,7 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
                     )
                     .await
                     .expect("workflow starts")
-                    .workflow_id
-                    .get(),
+                    .workflow_id,
             );
         }
         let mut connection = pool.get().await.expect("fixture connection");
@@ -1556,7 +1549,7 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
                         .find(*id)
                         .for_update()
                         .select(durable_workflow::id)
-                        .first::<i64>(connection)
+                        .first::<durable_workflows::WorkflowId>(connection)
                         .await?;
                 }
                 let claim = tokio::time::timeout(Duration::from_secs(5), coordinator.claim_one())
@@ -1568,7 +1561,7 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
             .await
             .expect("blocker transaction");
         assert_eq!(
-            claim.map(|claim| claim.workflow_id().expect("claimed id").get()),
+            claim.map(|claim| claim.workflow_id()),
             workflow_ids.get(32).copied(),
             "recovery must inspect the unlocked candidate beyond the first page"
         );
@@ -1585,7 +1578,7 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
         let recovered_ids = durable_workflow_event::table
             .filter(durable_workflow_event::event_type.eq("lease_recovered"))
             .select(durable_workflow_event::workflow_id)
-            .load::<i64>(&mut connection)
+            .load::<durable_workflows::WorkflowId>(&mut connection)
             .await
             .expect("recovery history");
         assert_eq!(

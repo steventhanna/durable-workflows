@@ -164,7 +164,7 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
         .workflow_id;
     let now = support::db_now(&pool).await;
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(stale_workflow.get()))
+    diesel::update(durable_workflow::table.find(stale_workflow))
         .set((
             durable_workflow::status.eq("running"),
             durable_workflow::lease_owner.eq(Some("worker-secret".to_string())),
@@ -175,7 +175,7 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
         .execute(&mut connection)
         .await
         .expect("stale workflow state");
-    diesel::update(durable_workflow::table.find(exhausted_workflow.get()))
+    diesel::update(durable_workflow::table.find(exhausted_workflow))
         .set((
             durable_workflow::status.eq("failed"),
             durable_workflow::error_category.eq(Some("activation".to_string())),
@@ -187,8 +187,8 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
         .expect("exhausted workflow state");
     diesel::insert_into(durable_activity::table)
         .values([
-            activity_row(stale_workflow.get(), 1, "running", now - 120_000),
-            activity_row(exhausted_workflow.get(), 2, "dead_lettered", now - 1),
+            activity_row(stale_workflow, 1, "running", now - 120_000),
+            activity_row(exhausted_workflow, 2, "dead_lettered", now - 1),
         ])
         .execute(&mut connection)
         .await
@@ -379,7 +379,7 @@ async fn activity_span_has_safe_correlation_fields_without_token_or_payload() {
         .expect("workflow")
         .workflow_id;
     let now = support::db_now(&pool).await;
-    let mut row = activity_row(workflow_id.get(), 1, "pending", now);
+    let mut row = activity_row(workflow_id, 1, "pending", now);
     row.kind = SecretActivity::KIND.to_string();
     row.version = SecretActivity::VERSION;
     row.topic = ObservabilityTopic::External.key().to_string();
@@ -404,14 +404,14 @@ async fn activity_span_has_safe_correlation_fields_without_token_or_payload() {
     let activity_id = durable_activity::table
         .select(durable_activity::id)
         .order(durable_activity::id.desc())
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity ID");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -447,8 +447,7 @@ async fn activity_span_has_safe_correlation_fields_without_token_or_payload() {
             .run_one(ObservabilityTopic::External.key())
             .await
             .expect("activity execution")
-            .expect("activity claim")
-            .get(),
+            .expect("activity claim"),
         activity_id
     );
     let logs = buffer.contents();
@@ -465,7 +464,7 @@ async fn activity_span_has_safe_correlation_fields_without_token_or_payload() {
 }
 
 fn activity_row(
-    workflow_id: i64,
+    workflow_id: durable_workflows::WorkflowId,
     command_sequence: i32,
     status: &str,
     lease_expires_at: i64,

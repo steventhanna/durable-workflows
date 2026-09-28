@@ -12,7 +12,7 @@ use crate::{
         durable_activity, durable_approval, durable_schedule_run, durable_schedule_state,
         durable_topic_lock, durable_workflow,
     },
-    DurableConnection, DurableError,
+    ActivityId, ApprovalId, DurableConnection, DurableError, ScheduleRunId, WorkflowId,
 };
 
 // `now()` is the transaction start time; callers sample the clock after
@@ -84,18 +84,18 @@ pub(crate) async fn insert_workflow(
 async fn insert_workflow_row(
     connection: &mut DurableConnection,
     row: NewWorkflowRow,
-) -> Result<Option<i64>, diesel::result::Error> {
+) -> Result<Option<WorkflowId>, diesel::result::Error> {
     diesel::insert_into(durable_workflow::table)
         .values(row)
         .on_conflict((durable_workflow::kind, durable_workflow::deduplication_key))
         .do_nothing()
         .returning(durable_workflow::id)
-        .get_result::<i64>(connection)
+        .get_result::<WorkflowId>(connection)
         .await
         .optional()
 }
 
-fn restart_conflict(restarted_from_workflow_id: Option<i64>) -> DurableError {
+fn restart_conflict(restarted_from_workflow_id: Option<WorkflowId>) -> DurableError {
     match restarted_from_workflow_id {
         Some(id) => DurableError::Conflict(format!("workflow {id} already has a successor")),
         None => DurableError::Conflict(
@@ -110,12 +110,12 @@ pub(crate) async fn insert_activity<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
     parent: Locked<'tx, &P>,
     row: NewActivityRow,
-) -> Result<i64, DurableError> {
+) -> Result<ActivityId, DurableError> {
     debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     Ok(diesel::insert_into(durable_activity::table)
         .values(row)
         .returning(durable_activity::id)
-        .get_result::<i64>(connection)
+        .get_result::<ActivityId>(connection)
         .await?)
 }
 
@@ -125,23 +125,23 @@ pub(crate) async fn insert_approval<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
     parent: Locked<'tx, &P>,
     row: NewApprovalRow,
-) -> Result<i64, DurableError> {
+) -> Result<ApprovalId, DurableError> {
     debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     Ok(diesel::insert_into(durable_approval::table)
         .values(row)
         .returning(durable_approval::id)
-        .get_result::<i64>(connection)
+        .get_result::<ApprovalId>(connection)
         .await?)
 }
 
 pub(crate) async fn insert_schedule_run(
     connection: &mut DurableConnection,
     row: NewScheduleRunRow,
-) -> Result<i64, DurableError> {
+) -> Result<ScheduleRunId, DurableError> {
     Ok(diesel::insert_into(durable_schedule_run::table)
         .values(row)
         .returning(durable_schedule_run::id)
-        .get_result::<i64>(connection)
+        .get_result::<ScheduleRunId>(connection)
         .await?)
 }
 

@@ -180,12 +180,12 @@ async fn insert_activity(
     pool: &durable_workflows::DurablePool,
     workflow_id: WorkflowId,
     status: &str,
-) -> i64 {
+) -> durable_workflows::ActivityId {
     let now = 10_000;
     let mut connection = pool.get().await.expect("connection");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             command_sequence: 1,
             replacement_number: 0,
             kind: "control_activity".to_string(),
@@ -230,15 +230,15 @@ async fn insert_activity(
 async fn set_waiting_activity(
     pool: &durable_workflows::DurablePool,
     workflow_id: WorkflowId,
-    activity_id: i64,
+    activity_id: durable_workflows::ActivityId,
     status: &str,
 ) {
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq(status),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
         ))
         .execute(&mut connection)
@@ -321,10 +321,10 @@ async fn assert_activity_claim_lock_order(batch: bool) {
         .await
         .expect("operator transaction");
     durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .for_update()
         .select(durable_workflow::id)
-        .first::<i64>(&mut operator_connection)
+        .first::<durable_workflows::WorkflowId>(&mut operator_connection)
         .await
         .expect("workflow lock");
 
@@ -353,7 +353,7 @@ async fn assert_activity_claim_lock_order(batch: bool) {
             .find(activity_id)
             .for_update()
             .select(durable_activity::id)
-            .first::<i64>(&mut operator_connection),
+            .first::<durable_workflows::ActivityId>(&mut operator_connection),
     )
     .await;
     operator_connection
@@ -369,10 +369,7 @@ async fn assert_activity_claim_lock_order(batch: bool) {
         .expect("claim task")
         .expect("claim")
         .expect("claimant must continue past the locked workflow");
-    assert_eq!(
-        claim.activity_id().expect("claimed activity").get(),
-        next_activity_id
-    );
+    assert_eq!(claim.activity_id(), next_activity_id);
 }
 
 #[tokio::test]
@@ -496,7 +493,10 @@ async fn pause_fences_a_running_activity_and_resume_reopens_the_wait() {
     assert!(attempt.finished_at.is_some());
 }
 
-async fn expire_activity_lease(pool: &durable_workflows::DurablePool, activity_id: i64) {
+async fn expire_activity_lease(
+    pool: &durable_workflows::DurablePool,
+    activity_id: durable_workflows::ActivityId,
+) {
     let mut connection = pool.get().await.expect("connection");
     diesel::update(durable_activity::table.find(activity_id))
         .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
@@ -607,7 +607,7 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
             status: durable_workflows::persistence::ScheduleRunStatus::Started,
             reason: None,
             actor_id: None,
-            workflow_id: Some(workflow_id.get()),
+            workflow_id: Some(workflow_id),
             created_at: 0,
         })
         .execute(&mut connection)
@@ -615,10 +615,10 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
         .expect("schedule run");
     let schedule_run_id = durable_schedule_run::table
         .select(durable_schedule_run::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ScheduleRunId>(&mut connection)
         .await
         .expect("schedule run id");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("paused"),
             durable_workflow::schedule_run_id.eq(Some(schedule_run_id)),
@@ -637,14 +637,14 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
 
     let mut connection = pool.get().await.expect("connection");
     let source = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("source");
     assert_eq!(source.status.as_str(), "cancelled");
     let replacement = durable_workflow::table
-        .find(restarted.workflow_id.get())
+        .find(restarted.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -656,7 +656,7 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
         .first::<ScheduleRunRow>(&mut connection)
         .await
         .expect("schedule run");
-    assert_eq!(run.workflow_id, Some(restarted.workflow_id.get()));
+    assert_eq!(run.workflow_id, Some(restarted.workflow_id));
     drop(connection);
     assert!(matches!(
         service
@@ -686,7 +686,7 @@ async fn two_simultaneous_pauses_have_one_winner_and_attributed_history() {
 
     let mut connection = pool.get().await.expect("connection");
     let events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq("workflow_paused"))
         .select(WorkflowEventRow::as_select())
         .load::<WorkflowEventRow>(&mut connection)
@@ -704,7 +704,7 @@ async fn resuming_an_overdue_timer_does_not_run_without_a_timer_event() {
     };
     let workflow_id = start_workflow(&pool).await;
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
@@ -777,7 +777,7 @@ async fn restart_is_version_pinned_while_correction_selects_current_and_rolls_ba
     };
     let workflow_id = start_workflow(&pool).await;
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("failed"),
             durable_workflow::completed_at.eq(Some(20_000_i64)),
@@ -804,7 +804,7 @@ async fn restart_is_version_pinned_while_correction_selects_current_and_rolls_ba
         .expect("correction source")
         .workflow_id;
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(correction_source.get()))
+    diesel::update(durable_workflow::table.find(correction_source))
         .set((
             durable_workflow::status.eq("failed"),
             durable_workflow::completed_at.eq(Some(20_001_i64)),
@@ -840,18 +840,15 @@ async fn restart_is_version_pinned_while_correction_selects_current_and_rolls_ba
 
     let mut connection = pool.get().await.expect("connection");
     let corrected_row = durable_workflow::table
-        .find(corrected.workflow_id.get())
+        .find(corrected.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("corrected workflow");
-    assert_eq!(
-        corrected_row.root_workflow_id,
-        Some(correction_source.get())
-    );
+    assert_eq!(corrected_row.root_workflow_id, Some(correction_source));
     assert_eq!(
         corrected_row.restarted_from_workflow_id,
-        Some(correction_source.get())
+        Some(correction_source)
     );
     assert!(corrected_row.deduplication_key.is_none());
     assert_eq!(corrected_row.state_json, r#""corrected:8""#);
@@ -864,7 +861,7 @@ async fn restart_is_one_shot_for_an_unscheduled_source() {
     };
     let workflow_id = start_workflow(&pool).await;
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set(durable_workflow::status.eq("paused"))
         .execute(&mut connection)
         .await
@@ -893,7 +890,7 @@ async fn restart_is_one_shot_for_an_unscheduled_source() {
 
     let mut connection = pool.get().await.expect("connection");
     let child_count = durable_workflow::table
-        .filter(durable_workflow::restarted_from_workflow_id.eq(Some(workflow_id.get())))
+        .filter(durable_workflow::restarted_from_workflow_id.eq(Some(workflow_id)))
         .count()
         .get_result::<i64>(&mut connection)
         .await
@@ -912,10 +909,7 @@ async fn retry_creates_immutable_lineage_and_correction_changes_version_and_oper
     let (workflows, activities, _) = registries();
     let service = AdminControlService::new(pool.clone(), Arc::new(workflows), Arc::new(activities));
     let retried = service
-        .retry_activity(
-            durable_workflows::ActivityId::new(activity_id).expect("activity ID"),
-            &operator("provider recovered"),
-        )
+        .retry_activity(activity_id, &operator("provider recovered"))
         .await
         .expect("retry");
     assert_eq!(retried.version, 1);
@@ -925,7 +919,7 @@ async fn retry_creates_immutable_lineage_and_correction_changes_version_and_oper
     );
 
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_activity::table.find(retried.activity_id.get()))
+    diesel::update(durable_activity::table.find(retried.activity_id))
         .set((
             durable_activity::status.eq("dead_lettered"),
             durable_activity::last_error_category.eq(Some("provider".to_string())),
@@ -935,7 +929,7 @@ async fn retry_creates_immutable_lineage_and_correction_changes_version_and_oper
         .execute(&mut connection)
         .await
         .expect("replacement failure");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set(durable_workflow::status.eq("blocked"))
         .execute(&mut connection)
         .await
@@ -970,16 +964,16 @@ async fn retry_creates_immutable_lineage_and_correction_changes_version_and_oper
 
     let mut connection = pool.get().await.expect("connection");
     let row = durable_activity::table
-        .find(corrected.activity_id.get())
+        .find(corrected.activity_id)
         .select(ActivityRow::as_select())
         .first::<ActivityRow>(&mut connection)
         .await
         .expect("replacement");
     assert_eq!(row.root_activity_id, Some(activity_id));
-    assert_eq!(row.replaces_activity_id, Some(retried.activity_id.get()));
+    assert_eq!(row.replaces_activity_id, Some(retried.activity_id));
     assert_eq!(row.replacement_number, 2);
     let workflow = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -1035,7 +1029,7 @@ async fn retry_recovers_a_workflow_blocked_by_a_quarantined_activity() {
         .await
         .expect("activity");
     let workflow = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -1047,14 +1041,11 @@ async fn retry_recovers_a_workflow_blocked_by_a_quarantined_activity() {
         Some("invalid_row")
     );
     assert_eq!(workflow.status.as_str(), "blocked");
-    assert_eq!(workflow.wait_reference_id, Some(activity_id));
+    assert_eq!(workflow.wait_reference_id, Some(activity_id.get()));
 
     let service = AdminControlService::new(pool.clone(), Arc::new(workflows), activities);
     let retried = service
-        .retry_activity(
-            durable_workflows::ActivityId::new(activity_id).expect("activity ID"),
-            &operator("replace the quarantined row"),
-        )
+        .retry_activity(activity_id, &operator("replace the quarantined row"))
         .await
         .expect("retry");
     let claim = worker
@@ -1062,7 +1053,7 @@ async fn retry_recovers_a_workflow_blocked_by_a_quarantined_activity() {
         .await
         .expect("claim")
         .expect("the replacement is claimable");
-    assert_eq!(claim.activity_id().expect("id"), retried.activity_id);
+    assert_eq!(claim.activity_id(), retried.activity_id);
 }
 
 #[tokio::test]
@@ -1087,10 +1078,7 @@ async fn recoverable_start_fences_dead_letter_retry_and_races_to_one_live_genera
     let service = AdminControlService::new(pool.clone(), Arc::new(workflows), Arc::new(activities));
     assert!(matches!(
         service
-            .retry_activity(
-                durable_workflows::ActivityId::new(activity_id).expect("activity ID"),
-                &operator("late dead-letter retry"),
-            )
+            .retry_activity(activity_id, &operator("late dead-letter retry"),)
             .await,
         Err(DurableError::Conflict(_))
     ));
@@ -1112,10 +1100,7 @@ async fn recoverable_start_fences_dead_letter_retry_and_races_to_one_live_genera
             &ControlWorkflowV1 { value: 8 },
             StartOptions::default().with_deduplication_key("source-race"),
         ),
-        service.retry_activity(
-            durable_workflows::ActivityId::new(race_activity_id).expect("race activity ID"),
-            &retry_operator,
-        ),
+        service.retry_activity(race_activity_id, &retry_operator,),
     );
     let race_recovery = race_recovery.expect("race recovery resolves");
     assert_eq!(
@@ -1125,7 +1110,7 @@ async fn recoverable_start_fences_dead_letter_retry_and_races_to_one_live_genera
 
     let mut connection = pool.get().await.expect("connection");
     let source_status = durable_workflow::table
-        .find(source.get())
+        .find(source)
         .select(durable_workflow::status)
         .first::<String>(&mut connection)
         .await
@@ -1141,8 +1126,8 @@ async fn recoverable_start_fences_dead_letter_retry_and_races_to_one_live_genera
     let race_live = durable_workflow::table
         .filter(
             durable_workflow::id
-                .eq(race_source.get())
-                .or(durable_workflow::root_workflow_id.eq(Some(race_source.get()))),
+                .eq(race_source)
+                .or(durable_workflow::root_workflow_id.eq(Some(race_source))),
         )
         .filter(durable_workflow::status.ne_all(["succeeded", "failed", "cancelled"]))
         .count()
@@ -1170,7 +1155,7 @@ async fn recoverable_start_at_a_new_version_fails_the_waiting_parent_as_supersed
         .expect("parent starts")
         .workflow_id;
     let mut connection = pool.get().await.expect("connection");
-    diesel::update(durable_workflow::table.find(parent.get()))
+    diesel::update(durable_workflow::table.find(parent))
         .set((
             durable_workflow::status.eq("waiting_child"),
             durable_workflow::wait_kind.eq(Some("child".to_string())),
@@ -1195,7 +1180,7 @@ async fn recoverable_start_at_a_new_version_fails_the_waiting_parent_as_supersed
     assert!(successor.inserted);
 
     let parent_row = durable_workflow::table
-        .find(parent.get())
+        .find(parent)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -1204,7 +1189,7 @@ async fn recoverable_start_at_a_new_version_fails_the_waiting_parent_as_supersed
     assert_eq!(parent_row.wait_kind, None);
     assert_eq!(parent_row.wait_reference_id, None);
     let events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(parent.get()))
+        .filter(durable_workflow_event::workflow_id.eq(parent))
         .order(durable_workflow_event::sequence.asc())
         .select(WorkflowEventRow::as_select())
         .load::<WorkflowEventRow>(&mut connection)
@@ -1295,7 +1280,7 @@ async fn restart_supersession_cancels_the_owned_child() {
         Some(parent)
     );
     let mut connection = pool.get().await.expect("connection");
-    let load = async |connection: &mut durable_workflows::DurableConnection, id: i64| {
+    let load = async |connection: &mut durable_workflows::DurableConnection, id: WorkflowId| {
         durable_workflow::table
             .find(id)
             .select(WorkflowRow::as_select())
@@ -1303,22 +1288,24 @@ async fn restart_supersession_cancels_the_owned_child() {
             .await
             .expect("workflow loads")
     };
-    let child = load(&mut connection, parent.get())
-        .await
-        .wait_reference_id
-        .expect("child reference");
-    assert_eq!(
-        coordinator
-            .activate_one()
+    let child = WorkflowId::new(
+        load(&mut connection, parent)
             .await
-            .expect("child")
-            .map(|id| id.get()),
+            .wait_reference_id
+            .expect("child reference"),
+    )
+    .expect("child id");
+    assert_eq!(
+        coordinator.activate_one().await.expect("child"),
         Some(child)
     );
-    let activity_id = load(&mut connection, child)
-        .await
-        .wait_reference_id
-        .expect("activity reference");
+    let activity_id = durable_workflows::ActivityId::new(
+        load(&mut connection, child)
+            .await
+            .wait_reference_id
+            .expect("activity reference"),
+    )
+    .expect("activity id");
 
     let service = AdminControlService::new(pool.clone(), workflows, activities);
     service
@@ -1331,11 +1318,11 @@ async fn restart_supersession_cancels_the_owned_child() {
         .expect("parent restarts");
 
     assert_eq!(
-        load(&mut connection, parent.get()).await.status.as_str(),
+        load(&mut connection, parent).await.status.as_str(),
         "cancelled"
     );
     assert_eq!(
-        load(&mut connection, restarted.workflow_id.get())
+        load(&mut connection, restarted.workflow_id)
             .await
             .status
             .as_str(),

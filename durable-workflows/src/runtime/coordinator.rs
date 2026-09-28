@@ -23,8 +23,8 @@ use crate::{
         WorkflowStatus,
     },
     schema::durable_workflow,
-    ActivityId, ActivityRegistry, ApprovalId, BackoffPolicy, DurableError, DurablePool,
-    RetryPolicy, StoredTransition, WorkflowEvent, WorkflowId, WorkflowRegistry,
+    ActivityRegistry, BackoffPolicy, DurableError, DurablePool, RetryPolicy, StoredTransition,
+    WorkflowEvent, WorkflowId, WorkflowRegistry,
 };
 use crate::{
     store::ChildStart,
@@ -125,8 +125,8 @@ struct ClaimedRow {
 }
 
 impl ClaimedRow {
-    fn workflow_id(&self) -> Result<WorkflowId, DurableError> {
-        WorkflowId::new(self.row.id)
+    fn workflow_id(&self) -> WorkflowId {
+        self.row.id
     }
 }
 
@@ -157,7 +157,7 @@ impl<C> std::fmt::Debug for WorkflowClaim<'_, C> {
 }
 
 impl<C> WorkflowClaim<'_, C> {
-    pub fn workflow_id(&self) -> Result<WorkflowId, DurableError> {
+    pub fn workflow_id(&self) -> WorkflowId {
         self.claimed.workflow_id()
     }
 
@@ -251,7 +251,7 @@ where
         let Some(claimed) = self.claim_row().await? else {
             return Ok(None);
         };
-        let workflow_id = claimed.workflow_id()?;
+        let workflow_id = claimed.workflow_id();
         if let Err(error) = self.activate_claimed(claimed).await {
             let Some(kind) = benign_activation_kind(&error) else {
                 return Err(error);
@@ -269,7 +269,7 @@ where
     }
 
     async fn activate_claimed(&self, claim: ClaimedRow) -> Result<WorkflowId, DurableError> {
-        let workflow_id = claim.workflow_id()?;
+        let workflow_id = claim.workflow_id();
         let lease_fingerprint = lease_fingerprint(&claim.lease_token);
         let span = tracing::info_span!(
             "durable.workflow.activation",
@@ -285,7 +285,7 @@ where
     }
 
     async fn activate_claim_inner(&self, claim: ClaimedRow) -> Result<WorkflowId, DurableError> {
-        let workflow_id = claim.workflow_id()?;
+        let workflow_id = claim.workflow_id();
         let mut connection = self.pool.get().await?;
         let event = persistence::next_delivery_event(
             &mut connection,
@@ -452,7 +452,7 @@ where
                         durable_workflow::lease_expires_at.assume_not_null(),
                         durable_workflow::id,
                     ))
-                    .load::<(i64, i64)>(connection)
+                    .load::<(i64, WorkflowId)>(connection)
                     .await?;
                 let Some(last_candidate) = page.last().copied() else {
                     break None;
@@ -501,13 +501,7 @@ where
                 .execute(connection)
                 .await?;
                 ensure_fenced(changed)?;
-                append_history(
-                    connection,
-                    WorkflowId::new(expired.id)?,
-                    "lease_recovered",
-                    now,
-                )
-                .await?;
+                append_history(connection, expired.id, "lease_recovered", now).await?;
                 crate::trace::touch_wf(expired.id);
             }
 
@@ -538,7 +532,7 @@ where
                 ))
                 .limit(32)
                 .select(durable_workflow::id)
-                .load::<i64>(connection)
+                .load::<WorkflowId>(connection)
                 .await?;
             let mut claimed_row = None;
             for candidate_id in candidate_ids {
@@ -615,7 +609,7 @@ where
     /// `CoordFenceMiss`: T-C2 or T-C3 lost its fence and rolled back.
     async fn record_fence_miss(
         &self,
-        (workflow_id, token): (i64, String),
+        (workflow_id, token): (WorkflowId, String),
         result: &Result<(), DurableError>,
     ) {
         if crate::trace::ENABLED && matches!(result, Err(DurableError::FencedWrite)) {
@@ -714,7 +708,7 @@ where
                 });
                 append_history(
                     connection,
-                    WorkflowId::new(current.id)?,
+                    current.id,
                     if exhausted {
                         "activation_exhausted"
                     } else {
@@ -749,7 +743,7 @@ async fn commit_on_connection<'tx>(
     transition: StoredTransition,
     config: CoordinatorConfig,
 ) -> Result<(), DurableError> {
-    let workflow_id = claim.workflow_id()?;
+    let workflow_id = claim.workflow_id();
     let delivered = event.delivery_sequence.ok_or_else(|| {
         DurableError::InvalidState("workflow received non-deliverable history".to_string())
     })?;
@@ -931,7 +925,7 @@ async fn commit_wait_transition<'tx>(
 ) -> Result<(), DurableError> {
     use crate::persistence::NewApprovalRow;
 
-    let workflow_id = claim.workflow_id()?;
+    let workflow_id = claim.workflow_id();
     let command = claim.row.command_sequence.saturating_add(1);
     match transition {
         WaitTransition::SleepUntil {
@@ -1000,7 +994,7 @@ async fn commit_wait_transition<'tx>(
                     durable_workflow::state_json.eq(state_json),
                     durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
                     durable_workflow::status.eq(WorkflowStatus::WaitingApproval),
-                    persistence::WaitColumns::on(Wait::Approval(ApprovalId::new(approval_id)?)),
+                    persistence::WaitColumns::on(Wait::Approval(approval_id)),
                     durable_workflow::command_sequence.eq(command),
                     durable_workflow::delivered_event_sequence.eq(delivered),
                     durable_workflow::consecutive_continuations.eq(0),
@@ -1097,7 +1091,7 @@ async fn commit_activity<'tx>(
             durable_workflow::state_json.eq(state_json),
             durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
             durable_workflow::status.eq(WorkflowStatus::WaitingActivity),
-            persistence::WaitColumns::on(Wait::Activity(ActivityId::new(activity_id)?)),
+            persistence::WaitColumns::on(Wait::Activity(activity_id)),
             durable_workflow::command_sequence.eq(command),
             durable_workflow::delivered_event_sequence.eq(delivered),
             durable_workflow::consecutive_continuations.eq(0),
@@ -1129,7 +1123,7 @@ async fn commit_activity<'tx>(
             }),
         )
     });
-    append_history(connection, claim.workflow_id()?, "activity_scheduled", now).await
+    append_history(connection, claim.workflow_id(), "activity_scheduled", now).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,7 +1160,7 @@ async fn commit_child<'tx>(
     // row lock when it rolls back: no second lock, no wait. For an ancestor's
     // key, only the ancestor's generations are locked; the caller's row is not
     // locked until the fenced update below, which this path never reaches.
-    let child_id = outcome.workflow_id()?;
+    let child_id = outcome.workflow_id();
     if !outcome.inserted() && is_caller_or_ancestor(connection, claim, child_id).await? {
         return Err(DurableError::InvalidDefinition(format!(
             "child key {deduplication_key} resolves to workflow {}, which is the caller or an ancestor",
@@ -1201,7 +1195,7 @@ async fn commit_child<'tx>(
     });
     append_history(
         connection,
-        claim.workflow_id()?,
+        claim.workflow_id(),
         "child_workflow_scheduled",
         now,
     )
@@ -1264,7 +1258,7 @@ async fn set_child_wait(
             durable_workflow::state_json.eq(state_json),
             durable_workflow::state_version.eq(claim.row.state_version.saturating_add(1)),
             durable_workflow::status.eq(WorkflowStatus::WaitingChild),
-            persistence::WaitColumns::on(Wait::Child(child.workflow_id()?)),
+            persistence::WaitColumns::on(Wait::Child(child.workflow_id())),
             durable_workflow::command_sequence.eq(command),
             durable_workflow::delivered_event_sequence.eq(delivered),
             durable_workflow::consecutive_continuations.eq(0),
@@ -1288,7 +1282,6 @@ async fn is_caller_or_ancestor(
     claim: &ClaimedRow,
     target: WorkflowId,
 ) -> Result<bool, DurableError> {
-    let target = target.get();
     let mut current = Some(claim.row.id);
     while let Some(id) = current {
         if id == target {
@@ -1300,7 +1293,7 @@ async fn is_caller_or_ancestor(
             durable_workflow::table
                 .find(id)
                 .select(durable_workflow::parent_workflow_id)
-                .first::<Option<i64>>(connection)
+                .first::<Option<WorkflowId>>(connection)
                 .await?
         };
     }
@@ -1317,7 +1310,7 @@ async fn append_history(
     persistence::append_event(
         connection,
         NewWorkflowEventRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             sequence,
             delivery_sequence: None,
             event_type: event_type.to_string(),
@@ -1355,8 +1348,8 @@ fn declare_unmodeled(name: &'static str) {
 /// Declares `TC1_Claim` when the claim recovered or claimed a workflow.
 /// `max_activation` is the activation cap T-C3 applies to the claimed row.
 fn declare_workflow_claim(
-    recovered: Option<i64>,
-    claimed: Option<(i64, &str, i64)>,
+    recovered: Option<WorkflowId>,
+    claimed: Option<(WorkflowId, &str, i64)>,
     max_activation: i32,
 ) {
     if recovered.is_none() && claimed.is_none() {

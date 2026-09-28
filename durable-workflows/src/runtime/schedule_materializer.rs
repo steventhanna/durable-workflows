@@ -14,8 +14,7 @@ use crate::{
     schema::{durable_schedule_run, durable_schedule_state, durable_workflow},
     tx::{self, Locked, Tx},
     DurableError, DurablePool, LocalTimeDisposition, MisfirePolicy, OverlapPolicy,
-    ScheduleCalendar, ScheduleOccurrence, ScheduleRegistry, ScheduleRunId,
-    ScheduleStateReconcileOutcome,
+    ScheduleCalendar, ScheduleOccurrence, ScheduleRegistry, ScheduleStateReconcileOutcome,
 };
 
 const MAX_DUE_OCCURRENCES_PER_TICK: usize = 10_000;
@@ -394,7 +393,7 @@ where
     .await?;
     match outcome {
         OccurrenceOutcome::Start => {
-            let schedule_run_id = ScheduleRunId::new(run_id)?;
+            let schedule_run_id = run_id;
             let workflow_id = target
                 .registry
                 .start_occurrence(
@@ -407,12 +406,12 @@ where
                 .await?;
             let changed = diesel::update(
                 durable_schedule_run::table
-                    .find(schedule_run_id.get())
+                    .find(schedule_run_id)
                     .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Materializing)),
             )
             .set((
                 durable_schedule_run::status.eq(ScheduleRunStatus::Started),
-                durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
+                durable_schedule_run::workflow_id.eq(Some(workflow_id)),
             ))
             .execute(connection)
             .await?;
@@ -480,7 +479,7 @@ where
         .select(ScheduleRunRow::as_select())
         .first::<ScheduleRunRow>(connection)
         .await?;
-    let schedule_run_id = ScheduleRunId::new(run.id)?;
+    let schedule_run_id = run.id;
     let workflow_id = registry
         .start_occurrence(
             schedule_key,
@@ -497,7 +496,7 @@ where
     )
     .set((
         durable_schedule_run::status.eq(ScheduleRunStatus::Started),
-        durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
+        durable_schedule_run::workflow_id.eq(Some(workflow_id)),
         durable_schedule_run::reason.eq(Some("queue_one_promoted".to_string())),
     ))
     .execute(connection)

@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use crate::{dialect::TransactionCallback, DurableConnection, DurablePool};
+use crate::{dialect::TransactionCallback, ActivityId, DurableConnection, DurablePool, WorkflowId};
 
 pub(crate) const ENABLED: bool = false;
 
@@ -37,16 +37,16 @@ pub(crate) fn declare(_action: impl FnOnce() -> Action) {}
 pub(crate) fn actor(_name: &str) {}
 
 #[inline(always)]
-pub(crate) fn touch_wf(_id: i64) {}
+pub(crate) fn touch_wf(_id: WorkflowId) {}
 
 #[inline(always)]
-pub(crate) fn touch_act(_id: i64) {}
+pub(crate) fn touch_act(_id: ActivityId) {}
 
 #[inline(always)]
-pub(crate) fn touch_att(_activity_id: i64, _attempt_number: i32) {}
+pub(crate) fn touch_att(_activity_id: ActivityId, _attempt_number: i32) {}
 
 #[inline(always)]
-pub(crate) fn touch_event(_workflow_id: i64, _delivery_sequence: i32, _event_type: &str) {}
+pub(crate) fn touch_event(_workflow_id: WorkflowId, _delivery_sequence: i32, _event_type: &str) {}
 
 #[inline(always)]
 pub(crate) fn note(_key: &str, _value: impl FnOnce() -> Value) {}

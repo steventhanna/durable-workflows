@@ -427,11 +427,11 @@ where
                 durable_workflow::kind,
                 durable_workflow::version,
             ))
-            .load::<(i64, String, i32)>(&mut connection)
+            .load::<(WorkflowId, String, i32)>(&mut connection)
             .await?;
         for (id, kind, version) in exhausted {
             alerts.push(HealthAlert::ActivationExhausted {
-                workflow_id: WorkflowId::new(id)?,
+                workflow_id: id,
                 kind,
                 version,
             });
@@ -448,7 +448,14 @@ where
                 durable_activity::version,
                 durable_activity::topic,
             ))
-            .load::<(i64, Option<i64>, i64, String, i32, String)>(&mut connection)
+            .load::<(
+                ActivityId,
+                Option<ActivityId>,
+                WorkflowId,
+                String,
+                i32,
+                String,
+            )>(&mut connection)
             .await?;
 
         // A dead-lettered activity may already have a resolved successor via the
@@ -457,11 +464,11 @@ where
         // own `status` column never changes once dead-lettered, so we must check the
         // chain here rather than trust `status` alone, or every scan re-alerts on
         // issues that were already fixed by a successful retry.
-        let candidate_roots: Vec<i64> = dead_letters
+        let candidate_roots: Vec<ActivityId> = dead_letters
             .iter()
             .map(|(id, root_activity_id, ..)| root_activity_id.unwrap_or(*id))
             .collect();
-        let resolved_roots: std::collections::HashSet<i64> = if candidate_roots.is_empty() {
+        let resolved_roots: std::collections::HashSet<ActivityId> = if candidate_roots.is_empty() {
             std::collections::HashSet::new()
         } else {
             durable_activity::table
@@ -472,7 +479,7 @@ where
                         .or(durable_activity::id.eq_any(&candidate_roots)),
                 )
                 .select((durable_activity::id, durable_activity::root_activity_id))
-                .load::<(i64, Option<i64>)>(&mut connection)
+                .load::<(ActivityId, Option<ActivityId>)>(&mut connection)
                 .await?
                 .into_iter()
                 .map(|(id, root_activity_id)| root_activity_id.unwrap_or(id))
@@ -490,8 +497,8 @@ where
             }
             unresolved += 1;
             alerts.push(HealthAlert::ActivityDeadLettered {
-                activity_id: ActivityId::new(id)?,
-                workflow_id: WorkflowId::new(workflow_id)?,
+                activity_id: id,
+                workflow_id,
                 kind,
                 version,
                 topic,
@@ -512,11 +519,11 @@ where
                 durable_workflow::kind,
                 durable_workflow::version,
             ))
-            .load::<(i64, String, i32)>(&mut connection)
+            .load::<(WorkflowId, String, i32)>(&mut connection)
             .await?;
         for (id, kind, version) in stale_workflows {
             alerts.push(HealthAlert::StaleWorkflow {
-                workflow_id: WorkflowId::new(id)?,
+                workflow_id: id,
                 kind,
                 version,
             });
@@ -538,12 +545,12 @@ where
                 durable_activity::version,
                 durable_activity::topic,
             ))
-            .load::<(i64, i64, String, i32, String)>(&mut connection)
+            .load::<(ActivityId, WorkflowId, String, i32, String)>(&mut connection)
             .await?;
         for (id, workflow_id, kind, version, topic) in stale_activities {
             alerts.push(HealthAlert::StaleActivity {
-                activity_id: ActivityId::new(id)?,
-                workflow_id: WorkflowId::new(workflow_id)?,
+                activity_id: id,
+                workflow_id,
                 kind,
                 version,
                 topic,

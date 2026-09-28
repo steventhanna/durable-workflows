@@ -38,7 +38,7 @@ mod postgres;
 pub(crate) use postgres::*;
 
 pub(crate) enum WorkflowInsert {
-    Inserted(i64),
+    Inserted(crate::WorkflowId),
     DeduplicationConflict,
 }
 

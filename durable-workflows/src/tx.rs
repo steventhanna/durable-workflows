@@ -66,7 +66,7 @@ use diesel_async::{
     AsyncConnection, RunQueryDsl,
 };
 
-use crate::{dialect::TransactionCallback, Db, DurableConnection, DurableError};
+use crate::{dialect::TransactionCallback, Db, DurableConnection, DurableError, WorkflowId};
 
 /// Brand of one transaction callback. Invariant in `'tx`, `Copy`, no public
 /// constructor: it exists only inside the callback that [`enter`] runs.
@@ -160,23 +160,23 @@ impl<'tx, 'a, Row> Locked<'tx, &'a Row> {
 /// inserted under (N4): the claim fence on the coordinator's path, the whole
 /// row on an operator's.
 pub(crate) trait CommandParent {
-    fn workflow_id(&self) -> i64;
+    fn workflow_id(&self) -> WorkflowId;
 }
 
 /// The claimed workflow row, locked under its lease fence (T-C2, N4).
 #[derive(diesel::Queryable)]
 pub(crate) struct ClaimFence {
-    workflow_id: i64,
+    workflow_id: WorkflowId,
 }
 
 impl CommandParent for ClaimFence {
-    fn workflow_id(&self) -> i64 {
+    fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 }
 
 impl CommandParent for crate::persistence::WorkflowRow {
-    fn workflow_id(&self) -> i64 {
+    fn workflow_id(&self) -> WorkflowId {
         self.id
     }
 }

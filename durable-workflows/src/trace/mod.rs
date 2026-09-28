@@ -23,7 +23,7 @@ use crate::{
     schema::{
         durable_activity, durable_activity_attempt, durable_workflow, durable_workflow_event,
     },
-    DurableConnection, DurablePool,
+    ActivityId, DurableConnection, DurablePool, WorkflowId,
 };
 
 pub(crate) const ENABLED: bool = true;
@@ -266,10 +266,10 @@ struct Scope {
     declared: Vec<Action>,
     now_sampled: Option<i64>,
     notes: Map<String, Value>,
-    workflows: BTreeSet<i64>,
-    activities: BTreeSet<i64>,
-    attempts: BTreeSet<(i64, i32)>,
-    events: BTreeMap<(i64, i32), String>,
+    workflows: BTreeSet<WorkflowId>,
+    activities: BTreeSet<ActivityId>,
+    attempts: BTreeSet<(ActivityId, i32)>,
+    events: BTreeMap<(WorkflowId, i32), String>,
     rollback: Option<Action>,
 }
 
@@ -400,26 +400,26 @@ pub(crate) fn actor(name: &str) {
     touch("an actor", |scope| scope.actor = Some(name.to_string()));
 }
 
-pub(crate) fn touch_wf(id: i64) {
+pub(crate) fn touch_wf(id: WorkflowId) {
     touch("a workflow", |scope| {
         scope.workflows.insert(id);
     });
 }
 
-pub(crate) fn touch_act(id: i64) {
+pub(crate) fn touch_act(id: ActivityId) {
     touch("an activity", |scope| {
         scope.activities.insert(id);
     });
 }
 
-pub(crate) fn touch_att(activity_id: i64, attempt_number: i32) {
+pub(crate) fn touch_att(activity_id: ActivityId, attempt_number: i32) {
     touch("an attempt", |scope| {
         scope.attempts.insert((activity_id, attempt_number));
     });
 }
 
 /// Deliverable events only; history rows are not part of the model.
-pub(crate) fn touch_event(workflow_id: i64, delivery_sequence: i32, event_type: &str) {
+pub(crate) fn touch_event(workflow_id: WorkflowId, delivery_sequence: i32, event_type: &str) {
     touch("an event", |scope| {
         scope
             .events

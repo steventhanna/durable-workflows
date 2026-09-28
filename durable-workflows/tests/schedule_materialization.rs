@@ -283,7 +283,9 @@ async fn run_latest_records_backlog_starts_one_and_is_multi_instance_exactly_onc
     let workflow_schedule_run = durable_workflow::table
         .filter(durable_workflow::schedule_run_id.eq(Some(started.id)))
         .select(durable_workflow::schedule_run_id)
-        .first::<Option<i64>>(&mut pool.get().await.expect("connection"))
+        .first::<Option<durable_workflows::ScheduleRunId>>(
+            &mut pool.get().await.expect("connection"),
+        )
         .await
         .expect("scheduled workflow");
     assert_eq!(workflow_schedule_run, Some(started.id));

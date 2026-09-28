@@ -10,7 +10,7 @@ pub async fn find_activity_by_id(
     activity_id: ActivityId,
 ) -> Result<ActivityRow, DurableError> {
     Ok(durable_activity::table
-        .find(activity_id.get())
+        .find(activity_id)
         .select(ActivityRow::as_select())
         .first(connection)
         .await?)

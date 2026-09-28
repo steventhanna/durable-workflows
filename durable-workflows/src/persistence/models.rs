@@ -3,6 +3,8 @@ use super::{
 };
 use diesel::{AsChangeset, Insertable, Queryable, Selectable};
 
+use crate::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
+
 use crate::schema::{
     durable_activity, durable_activity_attempt, durable_approval, durable_progress_event,
     durable_schedule_run, durable_schedule_state, durable_topic_lock, durable_workflow,
@@ -13,7 +15,7 @@ use crate::schema::{
 #[diesel(table_name = durable_workflow)]
 #[diesel(check_for_backend(crate::Db))]
 pub struct WorkflowRow {
-    pub id: i64,
+    pub id: WorkflowId,
     pub kind: String,
     pub version: i32,
     pub input_json: String,
@@ -33,10 +35,10 @@ pub struct WorkflowRow {
     pub lease_token: Option<String>,
     pub lease_expires_at: Option<i64>,
     pub deduplication_key: Option<String>,
-    pub schedule_run_id: Option<i64>,
-    pub root_workflow_id: Option<i64>,
-    pub restarted_from_workflow_id: Option<i64>,
-    pub parent_workflow_id: Option<i64>,
+    pub schedule_run_id: Option<ScheduleRunId>,
+    pub root_workflow_id: Option<WorkflowId>,
+    pub restarted_from_workflow_id: Option<WorkflowId>,
+    pub parent_workflow_id: Option<WorkflowId>,
     pub parent_command_sequence: Option<i32>,
     pub command_sequence: i32,
     pub delivered_event_sequence: i32,
@@ -50,7 +52,7 @@ pub struct WorkflowRow {
 #[diesel(check_for_backend(crate::Db))]
 pub struct WorkflowEventRow {
     pub id: i64,
-    pub workflow_id: i64,
+    pub workflow_id: WorkflowId,
     pub sequence: i32,
     pub delivery_sequence: Option<i32>,
     pub event_type: String,
@@ -65,8 +67,8 @@ pub struct WorkflowEventRow {
 #[diesel(table_name = durable_activity)]
 #[diesel(check_for_backend(crate::Db))]
 pub struct ActivityRow {
-    pub id: i64,
-    pub workflow_id: i64,
+    pub id: ActivityId,
+    pub workflow_id: WorkflowId,
     pub command_sequence: i32,
     pub replacement_number: i32,
     pub kind: String,
@@ -87,8 +89,8 @@ pub struct ActivityRow {
     pub lease_owner: Option<String>,
     pub lease_token: Option<String>,
     pub lease_expires_at: Option<i64>,
-    pub root_activity_id: Option<i64>,
-    pub replaces_activity_id: Option<i64>,
+    pub root_activity_id: Option<ActivityId>,
+    pub replaces_activity_id: Option<ActivityId>,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
@@ -98,7 +100,7 @@ pub struct ActivityRow {
 #[diesel(table_name = durable_activity_attempt)]
 #[diesel(check_for_backend(crate::Db))]
 pub struct ActivityAttemptRow {
-    pub activity_id: i64,
+    pub activity_id: ActivityId,
     pub attempt_number: i32,
     pub worker_id: String,
     pub lease_token: String,
@@ -115,7 +117,7 @@ pub struct ActivityAttemptRow {
 #[diesel(table_name = durable_progress_event)]
 #[diesel(check_for_backend(crate::Db))]
 pub struct ProgressEventRow {
-    pub activity_id: i64,
+    pub activity_id: ActivityId,
     pub attempt_number: i32,
     pub sequence: i32,
     pub code: String,
@@ -132,8 +134,8 @@ pub struct ProgressEventRow {
 #[diesel(table_name = durable_approval)]
 #[diesel(check_for_backend(crate::Db))]
 pub struct ApprovalRow {
-    pub id: i64,
-    pub workflow_id: i64,
+    pub id: ApprovalId,
+    pub workflow_id: WorkflowId,
     pub command_sequence: i32,
     pub kind: String,
     pub version: i32,
@@ -170,7 +172,7 @@ pub struct ScheduleStateRow {
 #[diesel(table_name = durable_schedule_run)]
 #[diesel(check_for_backend(crate::Db))]
 pub struct ScheduleRunRow {
-    pub id: i64,
+    pub id: ScheduleRunId,
     pub schedule_key: String,
     pub local_occurrence: String,
     pub scheduled_for: i64,
@@ -178,7 +180,7 @@ pub struct ScheduleRunRow {
     pub status: ScheduleRunStatus,
     pub reason: Option<String>,
     pub actor_id: Option<i32>,
-    pub workflow_id: Option<i64>,
+    pub workflow_id: Option<WorkflowId>,
     pub created_at: i64,
 }
 
@@ -213,10 +215,10 @@ pub struct NewWorkflowRow {
     pub lease_token: Option<String>,
     pub lease_expires_at: Option<i64>,
     pub deduplication_key: Option<String>,
-    pub schedule_run_id: Option<i64>,
-    pub root_workflow_id: Option<i64>,
-    pub restarted_from_workflow_id: Option<i64>,
-    pub parent_workflow_id: Option<i64>,
+    pub schedule_run_id: Option<ScheduleRunId>,
+    pub root_workflow_id: Option<WorkflowId>,
+    pub restarted_from_workflow_id: Option<WorkflowId>,
+    pub parent_workflow_id: Option<WorkflowId>,
     pub parent_command_sequence: Option<i32>,
     pub command_sequence: i32,
     pub delivered_event_sequence: i32,
@@ -228,7 +230,7 @@ pub struct NewWorkflowRow {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = durable_workflow_event)]
 pub struct NewWorkflowEventRow {
-    pub workflow_id: i64,
+    pub workflow_id: WorkflowId,
     pub sequence: i32,
     pub delivery_sequence: Option<i32>,
     pub event_type: String,
@@ -242,7 +244,7 @@ pub struct NewWorkflowEventRow {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = durable_activity)]
 pub struct NewActivityRow {
-    pub workflow_id: i64,
+    pub workflow_id: WorkflowId,
     pub command_sequence: i32,
     pub replacement_number: i32,
     pub kind: String,
@@ -263,8 +265,8 @@ pub struct NewActivityRow {
     pub lease_owner: Option<String>,
     pub lease_token: Option<String>,
     pub lease_expires_at: Option<i64>,
-    pub root_activity_id: Option<i64>,
-    pub replaces_activity_id: Option<i64>,
+    pub root_activity_id: Option<ActivityId>,
+    pub replaces_activity_id: Option<ActivityId>,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
@@ -273,7 +275,7 @@ pub struct NewActivityRow {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = durable_activity_attempt)]
 pub struct NewActivityAttemptRow {
-    pub activity_id: i64,
+    pub activity_id: ActivityId,
     pub attempt_number: i32,
     pub worker_id: String,
     pub lease_token: String,
@@ -289,7 +291,7 @@ pub struct NewActivityAttemptRow {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = durable_progress_event)]
 pub struct NewProgressEventRow {
-    pub activity_id: i64,
+    pub activity_id: ActivityId,
     pub attempt_number: i32,
     pub sequence: i32,
     pub code: String,
@@ -305,7 +307,7 @@ pub struct NewProgressEventRow {
 #[derive(Debug, Insertable)]
 #[diesel(table_name = durable_approval)]
 pub struct NewApprovalRow {
-    pub workflow_id: i64,
+    pub workflow_id: WorkflowId,
     pub command_sequence: i32,
     pub kind: String,
     pub version: i32,
@@ -347,7 +349,7 @@ pub struct NewScheduleRunRow {
     pub status: ScheduleRunStatus,
     pub reason: Option<String>,
     pub actor_id: Option<i32>,
-    pub workflow_id: Option<i64>,
+    pub workflow_id: Option<WorkflowId>,
     pub created_at: i64,
 }
 

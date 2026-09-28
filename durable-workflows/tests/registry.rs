@@ -387,7 +387,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
     let workflow_id = durable_workflow::table
         .filter(durable_workflow::deduplication_key.eq("active"))
         .select(durable_workflow::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::WorkflowId>(&mut connection)
         .await
         .expect("active workflow exists");
 
@@ -446,7 +446,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
     let historical_activity_id = durable_activity::table
         .filter(durable_activity::version.eq(99))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("historical activity");
     diesel::update(durable_activity::table.find(historical_activity_id))
@@ -458,7 +458,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
         .set((
             durable_workflow::status.eq("blocked"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(historical_activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(historical_activity_id.get())),
         ))
         .execute(&mut connection)
         .await

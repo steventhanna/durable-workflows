@@ -20,7 +20,8 @@ use crate::{
         durable_activity, durable_activity_attempt, durable_approval, durable_schedule_run,
         durable_schedule_state, durable_topic_lock, durable_workflow,
     },
-    ApprovalId, DurableError, ScheduleRunId, TopicDefinition, TopicRegistry, WorkflowId,
+    ActivityId, ApprovalId, DurableError, ScheduleRunId, TopicDefinition, TopicRegistry,
+    WorkflowId,
 };
 
 use super::cursor::scoped_cursor_scope;
@@ -41,7 +42,7 @@ diesel::define_sql_function! {
 
 #[derive(diesel::Queryable)]
 struct ScheduleRunProjection {
-    id: i64,
+    id: ScheduleRunId,
     schedule_key: String,
     local_occurrence: String,
     scheduled_for: i64,
@@ -49,7 +50,7 @@ struct ScheduleRunProjection {
     status: ScheduleRunStatus,
     reason: Option<String>,
     actor_id: Option<i32>,
-    workflow_id: Option<i64>,
+    workflow_id: Option<WorkflowId>,
     created_at: i64,
     workflow_status: Option<WorkflowStatus>,
     workflow_completed_at: Option<i64>,
@@ -57,8 +58,8 @@ struct ScheduleRunProjection {
 
 #[derive(diesel::Queryable)]
 struct ApprovalListProjection {
-    id: i64,
-    workflow_id: i64,
+    id: ApprovalId,
+    workflow_id: WorkflowId,
     kind: String,
     version: i32,
     status: ApprovalStatus,
@@ -174,7 +175,7 @@ impl AdminQueryService {
                 durable_activity::id,
                 durable_activity::root_activity_id,
             ))
-            .load::<(String, i64, Option<i64>)>(&mut connection)
+            .load::<(String, ActivityId, Option<ActivityId>)>(&mut connection)
             .await?;
         let dead_letter_rows = if dead_letter_candidates.is_empty() {
             Vec::new()
@@ -209,7 +210,10 @@ impl AdminQueryService {
             .filter(durable_activity::status.eq(ActivityStatus::Pending))
             .filter(durable_activity::available_at.le(now))
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+            .filter(
+                durable_workflow::wait_reference_id
+                    .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+            )
             .group_by(durable_activity::topic)
             .select((
                 durable_activity::topic,
@@ -232,7 +236,10 @@ impl AdminQueryService {
             .filter(durable_activity::available_at.gt(now))
             .filter(durable_activity::attempt_count.gt(0))
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+            .filter(
+                durable_workflow::wait_reference_id
+                    .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+            )
             .group_by(durable_activity::topic)
             .select((durable_activity::topic, count_star()))
             .load::<(String, i64)>(&mut connection)
@@ -561,7 +568,7 @@ impl AdminQueryService {
                 durable_schedule_run::scheduled_for.lt(timestamp).or(
                     durable_schedule_run::scheduled_for
                         .eq(timestamp)
-                        .and(durable_schedule_run::id.lt(id)),
+                        .and(crate::ids::untyped_id(durable_schedule_run::id).lt(id)),
                 ),
             );
         }
@@ -652,7 +659,7 @@ impl AdminQueryService {
             .transpose()?;
         let mut query = durable_approval::table.into_boxed::<crate::Db>();
         if let Some(workflow_id) = filter.workflow_id {
-            query = query.filter(durable_approval::workflow_id.eq(workflow_id.get()));
+            query = query.filter(durable_approval::workflow_id.eq(workflow_id));
         }
         if let Some(kind) = filter.kind {
             query = query.filter(durable_approval::kind.eq(kind));
@@ -695,7 +702,7 @@ impl AdminQueryService {
                     .lt(timestamp)
                     .or(durable_approval::requested_at
                         .eq(timestamp)
-                        .and(durable_approval::id.lt(id))),
+                        .and(crate::ids::untyped_id(durable_approval::id).lt(id))),
             );
         }
         let mut connection = self.pool.get().await?;
@@ -765,7 +772,7 @@ fn schedule_state_summary(row: &ScheduleStateRow) -> ScheduleStateSummary {
 
 fn schedule_run_summary(row: ScheduleRunProjection) -> Result<ScheduleRunSummary, DurableError> {
     Ok(ScheduleRunSummary {
-        id: ScheduleRunId::new(row.id)?,
+        id: row.id,
         schedule_key: row.schedule_key,
         local_occurrence: row.local_occurrence,
         scheduled_for: row.scheduled_for,
@@ -773,7 +780,7 @@ fn schedule_run_summary(row: ScheduleRunProjection) -> Result<ScheduleRunSummary
         status: row.status.to_string(),
         reason: row.reason,
         actor_id: row.actor_id,
-        workflow_id: row.workflow_id.map(WorkflowId::new).transpose()?,
+        workflow_id: row.workflow_id,
         workflow_status: row.workflow_status.map(|status| status.to_string()),
         workflow_completed_at: row.workflow_completed_at,
         created_at: row.created_at,
@@ -792,8 +799,8 @@ fn approval_summary(
         row.status
     };
     Ok(ApprovalSummary {
-        id: ApprovalId::new(row.id)?,
-        workflow_id: WorkflowId::new(row.workflow_id)?,
+        id: row.id,
+        workflow_id: row.workflow_id,
         kind: row.kind,
         version: row.version,
         status: status.to_string(),
@@ -886,8 +893,8 @@ fn hour_bucket_bounds(window: HourlyWindow, index: usize) -> (i64, i64) {
 
 async fn load_resolved_activity_roots<C>(
     connection: &mut C,
-    candidate_roots: &[i64],
-) -> Result<HashSet<i64>, DurableError>
+    candidate_roots: &[ActivityId],
+) -> Result<HashSet<ActivityId>, DurableError>
 where
     C: AsyncConnection<Backend = crate::Db> + Send,
 {
@@ -902,7 +909,7 @@ where
                         .or(durable_activity::id.eq_any(chunk)),
                 )
                 .select((durable_activity::id, durable_activity::root_activity_id))
-                .load::<(i64, Option<i64>)>(connection)
+                .load::<(ActivityId, Option<ActivityId>)>(connection)
                 .await?
                 .into_iter()
                 .map(|(id, root_activity_id)| root_activity_id.unwrap_or(id)),

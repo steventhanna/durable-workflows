@@ -29,7 +29,7 @@ async fn timeout_awaits_bounded_cleanup_and_never_commits_handler_success() {
             .await
             .expect("timeout cleanup is bounded")
             .expect("timeout outcome persisted");
-        assert_eq!(result.expect("claimed activity").get(), activity_id);
+        assert_eq!(result.expect("claimed activity"), activity_id);
         assert_eq!(
             AtomicBool::load(&context.cleaned, Ordering::SeqCst),
             !linger,
@@ -177,8 +177,7 @@ async fn timeout_cleanup_renews_lease_until_handler_finishes_before_allowing_ret
     assert_eq!(
         result
             .expect("timeout persisted")
-            .expect("claimed activity")
-            .get(),
+            .expect("claimed activity"),
         activity_id
     );
     assert!(AtomicBool::load(&context.cleaned, Ordering::SeqCst));
@@ -208,7 +207,7 @@ async fn timeout_cleanup_renews_lease_until_handler_finishes_before_allowing_ret
     })
     .await
     .expect("retry becomes available after cleanup and its configured delay");
-    assert_eq!(retry.activity_id().expect("retry id").get(), activity_id);
+    assert_eq!(retry.activity_id(), activity_id);
     assert_eq!(retry.attempt_number().expect("retry attempt"), 2);
 }
 
@@ -442,7 +441,7 @@ async fn timed_out_handler_holding_the_activity_row_lock_does_not_block_its_fini
         .expect("finish must not wait on the abandoned handler's row lock")
         .expect("worker join")
         .expect("timeout outcome persisted");
-    assert_eq!(result.expect("claimed activity").get(), activity_id);
+    assert_eq!(result.expect("claimed activity"), activity_id);
     let mut connection = pool.get().await.expect("connection");
     let row = durable_activity::table
         .find(activity_id)

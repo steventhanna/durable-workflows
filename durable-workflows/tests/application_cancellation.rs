@@ -125,13 +125,12 @@ async fn schedule_activity(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let workflow_id = DurableStore::new(pool.clone())
         .start(&HostWorkflow, StartOptions::default())
         .await
         .expect("workflow start")
-        .workflow_id
-        .get();
+        .workflow_id;
     let now = support::db_now(pool).await;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_activity::table)
@@ -172,14 +171,14 @@ async fn schedule_activity(
     let activity_id = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity id");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -248,13 +247,11 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
     use durable_workflows::{
         persistence::ActivityAttemptRow,
         schema::{durable_activity_attempt, durable_workflow_event},
-        WorkflowId,
     };
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
     let (workflow_id, activity_id) = schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
-    let workflow_id = WorkflowId::new(workflow_id).expect("workflow id");
     let (_, next_activity_id) = schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
     let worker = worker(pool.clone(), Arc::new(CleanupContext::default()));
     let claim = worker
@@ -262,7 +259,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         .await
         .expect("claim")
         .expect("old claim");
-    assert_eq!(claim.activity_id().expect("activity id").get(), activity_id);
+    assert_eq!(claim.activity_id(), activity_id);
     assert!(worker
         .claim_one("capture")
         .await
@@ -328,7 +325,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         Some("application_cancelled")
     );
     let events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq("workflow_cancelled"))
         .select((
             durable_workflow_event::actor_type,
@@ -347,7 +344,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         )]
     );
     let status = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(durable_workflow::status)
         .first::<durable_workflows::persistence::WorkflowStatus>(&mut connection)
         .await
@@ -384,10 +381,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         .await
         .expect("next claim")
         .expect("released capacity");
-    assert_eq!(
-        next_claim.activity_id().expect("next id").get(),
-        next_activity_id
-    );
+    assert_eq!(next_claim.activity_id(), next_activity_id);
     let mut connection = pool.get().await.expect("connection");
     let attempt = durable_activity_attempt::table
         .find((activity_id, 1))
@@ -412,13 +406,9 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
     let (pending_workflow, pending_activity) =
         schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
     let mut connection = pool.get().await.expect("connection");
-    DurableStore::cancel_with_conn(
-        &mut connection,
-        WorkflowId::new(pending_workflow).expect("pending workflow"),
-        "stopped before dispatch",
-    )
-    .await
-    .expect("cancel pending");
+    DurableStore::cancel_with_conn(&mut connection, pending_workflow, "stopped before dispatch")
+        .await
+        .expect("cancel pending");
     let pending = durable_activity::table
         .find(pending_activity)
         .select(ActivityRow::as_select())
@@ -437,7 +427,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
             .expect("start")
             .workflow_id;
         let mut connection = pool.get().await.expect("connection");
-        diesel::update(durable_workflow::table.find(id.get()))
+        diesel::update(durable_workflow::table.find(id))
             .set(durable_workflow::status.eq(status))
             .execute(&mut connection)
             .await
@@ -449,7 +439,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
             .await
             .expect("cancel status");
         let actual = durable_workflow::table
-            .find(id.get())
+            .find(id)
             .select(durable_workflow::status)
             .first::<durable_workflows::persistence::WorkflowStatus>(&mut connection)
             .await

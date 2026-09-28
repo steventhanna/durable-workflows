@@ -120,8 +120,7 @@ impl ActivityHandler for RuntimeActivity {
                     .ok_or_else(|| ActivityError::permanent("test", "missing pool"))?;
                 let activity_id = context
                     .activity_id()
-                    .ok_or_else(|| ActivityError::permanent("test", "missing activity id"))?
-                    .get();
+                    .ok_or_else(|| ActivityError::permanent("test", "missing activity id"))?;
                 let application = context.application();
                 let mut connection = pool
                     .get()
@@ -289,7 +288,7 @@ async fn schedule_activity(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     schedule_activity_payload(
         pool,
         RuntimeActivity::KIND,
@@ -306,7 +305,7 @@ async fn schedule_activity(
 async fn schedule_continuation_activity(
     pool: &durable_workflows::DurablePool,
     behavior: ContinuationBehavior,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let activity = RuntimeContinuationActivity { behavior };
     schedule_activity_payload(
         pool,
@@ -331,13 +330,12 @@ async fn schedule_activity_payload(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let workflow_id = DurableStore::new(pool.clone())
         .start(&RuntimeWorkflow, StartOptions::default())
         .await
         .expect("workflow start")
-        .workflow_id
-        .get();
+        .workflow_id;
     let mut connection = pool.get().await.expect("test connection");
     // Claims compare `available_at` with the database clock; a host stamp ahead of it
     // would hide the row from the first dispatcher sweep.
@@ -381,14 +379,14 @@ async fn schedule_activity_payload(
     let activity_id = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity id");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -401,7 +399,7 @@ async fn schedule_activity_payload(
 /// Sets the activity's `available_at` to the database clock plus `delay`.
 async fn set_activity_available_in(
     pool: &durable_workflows::DurablePool,
-    activity_id: i64,
+    activity_id: durable_workflows::ActivityId,
     delay: Duration,
 ) {
     let mut connection = pool.get().await.expect("test connection");
@@ -418,7 +416,7 @@ async fn set_activity_available_in(
 
 async fn wait_for_activity_status(
     pool: &durable_workflows::DurablePool,
-    activity_id: i64,
+    activity_id: durable_workflows::ActivityId,
     expected: &str,
 ) -> ActivityRow {
     for _ in 0..400 {
@@ -575,7 +573,7 @@ async fn readiness_fails_before_any_claim_when_a_live_version_is_unregistered() 
 
     let mut connection = pool.get().await.expect("test connection");
     let lease = durable_workflow::table
-        .find(outcome.workflow_id.get())
+        .find(outcome.workflow_id)
         .select((durable_workflow::status, durable_workflow::lease_token))
         .first::<(String, Option<String>)>(&mut connection)
         .await
@@ -807,7 +805,7 @@ async fn readiness_failure_happens_before_any_workflow_claim() {
     ));
     let mut connection = pool.get().await.expect("test connection");
     let status = durable_workflow::table
-        .find(started.workflow_id.get())
+        .find(started.workflow_id)
         .select(durable_workflow::status)
         .first::<String>(&mut connection)
         .await
@@ -835,7 +833,7 @@ async fn cancellation_prevents_new_claims() {
 
     let mut connection = pool.get().await.expect("test connection");
     let status = durable_workflow::table
-        .find(started.workflow_id.get())
+        .find(started.workflow_id)
         .select(durable_workflow::status)
         .first::<String>(&mut connection)
         .await

@@ -45,7 +45,13 @@ system can make the violation fail to compile. In order of preference:
    `tx::Locked<'tx, Row>` row-lock witness: `insert_activity` takes the
    `Locked<ClaimFence>` that `lock_fence` returns, N4; `commit_child`'s parent
    update takes the `ChildStart` whose `Existing` arm is the locked child,
-   G9), an exhaustive `match` that forces every new variant to be decided.
+   G9), a SQL type per id column (each id column in `schema.rs` has its own
+   type from `ids::sql_types`, and only the matching id newtype is
+   `AsExpression`/`FromSql` for it, so comparing `durable_workflow::id`
+   with an `ActivityId` is E0277: `id_swapped_in_query` compile-fail case;
+   `wait_reference_id` stays `BigInt` and is compared through
+   `ids::untyped_id`), an exhaustive `match` that forces every new variant
+   to be decided.
 3. **Checked at the boundary.** A constructor or parser that returns `Result`
    (e.g. `RetryPolicy::fixed`), or a transition that does
    (`ScheduleCursor::advance_to` rejects a cursor that does not move forward
@@ -119,7 +125,9 @@ type system cannot express the rule.
   time (`tokio::time::Instant`) is only for local deadlines, timeouts and
   sleeps. Keep the two in different types.
 - Ids crossing a function boundary use the id newtypes in `src/ids.rs`, not
-  `i64`.
+  `i64`. A new id column in `schema.rs` uses its id's SQL type, not
+  `BigInt`; the id's `FromSql` checks positivity through `Id::new`, so a
+  stored id that is not positive is a decode error, never a panic.
 - `#[doc(hidden)] pub` escape hatches (such as `RetryPolicy::from_checked`)
   exist only for the derive macros, which must validate the same bounds at
   expansion time. Make the hatch a `const fn` that checks the bounds too

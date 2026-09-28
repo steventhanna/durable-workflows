@@ -112,7 +112,7 @@ async fn start_workflow(pool: &durable_workflows::DurablePool) -> WorkflowId {
 
 async fn seed_timer(pool: &durable_workflows::DurablePool, now: i64) -> WorkflowId {
     let workflow_id = start_workflow(pool).await;
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
@@ -132,7 +132,7 @@ async fn seed_expired_approval(pool: &durable_workflows::DurablePool, now: i64) 
     let mut connection = pool.get().await.expect("approval connection");
     diesel::insert_into(durable_approval::table)
         .values(NewApprovalRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             command_sequence: 1,
             kind: TemporalRuntimeWorkflow::KIND.to_string(),
             version: TemporalRuntimeWorkflow::VERSION,
@@ -151,16 +151,16 @@ async fn seed_expired_approval(pool: &durable_workflows::DurablePool, now: i64) 
         .await
         .expect("approval insert");
     let approval_id = durable_approval::table
-        .filter(durable_approval::workflow_id.eq(workflow_id.get()))
+        .filter(durable_approval::workflow_id.eq(workflow_id))
         .select(durable_approval::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ApprovalId>(&mut connection)
         .await
         .expect("approval id");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_approval"),
             durable_workflow::wait_kind.eq(Some("approval".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(approval_id)),
+            durable_workflow::wait_reference_id.eq(Some(approval_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -176,7 +176,7 @@ async fn event_count(
     event_type: &str,
 ) -> i64 {
     durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq(event_type))
         .count()
         .get_result(&mut pool.get().await.expect("event connection"))

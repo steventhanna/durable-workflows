@@ -290,13 +290,12 @@ async fn schedule_activity(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let workflow_id = DurableStore::new(pool.clone())
         .start(&HostWorkflow, StartOptions::default())
         .await
         .expect("workflow start")
-        .workflow_id
-        .get();
+        .workflow_id;
     let mut connection = pool.get().await.expect("test connection");
     // Claims compare `available_at` with the database clock; a host stamp ahead of it
     // would hide the row from the first claim.
@@ -340,14 +339,14 @@ async fn schedule_activity(
     let activity_id = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity id");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -442,10 +441,7 @@ async fn two_workers_claim_distinct_rows_up_to_the_global_topic_limit() {
     let (left, right) = tokio::join!(first.claim_one("other"), second.claim_one("other"));
     let left = left.expect("first claim").expect("first activity");
     let right = right.expect("second claim").expect("second activity");
-    assert_ne!(
-        left.activity_id().expect("first id"),
-        right.activity_id().expect("second id")
-    );
+    assert_ne!(left.activity_id(), right.activity_id());
     assert!(third
         .claim_one("other")
         .await
@@ -490,7 +486,7 @@ async fn old_worker_skips_activity_versions_it_cannot_execute() {
         .await
         .expect("old claim")
         .expect("locally executable activity");
-    assert_eq!(claim.activity_id().expect("claimed activity").get(), v1_id);
+    assert_eq!(claim.activity_id(), v1_id);
 
     let mut connection = pool.get().await.expect("connection");
     let untouched = durable_activity::table
@@ -571,10 +567,7 @@ async fn activity_claim_eligibility_uses_database_time_when_process_clock_differ
     .await
     .expect("claim with database clock")
     .expect("database-due activity");
-    assert_eq!(
-        claimed.activity_id().expect("activity id").get(),
-        activity_id
-    );
+    assert_eq!(claimed.activity_id(), activity_id);
 
     let mut connection = pool.get().await.expect("test connection");
     support::drop_durable_tables(&mut connection).await;
@@ -593,11 +586,7 @@ async fn success_finishes_attempt_and_wakes_workflow_with_typed_event() {
     );
 
     assert_eq!(
-        worker
-            .run_one("external")
-            .await
-            .expect("execution")
-            .map(|id| id.get()),
+        worker.run_one("external").await.expect("execution"),
         Some(activity_id)
     );
 
@@ -662,8 +651,7 @@ async fn maximum_activity_output_fits_the_durable_workflow_event() {
         worker
             .run_one("external")
             .await
-            .expect("maximum bounded output commits")
-            .map(|id| id.get()),
+            .expect("maximum bounded output commits"),
         Some(activity_id)
     );
 
@@ -851,7 +839,7 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .await
         .expect("reclaim")
         .expect("work");
-    assert_eq!(reclaimed.activity_id().expect("id").get(), activity_id);
+    assert_eq!(reclaimed.activity_id(), activity_id);
     assert_eq!(reclaimed.attempt_number().expect("attempt"), 2);
 
     let mut connection = pool.get().await.expect("test connection");
@@ -1398,7 +1386,7 @@ async fn single_and_batch_claims_share_the_attempt_and_lease_contract() {
                 .expect("single claim")
                 .expect("activity")
         };
-        assert_eq!(claim.activity_id().expect("id").get(), activity_id);
+        assert_eq!(claim.activity_id(), activity_id);
         assert_eq!(claim.attempt_number().expect("attempt number"), 1);
         let mut connection = pool.get().await.expect("connection");
         let row = durable_activity::table

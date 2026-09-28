@@ -86,6 +86,25 @@ Compared with the production-internal version it was extracted from:
   and read it with the new `deduplication_key() -> Option<&str>`;
   `options.deduplication_key = Some(key)` becomes
   `options = options.with_deduplication_key(key)`.
+- Id columns are typed (breaking): each id column in `schema` has its own
+  SQL type per id (a `BIGINT` on the wire) and reads and writes it as the
+  matching id newtype (`WorkflowId`, `ActivityId`, `ApprovalId`,
+  `ScheduleRunId`), so a query that compares one table's id with another's
+  is a compile error (E0277; `id_swapped_in_query` compile-fail case). The
+  public row structs in `persistence` (`WorkflowRow`, `ActivityRow`,
+  `ApprovalRow`, `ScheduleRunRow`, the attempt, event and progress rows,
+  and their `New*` inserts) have id fields of the id types, not `i64`. A
+  stored id that is not positive fails to decode with a deserialization
+  error. `WorkflowRow::wait_reference_id` stays a plain `Option<i64>`,
+  because it names a workflow, an activity or an approval by `wait_kind`.
+  `WorkflowClaim::workflow_id()` and `ActivityClaim::activity_id()` return
+  the id directly, not a `Result`. Migration: build ids with
+  `WorkflowId::new(raw)` (each id's `new` returns `Result`), read the raw
+  value with `.get()`, compare id columns with the id itself
+  (`durable_workflow::id.eq(workflow_id)`, not `workflow_id.get()`), load
+  id columns as the id type (`.first::<WorkflowId>(..)`), write
+  `wait_reference_id` and raw-SQL binds as `id.get()`, and drop the
+  `?`/`expect` after the two claim id accessors.
 
 - `RetryPolicy` deserialization checks the same bounds as
   `RetryPolicy::fixed` / `exponential` and fails for a policy out of

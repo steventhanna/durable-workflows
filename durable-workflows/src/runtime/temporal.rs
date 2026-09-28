@@ -58,7 +58,7 @@ impl TimerMaterializer {
             let event = WorkflowEvent::TimerFired { command_sequence };
             append_delivery_event(connection, &workflow, "timer_fired", &event, now).await?;
             clear_wait(connection, &workflow, now).await?;
-            Ok(Some(WorkflowId::new(workflow.id)?))
+            Ok(Some(workflow.id))
         })
         .await
     }
@@ -94,7 +94,7 @@ impl ApprovalExpiryMaterializer {
                 durable_approval::id.asc(),
             ))
             .select((durable_approval::id, durable_approval::workflow_id))
-            .first::<(i64, i64)>(&mut connection)
+            .first::<(ApprovalId, WorkflowId)>(&mut connection)
             .await
             .optional()?;
         let Some((approval_id, workflow_id)) = candidate else {
@@ -122,7 +122,7 @@ impl ApprovalExpiryMaterializer {
                 return Ok(None);
             }
             if !workflow.status.awaits_approval()
-                || workflow.wait()? != Some(Wait::Approval(ApprovalId::new(approval.id)?))
+                || workflow.wait()? != Some(Wait::Approval(approval.id))
                 || workflow.kind != approval.kind
                 || workflow.version != approval.version
             {
@@ -155,7 +155,7 @@ impl ApprovalExpiryMaterializer {
             .await?;
             ensure_single_change(changed)?;
             clear_wait(connection, &workflow, now).await?;
-            Ok(Some(ApprovalId::new(approval.id)?))
+            Ok(Some(approval.id))
         })
         .await
     }
@@ -208,7 +208,7 @@ async fn append_delivery_event(
         .ok_or_else(|| {
             DurableError::InvalidState("workflow delivery sequence overflow".to_string())
         })?;
-    let workflow_id = WorkflowId::new(workflow.id)?;
+    let workflow_id = workflow.id;
     let sequence = persistence::next_event_sequence(connection, workflow_id).await?;
     persistence::append_event(
         connection,

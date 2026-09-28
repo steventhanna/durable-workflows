@@ -48,7 +48,9 @@ impl WorkflowHandler for AdminWorkflow {
     }
 }
 
-async fn seed_workflows(pool: &durable_workflows::DurablePool) -> Vec<i64> {
+async fn seed_workflows(
+    pool: &durable_workflows::DurablePool,
+) -> Vec<durable_workflows::WorkflowId> {
     let store = DurableStore::new(pool.clone());
     let mut ids = Vec::new();
     for index in 1..=3 {
@@ -61,7 +63,7 @@ async fn seed_workflows(pool: &durable_workflows::DurablePool) -> Vec<i64> {
             )
             .await
             .expect("workflow starts");
-        ids.push(outcome.workflow_id.get());
+        ids.push(outcome.workflow_id);
     }
     let mut connection = pool.get().await.expect("test connection");
     for id in &ids {
@@ -85,7 +87,10 @@ async fn seed_workflows(pool: &durable_workflows::DurablePool) -> Vec<i64> {
     ids
 }
 
-async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) -> i64 {
+async fn seed_activity(
+    pool: &durable_workflows::DurablePool,
+    workflow_id: durable_workflows::WorkflowId,
+) -> durable_workflows::ActivityId {
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
@@ -124,7 +129,7 @@ async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) 
     let activity_id = durable_activity::table
         .select(durable_activity::id)
         .order(durable_activity::id.desc())
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity ID");
     diesel::insert_into(durable_activity_attempt::table)
@@ -185,7 +190,7 @@ async fn workflow_pages_are_stable_filterable_and_redacted() {
         first
             .items
             .iter()
-            .map(|workflow| workflow.id.get())
+            .map(|workflow| workflow.id)
             .collect::<Vec<_>>(),
         vec![ids[2], ids[1]]
     );
@@ -200,7 +205,7 @@ async fn workflow_pages_are_stable_filterable_and_redacted() {
         .await
         .expect("second page");
     assert_eq!(second.items.len(), 1);
-    assert_eq!(second.items[0].id.get(), ids[0]);
+    assert_eq!(second.items[0].id, ids[0]);
 
     let waiting = service
         .list_workflows(WorkflowListFilter {
@@ -210,7 +215,7 @@ async fn workflow_pages_are_stable_filterable_and_redacted() {
         .await
         .expect("approval filter");
     assert_eq!(waiting.items.len(), 1);
-    assert_eq!(waiting.items[0].id.get(), ids[1]);
+    assert_eq!(waiting.items[0].id, ids[1]);
 
     let detail = service
         .get_workflow(waiting.items[0].id)
@@ -280,14 +285,14 @@ async fn activity_detail_exposes_attempts_progress_and_payload_values() {
     let service = AdminQueryService::new(pool.clone());
     let page = service
         .list_activities(ActivityListFilter {
-            workflow_id: Some(durable_workflows::WorkflowId::new(workflow_id).expect("workflow")),
+            workflow_id: Some(workflow_id),
             status: Some("dead_lettered".to_string()),
             ..ActivityListFilter::default()
         })
         .await
         .expect("activities");
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].id.get(), activity_id);
+    assert_eq!(page.items[0].id, activity_id);
     assert_eq!(
         page.items[0].operation_key.as_deref(),
         Some("provider-operation-7")
@@ -442,7 +447,7 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
     loop {
         let page = service
             .workflow_timeline(
-                durable_workflows::WorkflowId::new(workflow_id).expect("workflow"),
+                workflow_id,
                 PageRequest {
                     cursor,
                     limit: Some(2),

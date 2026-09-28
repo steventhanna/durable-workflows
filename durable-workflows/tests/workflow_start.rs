@@ -289,7 +289,7 @@ async fn start_with_conn_persists_input_state_and_started_event() {
     assert!(outcome.workflow_id.get() > 0);
 
     let workflow = durable_workflow::table
-        .filter(durable_workflow::id.eq(outcome.workflow_id.get()))
+        .filter(durable_workflow::id.eq(outcome.workflow_id))
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -301,7 +301,7 @@ async fn start_with_conn_persists_input_state_and_started_event() {
     assert_eq!(workflow.status.as_str(), "ready");
 
     let event = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(outcome.workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(outcome.workflow_id))
         .select(WorkflowEventRow::as_select())
         .first::<WorkflowEventRow>(&mut connection)
         .await
@@ -338,7 +338,7 @@ async fn prepared_start_uses_registry_validated_input_and_the_same_transactional
     .await
     .expect("prepared workflow starts");
     let workflow = durable_workflow::table
-        .filter(durable_workflow::id.eq(outcome.workflow_id.get()))
+        .filter(durable_workflow::id.eq(outcome.workflow_id))
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -442,7 +442,7 @@ async fn recovering_start_dedupes_active_successful_and_cancelled_generations_bu
     assert!(!active_duplicate.inserted);
     assert_eq!(active_duplicate.workflow_id, active.workflow_id);
 
-    diesel::update(durable_workflow::table.find(active.workflow_id.get()))
+    diesel::update(durable_workflow::table.find(active.workflow_id))
         .set(durable_workflow::status.eq("succeeded"))
         .execute(&mut connection)
         .await
@@ -464,7 +464,7 @@ async fn recovering_start_dedupes_active_successful_and_cancelled_generations_bu
     )
     .await
     .expect("cancelled lineage starts");
-    diesel::update(durable_workflow::table.find(cancelled.workflow_id.get()))
+    diesel::update(durable_workflow::table.find(cancelled.workflow_id))
         .set(durable_workflow::status.eq("cancelled"))
         .execute(&mut connection)
         .await
@@ -486,7 +486,7 @@ async fn recovering_start_dedupes_active_successful_and_cancelled_generations_bu
     )
     .await
     .expect("failed lineage starts");
-    diesel::update(durable_workflow::table.find(failed.workflow_id.get()))
+    diesel::update(durable_workflow::table.find(failed.workflow_id))
         .set(durable_workflow::status.eq("failed"))
         .execute(&mut connection)
         .await
@@ -502,18 +502,15 @@ async fn recovering_start_dedupes_active_successful_and_cancelled_generations_bu
     assert!(recovery.inserted);
     assert_ne!(recovery.workflow_id, failed.workflow_id);
     let recovery_row = durable_workflow::table
-        .find(recovery.workflow_id.get())
+        .find(recovery.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .unwrap();
-    assert_eq!(
-        recovery_row.root_workflow_id,
-        Some(failed.workflow_id.get())
-    );
+    assert_eq!(recovery_row.root_workflow_id, Some(failed.workflow_id));
     assert_eq!(
         recovery_row.restarted_from_workflow_id,
-        Some(failed.workflow_id.get())
+        Some(failed.workflow_id)
     );
     assert!(recovery_row.deduplication_key.is_none());
 
@@ -527,7 +524,7 @@ async fn recovering_start_dedupes_active_successful_and_cancelled_generations_bu
     assert!(!recovery_duplicate.inserted);
     assert_eq!(recovery_duplicate.workflow_id, recovery.workflow_id);
 
-    diesel::update(durable_workflow::table.find(recovery.workflow_id.get()))
+    diesel::update(durable_workflow::table.find(recovery.workflow_id))
         .set((
             durable_workflow::status.eq("blocked"),
             durable_workflow::error_category.eq(Some("activity_retry_exhausted")),
@@ -547,8 +544,8 @@ async fn recovering_start_dedupes_active_successful_and_cancelled_generations_bu
         durable_workflow::table
             .filter(
                 durable_workflow::id
-                    .eq(failed.workflow_id.get())
-                    .or(durable_workflow::root_workflow_id.eq(Some(failed.workflow_id.get()))),
+                    .eq(failed.workflow_id)
+                    .or(durable_workflow::root_workflow_id.eq(Some(failed.workflow_id))),
             )
             .count()
             .get_result::<i64>(&mut connection)
@@ -846,7 +843,7 @@ async fn second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_
         other => panic!("expected a restart conflict, got {other:?}"),
     }
     let successors = durable_workflow::table
-        .filter(durable_workflow::restarted_from_workflow_id.eq(Some(source.workflow_id.get())))
+        .filter(durable_workflow::restarted_from_workflow_id.eq(Some(source.workflow_id)))
         .count()
         .get_result::<i64>(&mut connection)
         .await
@@ -872,15 +869,18 @@ async fn second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_
             durable_workflow::restarted_from_workflow_id,
         ))
         .order(durable_workflow::id.asc())
-        .load::<(i64, Option<i64>)>(&mut connection)
+        .load::<(
+            durable_workflows::WorkflowId,
+            Option<durable_workflows::WorkflowId>,
+        )>(&mut connection)
         .await
         .expect("workflows load");
     assert_eq!(
         rows,
         vec![
-            (source.workflow_id.get(), None),
-            (successor.workflow_id.get(), Some(source.workflow_id.get())),
-            (unrelated.workflow_id.get(), None),
+            (source.workflow_id, None),
+            (successor.workflow_id, Some(source.workflow_id)),
+            (unrelated.workflow_id, None),
         ]
     );
 

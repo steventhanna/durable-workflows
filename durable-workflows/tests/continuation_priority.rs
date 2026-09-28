@@ -300,8 +300,7 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
             )
             .await
             .unwrap()
-            .workflow_id
-            .get();
+            .workflow_id;
         ids.push(id);
         coordinator.activate_one().await.unwrap();
     }
@@ -327,14 +326,14 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
         "the topic's two-provider-call cap still applies"
     );
     assert_eq!(
-        claims[0].activity_id().unwrap().get(),
+        claims[0].activity_id(),
         current.id,
         "a newly inserted next page must precede older continuation activity IDs"
     );
     assert!(worker.claim_batch(10, &capacity).await.unwrap().is_empty());
     let claimed_ids = claims
         .iter()
-        .map(|claim| claim.activity_id().unwrap().get())
+        .map(|claim| claim.activity_id())
         .collect::<Vec<_>>();
     let now = durable_workflows::persistence::database_now_millis(&mut conn)
         .await
@@ -354,7 +353,7 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
     assert_eq!(next.len(), 2);
     assert!(
         next.iter()
-            .all(|claim| !claimed_ids.contains(&claim.activity_id().unwrap().get())),
+            .all(|claim| !claimed_ids.contains(&claim.activity_id())),
         "future retry eligibility must override continuation priority"
     );
     support::drop_durable_tables(&mut conn).await;
@@ -384,12 +383,7 @@ async fn failed_continuation_waits_for_backoff_then_reacquires_priority() {
         .await
         .unwrap();
     coordinator.activate_one().await.unwrap();
-    let activity_id = worker
-        .run_one(ScanTopic.key())
-        .await
-        .unwrap()
-        .unwrap()
-        .get();
+    let activity_id = worker.run_one(ScanTopic.key()).await.unwrap().unwrap();
     let mut conn = pool.get().await.unwrap();
     let failed = durable_activity::table
         .find(activity_id)

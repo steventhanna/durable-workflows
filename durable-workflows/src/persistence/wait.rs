@@ -28,7 +28,7 @@ pub(crate) enum Wait {
 impl Wait {
     /// The one reading of the two wait columns of workflow `workflow_id`.
     pub(crate) fn parse(
-        workflow_id: i64,
+        workflow_id: WorkflowId,
         kind: Option<WaitKind>,
         reference: Option<i64>,
     ) -> Result<Option<Self>, DurableError> {
@@ -120,6 +120,7 @@ mod tests {
 
     #[test]
     fn every_wait_round_trips_through_its_columns() {
+        let workflow = WorkflowId::new(1).unwrap();
         let waits = [
             Wait::Timer {
                 command_sequence: 7,
@@ -129,30 +130,32 @@ mod tests {
             Wait::Approval(ApprovalId::new(13).unwrap()),
         ];
         for wait in waits {
-            let parsed = Wait::parse(1, Some(wait.kind()), Some(wait.reference_id())).unwrap();
+            let parsed =
+                Wait::parse(workflow, Some(wait.kind()), Some(wait.reference_id())).unwrap();
             assert_eq!(parsed, Some(wait));
         }
-        assert_eq!(Wait::parse(1, None, None).unwrap(), None);
+        assert_eq!(Wait::parse(workflow, None, None).unwrap(), None);
     }
 
     #[test]
     fn half_a_wait_is_an_error() {
+        let workflow = WorkflowId::new(1).unwrap();
         for kind in WaitKind::ALL {
             assert!(matches!(
-                Wait::parse(1, Some(*kind), None),
+                Wait::parse(workflow, Some(*kind), None),
                 Err(DurableError::InvalidState(_))
             ));
         }
         assert!(matches!(
-            Wait::parse(1, None, Some(5)),
+            Wait::parse(workflow, None, Some(5)),
             Err(DurableError::InvalidState(_))
         ));
         assert!(matches!(
-            Wait::parse(1, Some(WaitKind::Timer), Some(-1)),
+            Wait::parse(workflow, Some(WaitKind::Timer), Some(-1)),
             Err(DurableError::InvalidState(_))
         ));
         assert!(matches!(
-            Wait::parse(1, Some(WaitKind::Activity), Some(0)),
+            Wait::parse(workflow, Some(WaitKind::Activity), Some(0)),
             Err(DurableError::InvalidId(0))
         ));
     }

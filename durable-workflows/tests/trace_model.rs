@@ -177,7 +177,7 @@ async fn activity_happy_path() {
 
     let mut connection = pool.get().await.expect("connection");
     let workflow = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -370,7 +370,7 @@ async fn status(
 ) -> String {
     let mut connection = pool.get().await.expect("connection");
     durable_workflow::table
-        .find(id.get())
+        .find(id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -518,13 +518,14 @@ async fn cancel_parent_with_running_child() {
         .expect("child claimed");
     let mut connection = pool.get().await.expect("connection");
     let activity_id = durable_workflow::table
-        .find(child.get())
+        .find(child)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("child row")
         .wait_reference_id
         .expect("child waits on its activity");
+    let activity_id = durable_workflows::ActivityId::new(activity_id).expect("activity ID");
     DurableStore::cancel_with_conn(&mut connection, parent, "trace cancel")
         .await
         .expect("parent cancels");
@@ -850,7 +851,7 @@ fn named_worker(
 async fn start_activity<W>(
     pool: &durable_workflows::DurablePool,
     flow: &W,
-) -> (durable_workflows::WorkflowId, i64)
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId)
 where
     W: durable_workflows::WorkflowHandler,
 {
@@ -866,14 +867,17 @@ where
     );
     let mut connection = pool.get().await.expect("connection");
     let activity = durable_workflow::table
-        .find(id.get())
+        .find(id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("workflow row")
         .wait_reference_id
         .expect("waits on the activity");
-    (id, activity)
+    (
+        id,
+        durable_workflows::ActivityId::new(activity).expect("activity ID"),
+    )
 }
 
 async fn complete(pool: &durable_workflows::DurablePool, id: durable_workflows::WorkflowId) {
@@ -1004,7 +1008,7 @@ async fn heartbeat_extends_lease() {
 async fn expire_while_heartbeat_blocked(
     pool: &durable_workflows::DurablePool,
     gate_name: &str,
-    activity: i64,
+    activity: durable_workflows::ActivityId,
 ) {
     use diesel_async::SimpleAsyncConnection;
     let worker = named_worker(pool, "rtA:dispatcher", Duration::from_millis(100));
@@ -1146,7 +1150,7 @@ async fn cancel_while_running_settles_the_revoked_attempt() {
     // instead of applying the handler's result.
     assert!(matches!(
         run.await.expect("joins"),
-        Ok(Some(ran)) if ran.get() == activity_id
+        Ok(Some(ran)) if ran == activity_id
     ));
     assert_eq!(status(&pool, id).await, "cancelled");
     let mut connection = pool.get().await.expect("connection");

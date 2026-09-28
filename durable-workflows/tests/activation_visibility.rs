@@ -113,7 +113,7 @@ async fn activate_one_counts_a_lost_fence_as_a_fence_miss() {
         .await
         .expect("step entered");
     let mut connection = pool.get().await.expect("test connection");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set(durable_workflow::lease_token.eq(Some("recovered-by-another-claim")))
         .execute(&mut connection)
         .await

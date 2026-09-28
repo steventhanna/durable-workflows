@@ -154,7 +154,7 @@ async fn insert_approval(
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_approval::table)
         .values(NewApprovalRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             command_sequence: 1,
             kind: ApprovalWorkflow::KIND.to_string(),
             version: ApprovalWorkflow::VERSION,
@@ -175,21 +175,57 @@ async fn insert_approval(
     let approval_id = durable_approval::table
         .select(durable_approval::id)
         .order(durable_approval::id.desc())
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ApprovalId>(&mut connection)
         .await
         .expect("approval ID");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_approval"),
             durable_workflow::wait_kind.eq(Some("approval".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(approval_id)),
+            durable_workflow::wait_reference_id.eq(Some(approval_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
         .execute(&mut connection)
         .await
         .expect("workflow approval wait");
-    durable_workflows::ApprovalId::new(approval_id).expect("approval")
+    approval_id
+}
+
+/// Id columns decode through `ApprovalId::new` and the other id
+/// constructors, so a non-positive id written behind the engine's back is a
+/// deserialization error on read, never a panic or an unchecked id.
+#[tokio::test]
+async fn non_positive_stored_id_fails_to_decode_with_an_error() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let workflow_id = start_workflow(&pool).await;
+    let approval_id = insert_approval(&pool, workflow_id, None).await;
+    let mut connection = pool.get().await.expect("test connection");
+    diesel::sql_query(format!(
+        "UPDATE durable_approval SET id = -1 WHERE id = {approval_id}"
+    ))
+    .execute(&mut connection)
+    .await
+    .expect("raw SQL writes a non-positive id");
+
+    let ids = durable_approval::table
+        .select(durable_approval::id)
+        .load::<durable_workflows::ApprovalId>(&mut connection)
+        .await;
+    assert!(
+        matches!(ids, Err(diesel::result::Error::DeserializationError(_))),
+        "a non-positive id decoded: {ids:?}"
+    );
+    let rows = durable_approval::table
+        .select(ApprovalRow::as_select())
+        .load::<ApprovalRow>(&mut connection)
+        .await;
+    assert!(
+        matches!(rows, Err(diesel::result::Error::DeserializationError(_))),
+        "a row with a non-positive id decoded: {rows:?}"
+    );
 }
 
 #[tokio::test]
@@ -223,7 +259,7 @@ async fn approval_resolution_validates_exact_version_and_wakes_with_a_typed_even
 
     let mut connection = pool.get().await.expect("test connection");
     let approval = durable_approval::table
-        .find(approval_id.get())
+        .find(approval_id)
         .select(ApprovalRow::as_select())
         .first::<ApprovalRow>(&mut connection)
         .await
@@ -232,7 +268,7 @@ async fn approval_resolution_validates_exact_version_and_wakes_with_a_typed_even
     assert_eq!(approval.decision_payload_json.as_deref(), Some("true"));
     assert_eq!(approval.decided_by, Some(42));
     let workflow = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -240,7 +276,7 @@ async fn approval_resolution_validates_exact_version_and_wakes_with_a_typed_even
     assert_eq!(workflow.status.as_str(), "ready");
     assert!(workflow.wait_reference_id.is_none());
     let approval_event = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::delivery_sequence.gt(workflow.delivered_event_sequence))
         .order(durable_workflow_event::delivery_sequence.asc())
         .select(WorkflowEventRow::as_select())
@@ -279,7 +315,7 @@ async fn expired_or_invalid_approval_decisions_roll_back_without_waking() {
     ));
 
     let mut connection = pool.get().await.expect("test connection");
-    diesel::update(durable_approval::table.find(approval_id.get()))
+    diesel::update(durable_approval::table.find(approval_id))
         .set(durable_approval::expires_at.eq(None::<i64>))
         .execute(&mut connection)
         .await
@@ -300,7 +336,7 @@ async fn expired_or_invalid_approval_decisions_roll_back_without_waking() {
     ));
     let mut connection = pool.get().await.expect("test connection");
     let approval = durable_approval::table
-        .find(approval_id.get())
+        .find(approval_id)
         .select(ApprovalRow::as_select())
         .first::<ApprovalRow>(&mut connection)
         .await
@@ -384,22 +420,22 @@ async fn schedule_controls_are_code_owned_and_run_now_is_atomic_without_cadence_
         .expect("next occurrence");
     assert_eq!(state_next, next_occurrence);
     let schedule_run = durable_schedule_run::table
-        .find(run.schedule_run_id.get())
+        .find(run.schedule_run_id)
         .select(ScheduleRunRow::as_select())
         .first::<ScheduleRunRow>(&mut connection)
         .await
         .expect("schedule run");
-    assert_eq!(schedule_run.workflow_id, Some(run.workflow_id.get()));
+    assert_eq!(schedule_run.workflow_id, Some(run.workflow_id));
     assert_eq!(schedule_run.actor_id, Some(42));
     let workflow = durable_workflow::table
-        .find(run.workflow_id.get())
+        .find(run.workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("manual workflow");
-    assert_eq!(workflow.schedule_run_id, Some(run.schedule_run_id.get()));
+    assert_eq!(workflow.schedule_run_id, Some(run.schedule_run_id));
     let operator_event = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(run.workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(run.workflow_id))
         .filter(durable_workflow_event::event_type.eq("schedule_run_now"))
         .select(WorkflowEventRow::as_select())
         .first::<WorkflowEventRow>(&mut connection)

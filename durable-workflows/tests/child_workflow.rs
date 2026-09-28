@@ -282,7 +282,7 @@ async fn parent_awaits_child_flow_and_completes_with_its_output() {
 
     let mut connection = pool.get().await.expect("test connection");
     let child = durable_workflow::table
-        .find(child_id)
+        .find(durable_workflows::WorkflowId::new(child_id).expect("child ID"))
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
