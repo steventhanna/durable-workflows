@@ -25,7 +25,10 @@ system can make the violation fail to compile. In order of preference:
    of the persisted text, ordered like it), an outcome
    enum instead of a flag (a lease renewal returns `Renewed::Held` or
    `Renewed::Revoked`; a revoked execution finishes as
-   `ExecutionOutcome::Revoked`).
+   `ExecutionOutcome::Revoked`), one enum for fields that exclude each other
+   (a start's deduplication key and its engine-set restart lineage are the
+   private `StartLineage` in `StartOptions`, so a start with both has no
+   value; `start_options_dedup_key_field_private` compile-fail case).
 2. **Uncompilable.** Make the wrong use a compile error: a borrow guard
    (`WorkflowCoordinator::claim_one(&mut self)` returns a `WorkflowClaim<'_, C>`,
    so a second claim while one is alive is E0499), a method that consumes

@@ -259,7 +259,7 @@ impl WorkflowHandler for StartWorkflow {
 fn start_options_are_explicit_and_default_to_immediate_unrelated_work() {
     let options = StartOptions::default().with_deduplication_key("customer-42");
 
-    assert_eq!(options.deduplication_key.as_deref(), Some("customer-42"));
+    assert_eq!(options.deduplication_key(), Some("customer-42"));
     assert!(options.available_at.is_none());
     assert!(options.schedule_run_id.is_none());
 }

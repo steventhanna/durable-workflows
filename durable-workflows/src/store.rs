@@ -20,19 +20,60 @@ const MAX_DEDUPLICATION_KEY_CHARS: usize = 191;
 
 #[derive(Debug, Clone, Default)]
 pub struct StartOptions {
-    pub deduplication_key: Option<String>,
     pub available_at: Option<DateTime<Utc>>,
     pub schedule_run_id: Option<ScheduleRunId>,
-    /// Recovery lineage, set only by the engine (T-X2 recoverable start and
-    /// the admin restart), which checks that the source may be restarted.
-    pub(crate) root_workflow_id: Option<WorkflowId>,
-    pub(crate) restarted_from_workflow_id: Option<WorkflowId>,
+    lineage: StartLineage,
+}
+
+/// What identifies a start besides its id: the caller's deduplication key or
+/// the engine's restart lineage. One enum, so a start with both a key and a
+/// restart source has no value (it was a runtime check).
+#[derive(Debug, Clone, Default)]
+enum StartLineage {
+    #[default]
+    Fresh,
+    Deduplicated(String),
+    /// Set only by the engine (T-X2 recoverable start and the admin
+    /// restart), which checks that the source may be restarted.
+    Restart {
+        root: WorkflowId,
+        from: WorkflowId,
+    },
 }
 
 impl StartOptions {
     pub fn with_deduplication_key(mut self, key: impl Into<String>) -> Self {
-        self.deduplication_key = Some(key.into());
+        self.lineage = StartLineage::Deduplicated(key.into());
         self
+    }
+
+    /// The deduplication key [`with_deduplication_key`](Self::with_deduplication_key) set.
+    pub fn deduplication_key(&self) -> Option<&str> {
+        match &self.lineage {
+            StartLineage::Deduplicated(key) => Some(key),
+            StartLineage::Fresh | StartLineage::Restart { .. } => None,
+        }
+    }
+
+    /// Makes this the start of a restart successor of `from` in the chain
+    /// rooted at `root`, replacing any deduplication key.
+    pub(crate) fn restarted(mut self, root: WorkflowId, from: WorkflowId) -> Self {
+        self.lineage = StartLineage::Restart { root, from };
+        self
+    }
+
+    fn root_workflow_id(&self) -> Option<WorkflowId> {
+        match self.lineage {
+            StartLineage::Restart { root, .. } => Some(root),
+            StartLineage::Fresh | StartLineage::Deduplicated(_) => None,
+        }
+    }
+
+    fn restarted_from_workflow_id(&self) -> Option<WorkflowId> {
+        match self.lineage {
+            StartLineage::Restart { from, .. } => Some(from),
+            StartLineage::Fresh | StartLineage::Deduplicated(_) => None,
+        }
     }
 
     /// Starts the workflow no earlier than `available_at`.
@@ -260,7 +301,7 @@ impl DurableStore {
                             connection: transaction,
                             scope,
                         }| {
-                let Some(key) = options.deduplication_key.clone() else {
+                let Some(key) = options.deduplication_key().map(str::to_owned) else {
                     return Self::insert_prepared(
                         transaction,
                         scope,
@@ -334,12 +375,7 @@ impl DurableStore {
                     W::VERSION,
                     input_json,
                     state_json,
-                    StartOptions {
-                        deduplication_key: None,
-                        root_workflow_id: Some(WorkflowId::new(root_id)?),
-                        restarted_from_workflow_id: Some(WorkflowId::new(latest.id)?),
-                        ..options
-                    },
+                    options.restarted(WorkflowId::new(root_id)?, WorkflowId::new(latest.id)?),
                 )
                 .await;
                 let successor = match outcome {
@@ -500,8 +536,8 @@ impl DurableStore {
         state_json: String,
         options: StartOptions,
     ) -> Result<StartOutcome, DurableError> {
-        let key = options.deduplication_key.clone();
-        let from = options.restarted_from_workflow_id.map(WorkflowId::get);
+        let key = options.deduplication_key().map(str::to_owned);
+        let from = options.restarted_from_workflow_id().map(WorkflowId::get);
         let outcome = Self::insert_prepared_untraced(
             connection, scope, kind, version, input_json, state_json, options,
         )
@@ -535,7 +571,7 @@ impl DurableStore {
         state_json: String,
         options: StartOptions,
     ) -> Result<StartOutcome, DurableError> {
-        if let Some(key) = options.deduplication_key.as_deref() {
+        if let Some(key) = options.deduplication_key() {
             if let Some(existing) =
                 persistence::find_by_deduplication_key(connection, kind, key).await?
             {
@@ -568,10 +604,10 @@ impl DurableStore {
             lease_owner: None,
             lease_token: None,
             lease_expires_at: None,
-            deduplication_key: options.deduplication_key.clone(),
+            deduplication_key: options.deduplication_key().map(str::to_owned),
             schedule_run_id: options.schedule_run_id.map(ScheduleRunId::get),
-            root_workflow_id: options.root_workflow_id.map(WorkflowId::get),
-            restarted_from_workflow_id: options.restarted_from_workflow_id.map(WorkflowId::get),
+            root_workflow_id: options.root_workflow_id().map(WorkflowId::get),
+            restarted_from_workflow_id: options.restarted_from_workflow_id().map(WorkflowId::get),
             parent_workflow_id: None,
             parent_command_sequence: None,
             command_sequence: 0,
@@ -843,12 +879,7 @@ fn validate_definition<W: WorkflowHandler>() -> Result<(), DurableError> {
 }
 
 fn validate_options(options: &StartOptions) -> Result<(), DurableError> {
-    if options.deduplication_key.is_some() && options.restarted_from_workflow_id.is_some() {
-        return Err(DurableError::InvalidDefinition(
-            "workflow start cannot set both a deduplication key and a restart source".to_string(),
-        ));
-    }
-    if let Some(key) = options.deduplication_key.as_deref() {
+    if let Some(key) = options.deduplication_key() {
         let length = key.chars().count();
         if length == 0 || length > MAX_DEDUPLICATION_KEY_CHARS {
             return Err(DurableError::InvalidDefinition(format!(

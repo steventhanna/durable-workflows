@@ -258,17 +258,10 @@ where
             let version = prepared.version();
             let root = WorkflowId::new(source.root_workflow_id.unwrap_or(source.id))?;
             let schedule_run_id = source.schedule_run_id.map(ScheduleRunId::new).transpose()?;
-            let outcome = DurableStore::start_prepared_with_conn(
-                connection,
-                prepared,
-                StartOptions {
-                    schedule_run_id,
-                    root_workflow_id: Some(root),
-                    restarted_from_workflow_id: Some(workflow_id),
-                    ..StartOptions::default()
-                },
-            )
-            .await?;
+            let mut options = StartOptions::default().restarted(root, workflow_id);
+            options.schedule_run_id = schedule_run_id;
+            let outcome =
+                DurableStore::start_prepared_with_conn(connection, prepared, options).await?;
             if !outcome.inserted {
                 return Err(DurableError::InvalidState(
                     "workflow restart unexpectedly deduplicated".to_string(),

@@ -72,6 +72,14 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- `StartOptions::deduplication_key` is no longer a public field (breaking):
+  the key and the engine's restart lineage are one private enum, so a
+  start cannot carry both (this was a runtime `InvalidDefinition` check,
+  now removed). Migration: set the key with `with_deduplication_key(key)`
+  and read it with the new `deduplication_key() -> Option<&str>`;
+  `options.deduplication_key = Some(key)` becomes
+  `options = options.with_deduplication_key(key)`.
+
 - `RetryPolicy` deserialization checks the same bounds as
   `RetryPolicy::fixed` / `exponential` and fails for a policy out of
   bounds (it accepted any value). An activity row whose stored
