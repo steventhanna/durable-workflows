@@ -999,7 +999,16 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let (workflow_id, activity_id) = schedule_activity(&pool, 2, 40, 100).await;
+    // Each of the two claims must reach its handler (and panic) inside its
+    // lease: `execute_claim` refuses a claim whose local lease deadline has
+    // passed, and lease recovery then consumes the attempt without a panic,
+    // so the restart budget is never exhausted. Under a parallel suite the
+    // first claim reaches its handler 10-100 ms (debug build, more with
+    // `trace-model`) after the lease is stamped, so a 100 ms lease was spent
+    // before the handler ran in about 1 of 12 suite runs. A 500 ms lease leaves
+    // that margin 5x and still expires before the restarted dispatcher's
+    // first backoff sweep (~1 s), so the timeline below is unchanged.
+    let (workflow_id, activity_id) = schedule_activity(&pool, 2, 40, 500).await;
     let panic_context = Arc::new(RuntimeTestContext::default());
     panic_context.mode.store(3, Ordering::SeqCst);
     let mut config = runtime_config();
