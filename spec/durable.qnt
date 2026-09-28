@@ -1258,7 +1258,6 @@ module durable {
     nondet childKey = Set("domain", "auto").oneOf()
     nondet topic = TOPICS.oneOf()
     nondet backoff = Set(0, 1).oneOf()
-    nondet outcome = Set("succeeded", "retryable", "permanent", "revoked").oneOf()
     nondet tnowOne = Set(now, if (now > 0) now - 1 else 0).oneOf()
     nondet badBounds = Set(false, ENABLE_ENV_EDITS).oneOf()
     nondet prio = Set(false, true).oneOf()
@@ -1269,6 +1268,9 @@ module durable {
     // dummy elements keep oneOf() total; every action guards on membership
     nondet e = (if (proc.execs == Set()) Set(noExec) else proc.execs).oneOf()
     nondet h = (if (proc.hbs == Set()) Set(noHb) else proc.hbs).oneOf()
+    // HandlerReturn accepts "revoked" only from a revoking exec and a HANDLER_OUTCOMES value only
+    // from a running one, so drawing the outcome by the exec's phase removes no transition
+    nondet outcome = (if (e.phase == "revoking") Set("revoked") else HANDLER_OUTCOMES).oneOf()
     // values derived from the state (a trace supplies them instead)
     val c = proc.claims.get(r)
     val cw = c.wf

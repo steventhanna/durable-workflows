@@ -11,9 +11,9 @@ Facts verified in diesel-async 0.9.2 that this design depends on:
 
 - `AsyncConnection::transaction` and
   `AsyncPgConnection::build_transaction().read_committed().run(..)` take the
-  same `AsyncFnOnce(&mut Conn) -> Result<R, E>` closure (`src/lib.rs:285-296`,
-  `src/pg/transaction_builder.rs:220-296`).
-- The MySQL connection sets `client_found_rows(true)` (`src/mysql/mod.rs:346`),
+  same `AsyncFnOnce(&mut Conn) -> Result<R, E>` closure (`src/lib.rs` `AsyncConnection::transaction`,
+  `src/pg/transaction_builder.rs` `TransactionBuilder::run`).
+- The MySQL connection sets `client_found_rows(true)` (`src/mysql/mod.rs` `establish_connection_inner`),
   so affected-row counts are *matched* rows on both backends. Every
   `changed == 1` fence keeps its meaning on Postgres.
 - `set_instrumentation` exists on both connections.
@@ -110,10 +110,10 @@ Behavior changes:
 
 - A start that collides on `uq_durable_workflow_restart` returns
   `DurableError::Conflict` on both backends (MySQL returned `InvalidState`,
-  `persistence/workflows.rs:57-61`).
+  `persistence/workflows.rs` `insert_started`).
 - `StartOptions` with both `deduplication_key` and
   `restarted_from_workflow_id` is rejected by `validate_options`
-  (`store.rs:491-501`) with `InvalidDefinition`. No caller sets both today.
+  (`store.rs` `validate_options`) with `InvalidDefinition`. No caller sets both today.
 - `persistence::connection_last_insert_id` is deleted.
 - `TopicLockRow.max_concurrency` / `NewTopicLockRow.max_concurrency` become
   `i32`; `TopicMetrics.max_concurrency` stays `u32`.
@@ -127,7 +127,7 @@ combinators; that keeps diesel bounds out of the seam.
 pub(crate) enum WorkflowInsert { Inserted(i64), DeduplicationConflict }
 
 /// Library-owned transaction, pinned to READ COMMITTED on both backends.
-/// Copy the closure bounds from diesel-async-0.9.2/src/lib.rs:285-296. Its
+/// Copy the closure bounds from diesel-async-0.9.2/src/lib.rs `AsyncConnection::transaction`. Its
 /// `AsyncFunc` helper trait is private, so the crate keeps a local copy
 /// (`dialect::TransactionCallback`) with the same blanket impl.
 pub(crate) async fn transaction<R, E, F>(conn: &mut DurableConnection, callback: F) -> Result<R, E>;
@@ -147,17 +147,17 @@ pub(crate) fn is_unique_violation(error: &diesel::result::Error) -> bool;
 
 ### (a) New-row ids — 5 sites
 
-`runtime/coordinator.rs:641-660` (approval), `:719-758` (activity),
-`admin/control.rs:434-470` (replacement activity), `:774-789` (manual
-schedule run), `runtime/schedule_materializer.rs:379-396` (schedule run).
+`runtime/coordinator.rs` `commit_wait_transition` (approval), `commit_activity` (activity),
+`admin/control.rs` `AdminControlService::retry` (replacement activity), `run_schedule_now` (manual
+schedule run), `runtime/schedule_materializer.rs` `materialize_occurrence` (schedule run).
 Each becomes `dialect::insert_<table>(connection, row)`.
 
 - MySQL: `insert_into(t).values(row).execute(c)` then
   `select(last_insert_id()).get_result::<i64>(c)` (the `define_sql_function!`
-  from `workflows.rs:12-14` moves into `dialect/mysql.rs`).
+  from `workflows.rs` `last_insert_id` moves into `dialect/mysql.rs`).
 - Postgres: `insert_into(t).values(row).returning(t::id).get_result::<i64>(c)`.
 
-### (b) Insert-or-find workflow — `persistence/workflows.rs:35-88`
+### (b) Insert-or-find workflow — `persistence/workflows.rs` `insert_started`
 
 Defined behavior on both backends:
 
@@ -193,7 +193,7 @@ match dialect::insert_workflow(conn, row).await? {
 - NULL keys are distinct in unique indexes on both. Do not use
   `NULLS NOT DISTINCT`.
 
-### (c) Insert-if-absent — `registry.rs:618`, `schedule.rs:365`
+### (c) Insert-if-absent — `registry.rs` `TopicRegistry::seed_locks_once`, `schedule.rs` `ScheduleRegistry::reconcile_state`
 
 Existing rows are never modified; only a duplicate primary key is ignored;
 return value means "inserted exactly this row".
@@ -204,7 +204,7 @@ return value means "inserted exactly this row".
   and both call sites read the row back and compare it.
 - Postgres: `insert_into(t).values(..).on_conflict(<pk>).do_nothing()`.
 
-### (d) Database clock — `persistence/mod.rs:23-69`, 34 call sites
+### (d) Database clock — `persistence/mod.rs` `MysqlNowMillis`, `database_now_millis`, 34 call sites
 
 Call-time semantics are required (several sites sample after waiting on a
 lock). Postgres `now()` is transaction-start and is forbidden.
@@ -215,8 +215,8 @@ lock). Postgres `now()` is transaction-start and is forbidden.
 
 Test clock (`fake-clock` feature), one helper
 `support::freeze_database_clock(&mut DurableConnection, millis)` replacing the
-raw `SET TIMESTAMP` in `tests/database_time_mysql.rs:14`,
-`activity_execution_mysql.rs:537`, `admin_metrics_mysql.rs:836`:
+raw `SET TIMESTAMP` in `tests/database_time_mysql.rs` `database_clock_uses_mysql_session_time`,
+`activity_execution_mysql.rs` `activity_claim_eligibility_uses_database_time_when_process_clock_differs`, `admin_metrics_mysql.rs` `current_topic_metrics_use_mysql_time`:
 
 - MySQL: `SET TIMESTAMP = {secs}.{millis:03}` (production expression unchanged).
 - Postgres, only under `fake-clock`, the expression becomes
@@ -227,7 +227,7 @@ raw `SET TIMESTAMP` in `tests/database_time_mysql.rs:14`,
 
 No change. Audit in P7: no locking site uses `DISTINCT`/`GROUP BY`/aggregates;
 Postgres locks only returned rows after `ORDER BY`/`LIMIT`, which matches the
-page-then-relock pattern (`coordinator.rs:243-290,340-366`).
+page-then-relock pattern (`coordinator.rs` `WorkflowCoordinator::claim_one`).
 
 ### (f) Isolation: READ COMMITTED on both, pinned by the library
 
@@ -237,7 +237,7 @@ page-then-relock pattern (`coordinator.rs:243-290,340-366`).
 
 READ COMMITTED on MySQL closes G4 (`next_event_sequence` after the row lock
 sees every committed append), narrows G7, and removes gap-lock deadlocks
-(`coordinator.rs:239-240`). No invariant relies on snapshot staleness; all
+(`coordinator.rs` `WorkflowCoordinator::claim_one`). No invariant relies on snapshot staleness; all
 rest on `FOR UPDATE` + fences + unique keys. Requirement: MySQL with binary
 logging needs `binlog_format=ROW` (the 8.x default).
 
@@ -249,8 +249,8 @@ Applies to every pool-owned transaction (`coordinator.rs`, `activity_worker.rs`,
 ### (g) Postgres aborts a transaction on any failed statement
 
 User code in `ScheduleHandler::start_occurrence` runs inside the materializer
-transaction (`schedule_materializer.rs:397-406,482-490`,
-`control.rs:790-798`). Engine behavior is unchanged (any error rolls back the
+transaction (`schedule_materializer.rs` `materialize_occurrence`, `promote_queued`,
+`control.rs` `run_schedule_now`). Engine behavior is unchanged (any error rolls back the
 tick); the contract in §2 makes handler behavior identical on both backends.
 
 ### (h)–(k)
@@ -258,7 +258,7 @@ tick); the contract in §2 makes handler behavior identical on both backends.
 - (h) The idempotent index migration is obsolete with a fresh baseline.
 - (j) `VARCHAR(191)` stays on both backends so the Rust limit constants stay
   single-source.
-- (k) Keep the spawned bb8 checkout at `activity_worker.rs:783-789`; reword the
+- (k) Keep the spawned bb8 checkout in `activity_worker.rs` `heartbeat_once`; reword the
   comment to be backend-neutral.
 
 ## 4. Schema and migrations
@@ -281,13 +281,13 @@ merged, snake_case):
   `CONSTRAINT .. UNIQUE`; FKs and CHECKs verbatim; no collation clause.
 - All existing indexes carry over. Addition: `idx_durable_workflow_wait
   (wait_kind, wait_reference_id, status)` for the parent-wake scan
-  (`workflows.rs:156-167`, INVARIANTS §2.8).
+  (`workflows.rs` `wake_waiting_parents_on_child_terminal`, INVARIANTS §2.8).
 - `down.sql` drops in reverse FK order.
 
 `schema.rs` stays single-source: remove all `#[sql_name]`, normalize
 `Longtext`/`Char`/`Varchar` to `Text`, `Unsigned<Integer>` → `Integer`.
 `check_for_backend(Db)` in `persistence/models.rs`. `OCTET_LENGTH`
-declarations (`admin/query.rs:21-29`, `admin/metrics.rs:39-42`) use `Text`.
+declarations (`admin/query.rs` `octet_length_longtext`, `octet_length_nullable_longtext`; `admin/metrics.rs` `approval_decision_octet_length`) use `Text`.
 
 Users apply migrations by (1) copying the SQL into their own diesel migration
 tree, (2) `durable_workflows::migrations::MIGRATIONS` (`EmbeddedMigrations`),
@@ -305,13 +305,13 @@ URL. The fixture panics if the URL scheme does not match
   process-wide `tokio::sync::Mutex`; stale sweep via `pg_database`; drop with
   `DROP DATABASE .. WITH (FORCE)` from a server connection.
 - `git mv` the `*_mysql.rs` test files to drop the suffix.
-- `admin_controls_mysql.rs:320,356`: `START TRANSACTION` → `BEGIN`.
-- `workflow_activation_mysql.rs:1343`: quote-agnostic match
+- `admin_controls_mysql.rs` `assert_activity_claim_lock_order`: `START TRANSACTION` → `BEGIN`.
+- `workflow_activation_mysql.rs` `paused_expiry_probe_pool`: quote-agnostic match
   (`contains("ORDER BY") && contains("lease_expires_at")`).
-- `application_cancellation/timeout_cleanup.rs:232-235`: manager type →
+- `application_cancellation/timeout_cleanup.rs` `heartbeat_failure_limits_cleanup_to_the_last_confirmed_lease`: manager type →
   `DurableConnection`.
-- Replace the unicode_ci aliasing tests (`admin_metrics_mysql.rs:692-775`,
-  `:778-824`) with `topic_metrics_treat_spellings_as_distinct_topics`.
+- Replace the unicode_ci aliasing tests (`admin_metrics_mysql.rs` `topic_metrics_resolve_unicode_ci_topic_spellings`,
+  `topic_metrics_dead_letter_count_accumulates_collation_aliases`) with `topic_metrics_treat_spellings_as_distinct_topics`.
 
 CI: lint per backend (`--no-default-features --features <b>,fake-clock`);
 `test-mysql` on 8.0/8.4; `test-postgres` on 14/17 with
@@ -324,7 +324,7 @@ Every phase ends with the full MySQL suite green.
 | Phase | Goal | Acceptance |
 |---|---|---|
 | P1 | Fresh MySQL baseline: snake_case, `utf8mb4_bin`, `max_concurrency` `INT`/`i32`; drop `#[sql_name]` | `rg sql_name src/schema.rs` = 0; `rg Unsigned src` = 0; suite green |
-| P2 | Remove collation-alias machinery (`admin/metrics.rs:951-1014`, `TopicAliasRow`, alias indirection); distinct-spellings test; INVARIANTS updated | `rg "unicode_ci\|JSON_TABLE\|sql_query" src` = 0; green |
+| P2 | Remove collation-alias machinery (`admin/metrics.rs` `resolve_topic_aliases`, `TopicAliasRow`, alias indirection); distinct-spellings test; INVARIANTS updated | `rg "unicode_ci\|JSON_TABLE\|sql_query" src` = 0; green |
 | P3a | `dialect` module + aliases; persistence layer through it; §3b insert semantics; generic `string_status!` `FromSql`/`ToSql` | `AsyncMysqlConnection` only in `lib.rs` + `dialect/mysql.rs` for persistence; tests: restart collision → `Conflict` with caller txn usable; both keys → `InvalidDefinition`; green |
 | P3b | Finish alias swap in runtime/admin; typed inserts at the 5 id sites; `into_boxed::<Db>()` | `rg "mysql::Mysql\|AsyncMysqlConnection\|connection_last_insert_id" src` only in `lib.rs` + `dialect/mysql.rs`; green |
 | P4 | Pin READ COMMITTED via `dialect::transaction`; G4 regression test; isolation probe; docs/comments | green on 8.0/8.4; G4 test green |

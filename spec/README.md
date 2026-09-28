@@ -13,7 +13,7 @@ T-W1 is kept as the historical instances `durable_mc_rr` and
 | `durable.qnt` | The parameterized model: state, one action per DB transaction (T-W1 split by statement), invariants, witnesses, temporal properties. The header maps actions to code and invariants to S/G/N ids. |
 | `durable_mc.qnt` | Instances: `durable_mc` (the code), `durable_mc_drift` (process clock lags DB time), `durable_mc_act` (activity-only, small), `durable_mc_rr` and `durable_mc_act_rr` (historical: T-W1 under REPEATABLE READ). |
 | `durable_tests.qnt` | Directed scenarios (`quint test`): `durable_tests` (READ COMMITTED) and `durable_tests_rr` (historical RR). |
-| `check.sh` | Typecheck, both test modules, and random simulation of every invariant and witness. |
+| `check.sh` | Typecheck, the directed test modules, and random simulation of every invariant and witness (`--quick`: a smoke budget, about 5 minutes; `--full`, the default: the budget reported below). Each row is `hold`, `violate` (a witness sampling must reach; a miss fails `--full` and is a WARN in `--quick`) or `seek` (not reached by sampling; a named directed test is the evidence). |
 | `verify.sh` | Bounded model checking with Apalache (`quint verify`). |
 | `results/` | `summary.txt` (simulation), `apalache_summary.txt`, `check.log`, `verify.log`, and one output file per run. |
 
@@ -25,7 +25,8 @@ npm install                      # installs @informalsystems/quint locally
 npx quint typecheck durable_mc.qnt
 npx quint test durable_tests.qnt --main durable_tests
 npx quint test durable_tests.qnt --main durable_tests_rr
-./check.sh 20000 40              # samples, steps; writes results/summary.txt
+./check.sh --quick               # smoke budget; writes results/summary.txt
+./check.sh --full                # the thorough budget (default)
 ./verify.sh 3                    # needs Java 17+; downloads Apalache on first use (depth 4: > 2 h)
 ```
 
@@ -62,8 +63,11 @@ restart-key collision returns `Conflict`, both keys rejected) predate
 Constants in `durable_mc`: 2 runtimes, at most 4 workflow rows and 3 activity
 rows, 1 topic with `maxConcurrency = 1`, 1 local executor slot per runtime,
 `maxAttempts = 2`, 2 activation attempts, workflow and activity leases of 3
-ticks, clock bound 10. `durable_mc_act`: no children, no crashes, 2 workflows,
-2 activities, clock bound 6.
+ticks, clock bound 10. `durable_mc_act`: no children, no crashes, 4 workflows,
+2 activities, clock bound 10. (With 2 workflows and clock bound 6 most
+40-step samples ran out of work within about 13 steps and spent the rest in
+states where almost every branch of `step` is disabled: about 2 samples/s
+instead of 25, and 20 minutes without a result at 2000 samples.)
 
 State (`INVARIANTS.md` §7.3, reduced):
 
@@ -498,31 +502,40 @@ All 56 pass (`durable_tests` 49, `durable_tests_rr` 2, `durable_tests_drift` 1, 
 | `n1ReturnLatestTest`, `n1ReturnSiblingRejectedTest`, `n1ReturnOwnRowTest` | RC | N1, second variant (fixed): T-X2 on the child key returns the keyed row, not a newer live sibling (returning the sibling is not a step); `TX2_ReturnLatest` of a top-level keyed row. |
 | `g10InvalidRowNotClaimedTest`, `g10WrongReasonTest`, `g10ReplayTest` | RC, `ENABLE_ENV_EDITS` | The invalid row cannot be claimed; a replayed quarantine with the `attempt_cap` reason does not match it; the replay form quarantines a1 and claims a2 in one `TW1_Claim`. |
 
-### Random simulation (`quint run`, 20,000 samples, 40 steps; 80 steps where noted)
+### Random simulation (`./check.sh --full`, 40 steps)
 
-From `results/summary.txt`. Interface v4 (operator actions in `step`): `safety`,
-`safetyRc` and `inv_S24_exceptTX2` on `durable_mc` were rerun at 20,000 x 40
-and hold; the other rows are from v3 and were not rerun (the host was
-overloaded; `step` is about 3 times slower per sample with the new branches).
+From `./check.sh --full` on 2026-09-27 (interface v5, after N2 and G11; 59
+minutes of simulation on 12 cores, of which 32 were the two 80-step `seek` rows
+now run at 40 steps). `--quick` runs the `hold` rows at 2000 samples and the
+cheap witnesses, and skips `wit_activitySucceeded` and the `seek` rows (about 5
+minutes). `check.sh` lists each row's budget.
 
-| Instance | Property | Expected | Result |
+| Instance | Property | Expected | Result (samples) |
 |---|---|---|---|
-| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity and per topic, S14-S16, S18, S19 incl. source terminal, S23, S24, S25, G1) | hold | no violation |
-| `durable_mc` | `safetyRc` (= `safety` + S17 at claim and between commits) | hold | no violation |
-| `durable_mc_act` | `safetyRc` | hold | no violation |
-| `durable_mc_rr` | `safety` | hold | no violation |
-| `durable_mc_rr`, `durable_mc_act_rr` | `inv_S17_capAlways`, `inv_S17_capAtClaim` (G7, historical) | violate | not found at this budget; found by `g7CapExceededTest` |
-| `durable_mc_env` | `safety` (external writes and invalid-bounds commands on) | hold | no violation |
-| `durable_mc_env` | `wit_quarantined` (G10 fixed; non-vacuity) | violate | see `results/summary.txt` |
-| `durable_mc_drift` | `inv_S13_oneHandler` | violate | not found at 40 or 80 steps; found by `driftTwoHandlersTest` |
-| `durable_mc` | witnesses S3, blocked, child succeeded, activity succeeded, coordinator fence miss, reconcile row, commit inside an open T-W1 | violate | all violated (reachable) |
-| `durable_mc` | `wit_revivedLease` | violate | not found at 40 or 80 steps; reached in `g7ClosedUnderRcTest` |
+| `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity and per topic, S14-S16, S18, S19 incl. source terminal, S23, S24, S25, G1) | hold | no violation (20000) |
+| `durable_mc` | `safetyRc` (= `safety` + S17 at claim and between commits) | hold | no violation (20000) |
+| `durable_mc_act` | `safetyRc` | hold | no violation (20000) |
+| `durable_mc_env` | `safety` (external writes and invalid-bounds commands on) | hold | no violation (20000) |
+| `durable_mc_rr` | `safety` | hold | no violation (20000) |
+| `durable_mc_env` | `wit_quarantined` (G10 fixed; non-vacuity) | violate | reached |
+| `durable_mc` | witnesses S3, child succeeded, coordinator fence miss, commit inside an open T-W1, paused activity | violate | all reached |
+| `durable_mc_act` | `wit_reconciled`, `wit_blocked`, `wit_activitySucceeded` | violate | all reached (`wit_activitySucceeded` after ~36000 samples) |
+| `durable_mc_rr`, `durable_mc_act_rr` | `inv_S17_capAlways`, `inv_S17_capAtClaim` (G7, historical) | seek | not reached (20000); `g7CapExceededTest` |
+| `durable_mc_drift` | `inv_S13_oneHandler` | seek | not reached (20000 x 80); `driftTwoHandlersTest` |
+| `durable_mc` | `wit_revivedLease` | seek | not reached (20000 x 80); `g7ClosedUnderRcTest` |
 
-T-W1 now takes 5 or more steps, and `step` has more always-enabled branches
-(dedup hits, `TX2_ReturnLatest`, `TW1_SkipRow`), so uniform simulation reaches
-long schedules less often than before. The directed tests carry every gap.
+The activity-path witnesses run on `durable_mc_act`: `durable_mc` reaches
+them in fewer than 1 in 10^4 samples (0 activity successes and 1 blocked
+workflow in 18000 fixed-seed samples), `durable_mc_act` 10 to 100 times as
+often. T-W1 takes 5 or more steps and `step` has many always-enabled branches,
+so uniform simulation reaches long schedules rarely. The directed tests carry
+every gap.
 
 ### Apalache (`quint verify`)
+
+On 2026-09-27 `./verify.sh 3` on the interface-v5 model (commit 1ae02cd, and
+the same with the step-outcome change after it) ran out of the default 4 GB JVM
+heap in step 2 after about 10 minutes. The rows below predate N2 and G11.
 
 | Property | Bound | Result | Time |
 |---|---|---|---|

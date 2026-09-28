@@ -5,8 +5,10 @@
 #
 # Usage: scripts/verify-invariants.sh [--quick|--full] [--backend mysql|postgres|both]
 #   --quick  (default) compiler checks, both test suites, the Quint checks at
-#            2000 samples x 40 steps, and trace checking on each backend
-#   --full   the same, but the Quint simulation at 20000 x 40 and Apalache
+#            the quick budget (spec/check.sh --quick, about 5 minutes; an
+#            unreached witness is a WARN), and trace checking on each backend
+#   --full   the same, but the Quint simulation at the full budget
+#            (spec/check.sh --full; an unreached witness fails) and Apalache
 #            bounded model checking (spec/verify.sh, depth 3); run before a
 #            push or a release. Keeps the rewritten spec/results/.
 #   --backend  limit the test and trace stages to one backend (default both)
@@ -83,23 +85,19 @@ for b in $backends; do
 done
 
 # 3. The Quint model on its own: typecheck, directed tests, simulation.
-quint_checks() {
-  local samples=$1
-  (cd spec && ./check.sh "$samples" 40) || return 1
-  # check.sh reports rather than fails: a directed test failing, an invariant
-  # expected to hold that did not, or a runtime error is a failure here.
-  # (An expected violation that sampling did not reach is not.)
-  if grep -E 'failing|[0-9]+\) .* failed' spec/results/summary.txt; then return 1; fi
-  if grep -E 'expect=hold' spec/results/summary.txt | grep -vE 'got=No violation found'; then return 1; fi
-  if grep -E 'got=error' spec/results/summary.txt; then return 1; fi
-  return 0
-}
+# check.sh fails on a failing directed test, a violated `hold` row, a quint error
+# and, in --full, a `violate` witness its budget did not reach. In --quick an
+# unreached witness is a WARN: the stage stays ok and the summary lists it.
 if [ "$mode" = full ]; then
-  stage quint-simulation quint_checks 20000
+  stage quint-simulation sh -c 'cd spec && ./check.sh --full'
   stage apalache sh -c 'cd spec && ./verify.sh 3 && ! grep -vE "No violation found" results/apalache_summary.txt'
 else
-  stage quint-simulation quint_checks 2000
+  stage quint-simulation sh -c 'cd spec && ./check.sh --quick'
   git checkout -q -- spec/results 2>/dev/null || true
+fi
+quint_notes=$(sed -n '/^Not reached or failed:/,$p' "$logs/quint-simulation.log" | grep -E '^(WARN|MISS|FAIL) ' || true)
+if [ -n "$quint_notes" ]; then
+  summary="${summary}$(printf '%s\n' "$quint_notes" | sed 's/^/      quint /')\n"
 fi
 
 # 4. Trace checking: the code's recorded runs replayed through the model.

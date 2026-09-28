@@ -59,9 +59,19 @@ scripts/verify-invariants.sh            # every change
 scripts/verify-invariants.sh --full     # before a push or release
 ```
 Stages: fmt, clippy (4 feature sets), rustdoc, the test suites on MySQL and
-Postgres (incl. trybuild compile-fail cases), the Quint model (typecheck,
-directed tests, random simulation; `--full` adds 20000-sample simulation and
-Apalache), and trace checking on each backend. Logs: `target/verify-invariants/`.
+Postgres (incl. trybuild compile-fail cases), the Quint model
+(`spec/check.sh --quick`, about 5 minutes: typecheck, directed tests, random
+simulation at a smoke budget; `--full` runs `spec/check.sh --full`, the
+thorough budget, and Apalache), and trace checking on each backend. Logs:
+`target/verify-invariants/`.
+
+Each simulation row in `spec/check.sh` is `hold` (a violation fails), `violate`
+(a witness or gap sampling must reach: a miss is a WARN in quick mode and a
+failure in `--full`) or `seek` (never reached by sampling; a named directed test
+is the evidence; a miss is listed, never fails). The summary lists every WARN,
+MISS and FAIL. A WARN in quick mode is not a pass: rerun the row at its full
+budget before you trust the change. Never turn a `violate` row into `seek`, or
+lower a budget, to make a run pass; that is an owner decision like an invariant.
 
 ### 5. Classify every failure before changing anything
 Read the log (for traces: `spec/trace-check.sh` names the first failing step;

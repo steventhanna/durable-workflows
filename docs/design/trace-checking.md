@@ -25,23 +25,23 @@ model's invariants hold after each step.
 
 - Every library-owned transaction goes through `crate::dialect::transaction`
   (29 sites). Outermost-capable exceptions: `DurableStore::cancel_with_conn`
-  (`store.rs:81-103`), `start_with_conn` (`:140-152`),
-  `start_or_restart_recoverable_with_conn` (`:211-336`),
-  `start_prepared_with_conn` (`:357-369`); through `start` /
-  `start_or_restart_recoverable` they are savepoints (`:116`, `:187`).
+  (`store.rs`), `start_with_conn`,
+  `start_or_restart_recoverable_with_conn`,
+  `start_prepared_with_conn`; through `start` /
+  `start_or_restart_recoverable` they are savepoints.
 - Fences return `DurableError::FencedWrite` and roll back
-  (`coordinator.rs:911-917`, `activity_worker.rs:1275-1281`); the coordinator
-  propagates them (`coordinator.rs:217`, G1).
+  (`coordinator.rs` `ensure_fenced`, `activity_worker.rs` `ensure_fenced`); the coordinator
+  propagates them (`coordinator.rs` `WorkflowCoordinator::activate_claim_inner`, G1).
 - Each transaction samples `now` once (`persistence::database_now_millis`).
 - Deliverable events are appended only via `persistence::append_event`
-  (`events.rs:40-49`) and the `started` insert in `insert_started`
-  (`workflows.rs:35-48`). Parent wakes go through
-  `wake_loaded_parent_on_child_terminal` (`workflows.rs:154-245`); activity
-  cancels through `cancel_activities` (`store.rs:611-647`).
+  (`events.rs`) and the `started` insert in `insert_started`
+  (`workflows.rs`). Parent wakes go through
+  `wake_loaded_parent_on_child_terminal` (`workflows.rs`); activity
+  cancels through `cancel_activities` (`store.rs`).
 - Test DBs are fresh per test; the tokio test body runs on the test thread,
   which libtest names after the test path.
-- Coordinator id `"{runtime_id}:coordinator"` (`supervisor.rs:928`),
-  dispatcher `"{runtime_id}:dispatcher"` (`:1040`).
+- Coordinator id `"{runtime_id}:coordinator"` (`supervisor.rs` `run_task`),
+  dispatcher `"{runtime_id}:dispatcher"` (`run_task`).
 - Ids have gaps (dedup hits and rollbacks consume ids); the model assigns
   dense ids, so the checker maps real ids to model ids. Tokens are UUIDs; the
   checker interns them by first appearance.
@@ -217,13 +217,13 @@ checks `availableAt >= tnow`.
 | Code site | Record | Quint action | Parameters (source) |
 |---|---|---|---|
 | `store.rs` `insert_prepared` | `TX1_Start` | `TX1_Start(wNew, kind, key, inserted, tnow)` | kind, key, id, inserted |
-| `store.rs:195-337` | `TX2_RecoverableStart` | `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` | original, latest, successor; latest not failed/blocked → `Noop` |
-| `store.rs:69-104` | `TX3_Cancel` | `TX3_Cancel(w, tnow)` | terminal → not recorded |
-| `coordinator.rs:228-393` | `TC1_Claim` | `TC1_Claim(r, rec, cl, tok, leaseExp, tnow)` | recovered id, claimed id, token, lease |
-| `coordinator.rs:139-149` | `LC1_NoEvent` (local) | `LC1_NoEvent(r, w)` | |
-| `coordinator.rs:496-700` | `TC2_Commit` | `TC2_Continue` / `TC2_Complete` / `TC2_RunActivity(…, aNew, topic, maxAttempts, availableAt, tnow)` / `TC2_RunChild(…, key, existing, cNew, tnow)` | variant, new ids, child key; SleepUntil / WaitForApproval → `Unmodeled` |
-| `coordinator.rs:409-493` | `TC3_ActivationFailure` | `TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)` | |
-| `coordinator.rs:205-224` on `FencedWrite` | `CoordFenceMiss` (local) | `CoordFenceMiss(r, w, tok)` | |
+| `store.rs` `start_or_restart_recoverable_with_conn` | `TX2_RecoverableStart` | `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` | original, latest, successor; latest not failed/blocked → `Noop` |
+| `store.rs` `cancel_with_conn` | `TX3_Cancel` | `TX3_Cancel(w, tnow)` | terminal → not recorded |
+| `coordinator.rs` `WorkflowCoordinator::claim_one` | `TC1_Claim` | `TC1_Claim(r, rec, cl, tok, leaseExp, tnow)` | recovered id, claimed id, token, lease |
+| `coordinator.rs` `WorkflowCoordinator::activate_claim_inner` | `LC1_NoEvent` (local) | `LC1_NoEvent(r, w)` | |
+| `coordinator.rs` `commit_on_connection`, `commit_wait_transition` | `TC2_Commit` | `TC2_Continue` / `TC2_Complete` / `TC2_RunActivity(…, aNew, topic, maxAttempts, availableAt, tnow)` / `TC2_RunChild(…, key, existing, cNew, tnow)` | variant, new ids, child key; SleepUntil / WaitForApproval → `Unmodeled` |
+| `coordinator.rs` `WorkflowCoordinator::record_activation_failure` | `TC3_ActivationFailure` | `TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)` | |
+| `coordinator.rs` `WorkflowCoordinator::activate_claim_inner` on `FencedWrite` | `CoordFenceMiss` (local) | `CoordFenceMiss(r, w, tok)` | |
 | `activity_worker.rs` `claim_one` / `claim_batch` | `TW1_Claim` | `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, claimed)` | per-topic `in_flight`, reconciled list, claims; error (G10) → `TW1_Error` (local) |
 | `activity_worker.rs` outcome dispatch / timeout | `HandlerReturn` (local) | `HandlerReturn(r, a, tok, outcome)` | |
 | heartbeat failure past `lease_deadline` | `LocalDeadline` (local) | `LocalDeadline(r, a, tok)` | |
