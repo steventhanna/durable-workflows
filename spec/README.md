@@ -510,6 +510,12 @@ now run at 40 steps). `--quick` runs the `hold` rows at 2000 samples and the
 cheap witnesses, and skips `wit_activitySucceeded` and the `seek` rows (about 5
 minutes). `check.sh` lists each row's budget.
 
+Owner decision (2026-09-27): the `seek` rows (G7 on the RR instances, drift
+S13, `wit_revivedLease`) stay `seek`. Random sampling never reaches them, and
+each is backed by a directed test (`g7CapExceededTest`,
+`driftTwoHandlersTest`, `g7ClosedUnderRcTest`), so a `seek` miss never fails
+a run: the directed test is the guard.
+
 | Instance | Property | Expected | Result (samples) |
 |---|---|---|---|
 | `durable_mc` | `safety` (S1, S2, S5, S6-S12, S13 per activity and per topic, S14-S16, S18, S19 incl. source terminal, S23, S24, S25, G1) | hold | no violation (20000) |
@@ -535,7 +541,26 @@ every gap.
 
 On 2026-09-27 `./verify.sh 3` on the interface-v5 model (commit 1ae02cd, and
 the same with the step-outcome change after it) ran out of the default 4 GB JVM
-heap in step 2 after about 10 minutes. The rows below predate N2 and G11.
+heap in step 2 after about 10 minutes. `quint verify` spawns `apalache-mc
+server` with its own environment, and `apalache-mc` uses 4 GB unless
+`JVM_ARGS` sets `-Xmx`; `verify.sh` now exports `JVM_ARGS=-Xmx12g` (override
+it to change the bound; a server already listening on port 8822 is reused and
+keeps its own heap). With 12 GB the same run no longer runs out of memory,
+but it does not finish in useful time: step 1 checks all 49 transitions (5 enabled) in
+about 3 minutes (transition #7 alone takes 90 s), and step 2 spent 10 minutes
+translating transition #7 to SMT and more than 20 minutes in Z3 on it before
+the run was stopped at 35 minutes (JVM resident size about 4.7 GB, one core).
+Step 2 had 42 transitions left and step 3 has 49, so depth 3 would take many
+hours. Transition #7 is, by Apalache's order of the `step` disjuncts (the
+if/else branches of `TX1_Start` and `TX2_RecoverableStart` are split),
+`TX3_Cancel`: `cancelTargets` (G11) nests a `MAX_WF`-round fold, a filter,
+an `exists` and the `restartOrigins` fold, and `TX3_Cancel` evaluates
+`cancelWrite` twice. `AdminCancel` uses the same cascade. The options, none
+of which removes an invariant from `safetyRc`: a smaller Apalache instance
+(`MAX_WF = 3`) for this row, a lower `--max-steps` for this row, or an
+Apalache-friendly form of `cancelTargets` (computed once per step, or a
+bounded closure without the nested fold). Each is an owner decision. The rows
+below predate N2 and G11 and are the last complete result.
 
 | Property | Bound | Result | Time |
 |---|---|---|---|
