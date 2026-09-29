@@ -456,8 +456,7 @@ where
                 }
                 // The upgrade drops the unmaterialized span before `now` (intended)
                 // and never targets an occurrence with a run row (S27, G5).
-                let floor =
-                    MaterializedFloor::load(connection, row.as_ref(), &metadata.key).await?;
+                let floor = MaterializedFloor::load(connection, row.as_ref()).await?;
                 let (cursor, target) = ScheduleCursor::upgrade(&calendar, deployed_at, floor)?;
                 diesel::update(durable_schedule_state::table.find(&metadata.key))
                     .set((

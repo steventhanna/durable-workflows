@@ -830,7 +830,7 @@ where
                 OverlapPolicy::SkipIfActive | OverlapPolicy::QueueOne => true,
             };
             if overlap_checked
-                && crate::runtime::active_workflow_count(connection, state.as_ref(), &schedule_key)
+                && crate::runtime::active_workflow_count(connection, state.as_ref())
                     .await? > 0
             {
                 return Err(DurableError::Conflict(format!(

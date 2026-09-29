@@ -662,7 +662,13 @@ cannot be locked before an existing child (G9). The helpers that need an
 earlier lock (`cancel_locked_workflow`, `cancel_owned_descendants`, `wake_waiting_parents_on_child_terminal`,
 `hand_waiting_parents_to_successor`, `settle_revoked`, `quarantine_candidate`,
 `block_workflow`, `MaterializedFloor::load`, `active_workflow_count`) take a
-witness too. The types do not prove which row was locked (a witness for
+witness too. `MaterializedFloor::load` and `active_workflow_count` read the
+schedule key from their `ScheduleStateRow` witness instead of taking it as a
+separate argument, so they query only the schedule whose state row is
+locked (S27, S29). `tx::lock_by_update` builds its claim-fenced `UPDATE`
+from the `WorkflowRow` it returns as the witness, so its witness is for
+the row the statement changed. Otherwise the types do not prove which row
+was locked (a witness for
 workflow X passed with a command for workflow Y still compiles; the command
 inserts `debug_assert` the ids match), that the row is fresh, or what the
 database contains. The SQL fences (lease token, status filters) stay.

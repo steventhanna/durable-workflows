@@ -61,14 +61,15 @@ impl FromStr for LocalOccurrence {
 pub(crate) struct MaterializedFloor(Option<LocalOccurrence>);
 
 impl MaterializedFloor {
-    /// One query, with the schedule state row locked (`_state` is the
-    /// witness): a tick inserts run rows only under that lock, so the floor
-    /// cannot rise before commit.
+    /// One query, for the schedule whose state row `state` locked: a tick
+    /// inserts run rows only under that lock, so the floor cannot rise
+    /// before commit. The key comes from the locked row, so the floor of
+    /// another schedule cannot be read under this lock.
     pub(crate) async fn load(
         connection: &mut DurableConnection,
-        _state: Locked<'_, &ScheduleStateRow>,
-        schedule_key: &str,
+        state: Locked<'_, &ScheduleStateRow>,
     ) -> Result<Self, DurableError> {
+        let schedule_key = state.row().schedule_key.as_str();
         // Local keys are fixed width, so the text maximum is the latest key.
         let largest = durable_schedule_run::table
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))

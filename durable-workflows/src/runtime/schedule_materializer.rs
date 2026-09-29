@@ -143,8 +143,7 @@ where
                     report.paused = true;
                     return Ok(trace.commit(report));
                 }
-                let mut active =
-                    active_workflow_count(connection, state.as_ref(), &schedule_key).await?;
+                let mut active = active_workflow_count(connection, state.as_ref()).await?;
                 let mut queued = queued_run_exists(connection, &schedule_key).await?;
                 if metadata.overlap == OverlapPolicy::QueueOne && active == 0 && queued {
                     promote_queued(
@@ -434,13 +433,13 @@ where
     Ok(())
 }
 
-/// Non-terminal workflows started by runs of `schedule_key` (S29), with the
-/// schedule state row locked (`_state` is the witness).
+/// Non-terminal workflows started by runs of the schedule whose state row
+/// `state` locked (S29). The key comes from the locked row.
 pub(crate) async fn active_workflow_count(
     connection: &mut crate::DurableConnection,
-    _state: Locked<'_, &ScheduleStateRow>,
-    schedule_key: &str,
+    state: Locked<'_, &ScheduleStateRow>,
 ) -> Result<i64, DurableError> {
+    let schedule_key = state.row().schedule_key.as_str();
     Ok(durable_workflow::table
         .inner_join(
             durable_schedule_run::table

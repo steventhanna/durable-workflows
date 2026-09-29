@@ -85,6 +85,12 @@
 //!     `&WorkflowRow`). Set a `durable_activity` column in its `changes`:
 //!     E0271 (`AsChangeset::Target == durable_workflow::table`). The
 //!     statement's table and key come from the row, not the caller.
+//! 11. S27/S29: in `ScheduleRegistry::reconcile_state` (the version upgrade), pass
+//!     a schedule key next to the state witness,
+//!     `MaterializedFloor::load(connection, row.as_ref(), "other")`: E0061
+//!     (takes 2 arguments). `MaterializedFloor::load` and
+//!     `active_workflow_count` read the key from the locked
+//!     `ScheduleStateRow`, so they cannot query another schedule under it.
 
 use std::{future::Future, marker::PhantomData, ops::Deref};
 
