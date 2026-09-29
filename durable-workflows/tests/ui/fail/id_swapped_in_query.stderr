@@ -1,10 +1,10 @@
-error[E0277]: the trait bound `ActivityId: AsExpression<durable_workflows::ids::sql_types::WorkflowId>` is not satisfied
+error[E0277]: the trait bound `durable_workflows::ActivityId: AsExpression<durable_workflows::sql_types::WorkflowId>` is not satisfied
   --> tests/ui/fail/id_swapped_in_query.rs:10:41
    |
 10 |     let _swapped = durable_workflow::id.eq(activity_id);
-   |                                         ^^ the trait `AsExpression<durable_workflows::ids::sql_types::WorkflowId>` is not implemented for `ActivityId`
+   |                                         ^^ the trait `AsExpression<durable_workflows::sql_types::WorkflowId>` is not implemented for `durable_workflows::ActivityId`
    |
    = help: the following other types implement trait `AsExpression<T>`:
-             `&ActivityId` implements `AsExpression<durable_workflows::ids::sql_types::ActivityId>`
-             `ActivityId` implements `AsExpression<Nullable<durable_workflows::ids::sql_types::ActivityId>>`
-             `ActivityId` implements `AsExpression<durable_workflows::ids::sql_types::ActivityId>`
+             `&durable_workflows::ActivityId` implements `AsExpression<durable_workflows::sql_types::ActivityId>`
+             `durable_workflows::ActivityId` implements `AsExpression<Nullable<durable_workflows::sql_types::ActivityId>>`
+             `durable_workflows::ActivityId` implements `AsExpression<durable_workflows::sql_types::ActivityId>`
