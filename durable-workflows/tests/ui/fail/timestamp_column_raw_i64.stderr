@@ -1,0 +1,10 @@
+error[E0277]: the trait bound `i64: AsExpression<durable_workflows::sql_types::DbMillis>` is not satisfied
+ --> tests/ui/fail/timestamp_column_raw_i64.rs:5:44
+  |
+5 |     let _ = durable_workflow::available_at.le(0_i64);
+  |                                            ^^ the trait `AsExpression<durable_workflows::sql_types::DbMillis>` is not implemented for `i64`
+  |
+  = help: the following other types implement trait `AsExpression<T>`:
+            `&i64` implements `AsExpression<BigInt>`
+            `i64` implements `AsExpression<BigInt>`
+            `i64` implements `AsExpression<Nullable<BigInt>>`

@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use diesel::{QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
-    persistence::WorkflowRow, schema::durable_workflow, ActivityCommand, ActivityContext,
-    ActivityError, ActivityHandler, ActivityTopic, CoordinatorConfig, DurableActivity,
-    DurableStore, DurableWorkflow, RetryPolicy, StartOptions, WorkerConfig, WorkflowContext,
-    WorkflowEvent, WorkflowHandler, WorkflowTransition,
+    persistence::WorkflowRow,
+    schema::{durable_activity, durable_activity_attempt, durable_workflow},
+    ActivityCommand, ActivityContext, ActivityError, ActivityHandler, ActivityTopic,
+    CoordinatorConfig, DurableActivity, DurableStore, DurableWorkflow, RetryPolicy, StartOptions,
+    WorkerConfig, WorkflowContext, WorkflowEvent, WorkflowHandler, WorkflowTransition,
 };
 
 #[derive(Clone, Copy)]
@@ -136,7 +137,7 @@ async fn activity_happy_path() {
         .expect("workflow starts")
         .workflow_id;
 
-    let coordinator = durable_workflows::WorkflowCoordinator::new(
+    let mut coordinator = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),
         Arc::new(
@@ -154,10 +155,9 @@ async fn activity_happy_path() {
         activities(),
         Arc::new(durable_workflows::register_durable_topics!(Topics::Emails).expect("topics")),
         "rt1:dispatcher",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(60),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(60))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker");
 
@@ -177,7 +177,7 @@ async fn activity_happy_path() {
 
     let mut connection = pool.get().await.expect("connection");
     let workflow = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -357,10 +357,9 @@ fn worker(pool: &durable_workflows::DurablePool) -> durable_workflows::ActivityW
         activities(),
         Arc::new(durable_workflows::register_durable_topics!(Topics::Emails).expect("topics")),
         "rt1:dispatcher",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(60),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(60))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker")
 }
@@ -371,7 +370,7 @@ async fn status(
 ) -> String {
     let mut connection = pool.get().await.expect("connection");
     durable_workflow::table
-        .find(id.get())
+        .find(id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
@@ -391,7 +390,7 @@ async fn continue_then_complete() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("continue"),
         Some(id)
@@ -413,7 +412,7 @@ async fn child_happy_path() {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     let worker = worker(&pool);
     assert_eq!(
         coordinator.activate_one().await.expect("run child"),
@@ -446,14 +445,12 @@ async fn activation_failure_retries_then_fails() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         "rt1:coordinator",
-        CoordinatorConfig {
-            max_activation_attempts: 3,
-            activation_retry_policy: RetryPolicy::fixed(1).expect("policy"),
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default()
+            .with_max_activation_attempts(3)
+            .with_activation_retry_policy(RetryPolicy::fixed(1).expect("policy")),
     );
     let mut failures = 0;
     while failures < 3 {
@@ -481,12 +478,11 @@ async fn stale_coordinator_fence_miss() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let short = CoordinatorConfig {
-        lease_duration: Duration::from_millis(500),
-        ..CoordinatorConfig::default()
-    };
-    let stale = coordinator(&pool, "rt1:coordinator", short);
-    let fresh = coordinator(&pool, "rt2:coordinator", short);
+    let short = CoordinatorConfig::default()
+        .with_lease_duration(Duration::from_millis(500))
+        .with_step_timeout(Duration::from_millis(400));
+    let mut stale = coordinator(&pool, "rt1:coordinator", short);
+    let mut fresh = coordinator(&pool, "rt2:coordinator", short);
     let claim = stale.claim_one().await.expect("claim").expect("claimed");
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(
@@ -494,13 +490,14 @@ async fn stale_coordinator_fence_miss() {
         Some(id)
     );
     assert!(matches!(
-        stale.activate_claim(claim).await,
+        claim.activate().await,
         Err(durable_workflows::DurableError::FencedWrite)
     ));
     assert_eq!(status(&pool, id).await, "succeeded");
 }
 
-/// G11: cancelling a parent leaves its child live (`inv_G11_cancelReachesChildren`).
+/// G11: cancelling a parent cancels the child it owns in the same transaction,
+/// and the child's pending activity with it (`inv_G11_cancelReachesChildren`).
 #[tokio::test]
 async fn cancel_parent_with_running_child() {
     let Some(pool) = support::fresh_pool().await else {
@@ -511,7 +508,7 @@ async fn cancel_parent_with_running_child() {
         .await
         .expect("parent starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("run child"),
         Some(parent)
@@ -522,12 +519,28 @@ async fn cancel_parent_with_running_child() {
         .expect("child runs its activity")
         .expect("child claimed");
     let mut connection = pool.get().await.expect("connection");
+    let activity_id = durable_workflow::table
+        .find(child)
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(&mut connection)
+        .await
+        .expect("child row")
+        .wait_reference_id
+        .expect("child waits on its activity");
+    let activity_id = durable_workflows::ActivityId::new(activity_id).expect("activity ID");
     DurableStore::cancel_with_conn(&mut connection, parent, "trace cancel")
         .await
         .expect("parent cancels");
-    drop(connection);
     assert_eq!(status(&pool, parent).await, "cancelled");
-    assert_eq!(status(&pool, child).await, "waiting_activity");
+    assert_eq!(status(&pool, child).await, "cancelled");
+    // Never claimed, so the N2 path cancels it at once (no `cancelling`).
+    let activity_status = durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<String>(&mut connection)
+        .await
+        .expect("activity row");
+    assert_eq!(activity_status, "cancelled");
 }
 
 #[tokio::test]
@@ -540,7 +553,7 @@ async fn cancel_waiting_activity() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(&pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("run activity"),
         Some(id)
@@ -557,8 +570,7 @@ async fn cancel_waiting_activity() {
     assert_eq!(status(&pool, id).await, "cancelled");
 }
 
-/// T-X2 branches: StartNew, supersede a failed row, ReturnLatest, and the
-/// restart-key `Conflict` of both T-X2 and T-X1 after a public successor (N3).
+/// T-X2 branches: StartNew, supersede a failed row, ReturnLatest.
 #[tokio::test]
 async fn recoverable_start_after_failure() {
     let Some(pool) = support::fresh_pool().await else {
@@ -566,13 +578,10 @@ async fn recoverable_start_after_failure() {
     };
     let store = DurableStore::new(pool.clone());
     let keyed = || StartOptions::default().with_deduplication_key("k");
-    let coordinator = coordinator(
+    let mut coordinator = coordinator(
         &pool,
         "rt1:coordinator",
-        CoordinatorConfig {
-            max_activation_attempts: 1,
-            ..CoordinatorConfig::default()
-        },
+        CoordinatorConfig::default().with_max_activation_attempts(1),
     );
     let first = store
         .start_or_restart_recoverable(&FailingFlow, keyed())
@@ -598,24 +607,6 @@ async fn recoverable_start_after_failure() {
         coordinator.activate_one().await.expect("fails"),
         Some(second.workflow_id)
     );
-    let from_second = || StartOptions {
-        restarted_from_workflow_id: Some(second.workflow_id),
-        ..StartOptions::default()
-    };
-    store
-        .start(&FailingFlow, from_second())
-        .await
-        .expect("public successor of a failed row");
-    assert!(matches!(
-        store
-            .start_or_restart_recoverable(&FailingFlow, keyed())
-            .await,
-        Err(durable_workflows::DurableError::Conflict(_))
-    ));
-    assert!(matches!(
-        store.start(&FailingFlow, from_second()).await,
-        Err(durable_workflows::DurableError::Conflict(_))
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -850,10 +841,9 @@ fn named_worker(
         activities(),
         Arc::new(durable_workflows::register_durable_topics!(Topics::Emails).expect("topics")),
         worker_id,
-        WorkerConfig {
-            heartbeat_interval,
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(heartbeat_interval)
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
     .expect("worker")
 }
@@ -863,7 +853,7 @@ fn named_worker(
 async fn start_activity<W>(
     pool: &durable_workflows::DurablePool,
     flow: &W,
-) -> (durable_workflows::WorkflowId, i64)
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId)
 where
     W: durable_workflows::WorkflowHandler,
 {
@@ -872,25 +862,28 @@ where
         .await
         .expect("workflow starts")
         .workflow_id;
-    let coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("run activity"),
         Some(id)
     );
     let mut connection = pool.get().await.expect("connection");
     let activity = durable_workflow::table
-        .find(id.get())
+        .find(id)
         .select(WorkflowRow::as_select())
         .first::<WorkflowRow>(&mut connection)
         .await
         .expect("workflow row")
         .wait_reference_id
         .expect("waits on the activity");
-    (id, activity)
+    (
+        id,
+        durable_workflows::ActivityId::new(activity).expect("activity ID"),
+    )
 }
 
 async fn complete(pool: &durable_workflows::DurablePool, id: durable_workflows::WorkflowId) {
-    let coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
+    let mut coordinator = coordinator(pool, "rt1:coordinator", CoordinatorConfig::default());
     assert_eq!(
         coordinator.activate_one().await.expect("completes"),
         Some(id)
@@ -1017,7 +1010,7 @@ async fn heartbeat_extends_lease() {
 async fn expire_while_heartbeat_blocked(
     pool: &durable_workflows::DurablePool,
     gate_name: &str,
-    activity: i64,
+    activity: durable_workflows::ActivityId,
 ) {
     use diesel_async::SimpleAsyncConnection;
     let worker = named_worker(pool, "rtA:dispatcher", Duration::from_millis(100));
@@ -1132,12 +1125,12 @@ async fn crash_then_recovery() {
 }
 
 #[tokio::test]
-async fn cancel_while_running_fence_miss() {
+async fn cancel_while_running_settles_the_revoked_attempt() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let gate_name = "cancel_while_running_fence_miss";
-    let (id, _) = start_activity(
+    let gate_name = "cancel_while_running_settles_the_revoked_attempt";
+    let (id, activity_id) = start_activity(
         &pool,
         &HoldFlow {
             gate: gate_name.to_string(),
@@ -1155,9 +1148,30 @@ async fn cancel_while_running_fence_miss() {
         .expect("cancels");
     drop(connection);
     gate.release.add_permits(1);
+    // N2: the cancel revoked the attempt (`cancelling`); T-W3 settles it
+    // instead of applying the handler's result.
     assert!(matches!(
         run.await.expect("joins"),
-        Err(durable_workflows::DurableError::FencedWrite)
+        Ok(Some(ran)) if ran == activity_id
     ));
     assert_eq!(status(&pool, id).await, "cancelled");
+    let mut connection = pool.get().await.expect("connection");
+    let activity_status = durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<String>(&mut connection)
+        .await
+        .expect("activity row");
+    assert_eq!(activity_status, "cancelled");
+    let (outcome, finished_at) = durable_activity_attempt::table
+        .find((activity_id, 1))
+        .select((
+            durable_activity_attempt::outcome,
+            durable_activity_attempt::finished_at,
+        ))
+        .first::<(Option<String>, Option<durable_workflows::DbMillis>)>(&mut connection)
+        .await
+        .expect("attempt row");
+    assert!(finished_at.is_some(), "the revoked attempt is closed");
+    assert_eq!(outcome.as_deref(), Some("application_cancelled"));
 }

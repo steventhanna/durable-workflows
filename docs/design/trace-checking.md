@@ -25,23 +25,26 @@ model's invariants hold after each step.
 
 - Every library-owned transaction goes through `crate::dialect::transaction`
   (29 sites). Outermost-capable exceptions: `DurableStore::cancel_with_conn`
-  (`store.rs:81-103`), `start_with_conn` (`:140-152`),
-  `start_or_restart_recoverable_with_conn` (`:211-336`),
-  `start_prepared_with_conn` (`:357-369`); through `start` /
-  `start_or_restart_recoverable` they are savepoints (`:116`, `:187`).
+  (`store.rs`), `start_with_conn`,
+  `start_or_restart_recoverable_with_conn`,
+  `start_prepared_with_conn`. The pool-level `start` and
+  `start_or_restart_recoverable` methods open their own
+  `dialect::transaction` with a `tx::Trace`. The `_with_conn` methods use
+  `tx::caller_transaction`, which uses a savepoint only inside a caller
+  transaction.
 - Fences return `DurableError::FencedWrite` and roll back
-  (`coordinator.rs:911-917`, `activity_worker.rs:1275-1281`); the coordinator
-  propagates them (`coordinator.rs:217`, G1).
+  (`coordinator.rs` `ensure_fenced`, `activity_worker.rs` `ensure_fenced`); the coordinator
+  propagates them (`coordinator.rs` `WorkflowCoordinator::activate_claim_inner`, G1).
 - Each transaction samples `now` once (`persistence::database_now_millis`).
 - Deliverable events are appended only via `persistence::append_event`
-  (`events.rs:40-49`) and the `started` insert in `insert_started`
-  (`workflows.rs:35-48`). Parent wakes go through
-  `wake_loaded_parent_on_child_terminal` (`workflows.rs:154-245`); activity
-  cancels through `cancel_activities` (`store.rs:611-647`).
+  (`events.rs`) and the `started` insert in `insert_started`
+  (`workflows.rs`). Parent wakes go through
+  `wake_loaded_parent_on_child_terminal` (`workflows.rs`); activity
+  cancels through `cancel_activities` (`store.rs`).
 - Test DBs are fresh per test; the tokio test body runs on the test thread,
   which libtest names after the test path.
-- Coordinator id `"{runtime_id}:coordinator"` (`supervisor.rs:928`),
-  dispatcher `"{runtime_id}:dispatcher"` (`:1040`).
+- Coordinator id `"{runtime_id}:coordinator"` (`supervisor.rs` `run_task`),
+  dispatcher `"{runtime_id}:dispatcher"` (`run_task`).
 - Ids have gaps (dedup hits and rollbacks consume ids); the model assigns
   dense ids, so the checker maps real ids to model ids. Tokens are UUIDs; the
   checker interns them by first appearance.
@@ -217,14 +220,14 @@ checks `availableAt >= tnow`.
 | Code site | Record | Quint action | Parameters (source) |
 |---|---|---|---|
 | `store.rs` `insert_prepared` | `TX1_Start` | `TX1_Start(wNew, kind, key, inserted, tnow)` | kind, key, id, inserted |
-| `store.rs:195-337` | `TX2_RecoverableStart` | `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` | original, latest, successor; latest not failed/blocked → `Noop` |
-| `store.rs:69-104` | `TX3_Cancel` | `TX3_Cancel(w, tnow)` | terminal → not recorded |
-| `coordinator.rs:228-393` | `TC1_Claim` | `TC1_Claim(r, rec, cl, tok, leaseExp, tnow)` | recovered id, claimed id, token, lease |
-| `coordinator.rs:139-149` | `LC1_NoEvent` (local) | `LC1_NoEvent(r, w)` | |
-| `coordinator.rs:496-700` | `TC2_Commit` | `TC2_Continue` / `TC2_Complete` / `TC2_RunActivity(…, aNew, topic, maxAttempts, availableAt, tnow)` / `TC2_RunChild(…, key, existing, cNew, tnow)` | variant, new ids, child key; SleepUntil / WaitForApproval → `Unmodeled` |
-| `coordinator.rs:409-493` | `TC3_ActivationFailure` | `TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)` | |
-| `coordinator.rs:205-224` on `FencedWrite` | `CoordFenceMiss` (local) | `CoordFenceMiss(r, w, tok)` | |
-| `activity_worker.rs` `claim_one` / `claim_batch` | `TW1_Claim` | `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, claimed)` | per-topic `in_flight`, reconciled list, claims; error (G10) → `TW1_Error` (local) |
+| `store.rs` `start_or_restart_recoverable_with_conn` | `TX2_RecoverableStart` | `TX2_RecoverableStart(kind, key, orig, latest, superseded, sNew, tnow)` | original, latest, successor; latest not failed/blocked → `Noop` |
+| `store.rs` `cancel_with_conn` | `TX3_Cancel` | `TX3_Cancel(w, tnow)` | terminal → not recorded |
+| `coordinator.rs` `WorkflowCoordinator::claim_one` | `TC1_Claim` | `TC1_Claim(r, rec, cl, tok, leaseExp, tnow)` | recovered id, claimed id, token, lease |
+| `coordinator.rs` `WorkflowCoordinator::activate_claim_inner` | `LC1_NoEvent` (local) | `LC1_NoEvent(r, w)` | |
+| `coordinator.rs` `commit_on_connection`, `commit_wait_transition` | `TC2_Commit` | `TC2_Continue` / `TC2_Complete` / `TC2_RunActivity(…, aNew, topic, maxAttempts, availableAt, tnow)` / `TC2_RunChild(…, key, existing, cNew, tnow)` | variant, new ids, child key; SleepUntil / WaitForApproval → `Unmodeled` |
+| `coordinator.rs` `WorkflowCoordinator::record_activation_failure` | `TC3_ActivationFailure` | `TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)` | |
+| `coordinator.rs` `WorkflowCoordinator::activate_claim_inner` on `FencedWrite` | `CoordFenceMiss` (local) | `CoordFenceMiss(r, w, tok)` | |
+| `activity_worker.rs` `claim_one` / `claim_batch` | `TW1_Claim` | `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, quarantined, claimed)` | per-topic `in_flight`, reconciled and quarantined lists, claims; invalid rows are quarantined (v5+) |
 | `activity_worker.rs` outcome dispatch / timeout | `HandlerReturn` (local) | `HandlerReturn(r, a, tok, outcome)` | |
 | heartbeat failure past `lease_deadline` | `LocalDeadline` (local) | `LocalDeadline(r, a, tok)` | |
 | `heartbeat_once` | `TW2_Send` (local) + `TW2_Commit` | `TW2_Send(r, a, tok, hb)`, `TW2_Commit(hb, sample, leaseExp)` | fence miss → `TW2_FenceMiss`; dropped future → `TW2_Drop` |
@@ -234,7 +237,7 @@ checks `availableAt >= tnow`.
 
 ## 7. Requirements on the Quint model interface
 
-Pinned by `pure val TRACE_IFACE_VERSION = 1`; the generator refuses other
+Pinned by `pure val TRACE_IFACE_VERSION = 6`; the generator refuses other
 versions. Documented in `spec/README.md` "Trace-checking interface".
 
 1. Every choice is a parameter; `nondet` only in `step`.
@@ -250,13 +253,14 @@ versions. Documented in `spec/README.md` "Trace-checking interface".
 7. `kind: str` free; versions unmodeled.
 8. Explicit local actions: `CoordFenceMiss`, `TW3_FenceMiss`,
    `TW2_FenceMiss`, `TW2_Drop`, `LocalDeadline`, `HandlerReturn`,
-   `LC1_NoEvent`, `Crash`, `TW1_Error`.
+   `LC1_NoEvent`, `Crash`. Invalid activity rows appear in the
+   `quarantined` list on `TW1_Claim` (v5+).
 9. Views: `viewWf`, `viewAct`, `viewAtt`, `deliverable`.
 10. Instance constants sized per trace.
 11. Stable invariant names: `safety`, `inv_S17_capAtClaim`,
     `inv_S24_parentWakes`, `inv_G11_cancelReachesChildren`,
-    `inv_N1_tx2OwnLineage`, `inv_S13_topicConcurrency`,
-    `inv_G10_noAttemptCapError`.
+    `inv_G11_cancelReachesGenerations`, `inv_G8_noAncestorWait`,
+    `inv_S13_topicConcurrency`.
 
 ## 8. Replay
 
@@ -334,7 +338,7 @@ excluded count asserted so scope cannot shrink silently.
 | 0 | Model interface (§7), `TRACE_IFACE_VERSION`, README section | `quint test durable_tests.qnt` passes against new signatures |
 | 1a | Recorder core: feature, `trace/` + noop, hooks in both dialects and `store.rs`, event/insert touches, declarations for `TX1_Start`, `TC1_Claim`, `TC2_Commit{run_activity, complete}`, `TW1_Claim` (claims only), `HandlerReturn`, `TW3_Finish{succeeded}` | clippy clean with and without the feature; `activity_execution` green with and without; with the feature, the happy-path test's `durable_trace` holds `TX1_Start, TC1_Claim, TC2_Commit, TW1_Claim, HandlerReturn, TW3_Finish` with non-empty `post_json` |
 | 1b | End-to-end slice: fixture creates trace tables, `tests/trace_model.rs`, `tools/durable-trace` (`dump`, `gen` for the six actions), `spec/trace-check.sh` | the happy-path trace passes `quint test`; a hand-corrupted trace fails at the right step with a field diff; an `Unknown` action is excluded with a reason |
-| 2 | Full modeled coverage (all actions of §6, `Unmodeled` declarations, generator exclusion rules, `begin_seq` classification) | a source-scan unit test asserts every transaction site declares; child, reconcile and stale-lease traces pass |
+| 2 | Full modeled coverage (all actions of §6, `Unmodeled` declarations, generator exclusion rules, `begin_seq` classification) | a source-scan unit test asserts every transaction site declares (since replaced by the `tx::Trace` typestate: an undeclared transaction does not compile); child, reconcile and stale-lease traces pass |
 | 3a | External-write capture (triggers, `Env*` actions, interface v3), `gen --expect-violation` with `spec/traces/gaps.yaml`, suite replay on both backends | every in-scope trace passes, confirms its expected violation, or is excluded with a specific reason; every FAIL analysed |
 | 3b | CI job, field-level `report`, `docs/TRACE_CHECKING.md`, excluded count asserted | ≤ 10 min in CI |
 | 4 | Concurrent workload driver + nightly | 4 seeds × 20 s pass or are classified `concurrent`; at least one seed covers Crash, recovery, reconcile, `TW3_FenceMiss`; a deliberately removed fence is caught |

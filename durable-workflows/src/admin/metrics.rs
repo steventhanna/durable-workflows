@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::DbMillis;
 use diesel::{
     dsl::{count_star, min, not},
     BoolExpressionMethods, ExpressionMethods, JoinOnDsl, NullableExpressionMethods,
@@ -15,12 +16,13 @@ use crate::{
         MAX_ADMIN_PAGE_SIZE,
     },
     persistence::ScheduleStateRow,
-    persistence::{ActivityStatus, WorkflowStatus},
+    persistence::{ActivityStatus, ApprovalStatus, ScheduleRunStatus, WorkflowStatus},
     schema::{
         durable_activity, durable_activity_attempt, durable_approval, durable_schedule_run,
         durable_schedule_state, durable_topic_lock, durable_workflow,
     },
-    ApprovalId, DurableError, ScheduleRunId, TopicDefinition, TopicRegistry, WorkflowId,
+    ActivityId, ApprovalId, DurableError, ScheduleRunId, TopicDefinition, TopicRegistry,
+    WorkflowId,
 };
 
 use super::cursor::scoped_cursor_scope;
@@ -41,33 +43,33 @@ diesel::define_sql_function! {
 
 #[derive(diesel::Queryable)]
 struct ScheduleRunProjection {
-    id: i64,
+    id: ScheduleRunId,
     schedule_key: String,
     local_occurrence: String,
-    scheduled_for: i64,
-    materialized_at: i64,
-    status: String,
+    scheduled_for: DbMillis,
+    materialized_at: DbMillis,
+    status: ScheduleRunStatus,
     reason: Option<String>,
     actor_id: Option<i32>,
-    workflow_id: Option<i64>,
-    created_at: i64,
+    workflow_id: Option<WorkflowId>,
+    created_at: DbMillis,
     workflow_status: Option<WorkflowStatus>,
-    workflow_completed_at: Option<i64>,
+    workflow_completed_at: Option<DbMillis>,
 }
 
 #[derive(diesel::Queryable)]
 struct ApprovalListProjection {
-    id: i64,
-    workflow_id: i64,
+    id: ApprovalId,
+    workflow_id: WorkflowId,
     kind: String,
     version: i32,
-    status: String,
+    status: ApprovalStatus,
     decision_bytes: Option<i64>,
     decided_by: Option<i32>,
     operator_reason: Option<String>,
-    requested_at: i64,
-    expires_at: Option<i64>,
-    resolved_at: Option<i64>,
+    requested_at: DbMillis,
+    expires_at: Option<DbMillis>,
+    resolved_at: Option<DbMillis>,
 }
 
 impl AdminQueryService {
@@ -86,7 +88,7 @@ impl AdminQueryService {
         &self,
         topics: &TopicRegistry,
         page: PageRequest,
-        now: i64,
+        now: DbMillis,
     ) -> Result<AdminPage<TopicMetrics>, DurableError> {
         validate_now(now)?;
         let limit = page.bounded_limit(MAX_ADMIN_PAGE_SIZE)?;
@@ -116,7 +118,7 @@ impl AdminQueryService {
     async fn load_topic_metrics(
         &self,
         definitions: &[TopicDefinition],
-        now: i64,
+        now: DbMillis,
     ) -> Result<Vec<TopicMetrics>, DurableError> {
         if definitions.is_empty() {
             return Ok(Vec::new());
@@ -138,7 +140,7 @@ impl AdminQueryService {
             .filter(durable_activity::topic.eq_any(&keys))
             .filter(
                 durable_activity::status
-                    .eq(ActivityStatus::Running)
+                    .eq_any(ActivityStatus::SLOT_HOLDERS)
                     .and(durable_activity::lease_expires_at.gt(now)),
             )
             .group_by((durable_activity::topic, durable_activity::status))
@@ -166,17 +168,15 @@ impl AdminQueryService {
             )
             .filter(durable_activity::topic.eq_any(&keys))
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-            .filter(not(durable_workflow::status.eq_any([
-                WorkflowStatus::Succeeded,
-                WorkflowStatus::Failed,
-                WorkflowStatus::Cancelled,
-            ])))
+            .filter(not(
+                durable_workflow::status.eq_any(WorkflowStatus::TERMINAL)
+            ))
             .select((
                 durable_activity::topic,
                 durable_activity::id,
                 durable_activity::root_activity_id,
             ))
-            .load::<(String, i64, Option<i64>)>(&mut connection)
+            .load::<(String, ActivityId, Option<ActivityId>)>(&mut connection)
             .await?;
         let dead_letter_rows = if dead_letter_candidates.is_empty() {
             Vec::new()
@@ -211,19 +211,23 @@ impl AdminQueryService {
             .filter(durable_activity::status.eq(ActivityStatus::Pending))
             .filter(durable_activity::available_at.le(now))
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+            .filter(
+                durable_workflow::wait_reference_id
+                    .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+            )
             .group_by(durable_activity::topic)
             .select((
                 durable_activity::topic,
                 count_star(),
                 min(diesel::dsl::case_when(
-                    durable_activity::available_at
-                        .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
+                    durable_activity::available_at.eq(DbMillis::from_database_millis(
+                        crate::transition::CONTINUATION_READY_AT_MILLIS,
+                    )),
                     durable_activity::created_at,
                 )
                 .otherwise(durable_activity::available_at)),
             ))
-            .load::<(String, i64, Option<i64>)>(&mut connection)
+            .load::<(String, i64, Option<DbMillis>)>(&mut connection)
             .await?;
         let retry_rows = durable_activity::table
             .inner_join(
@@ -234,7 +238,10 @@ impl AdminQueryService {
             .filter(durable_activity::available_at.gt(now))
             .filter(durable_activity::attempt_count.gt(0))
             .filter(durable_workflow::status.eq(WorkflowStatus::WaitingActivity))
-            .filter(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))
+            .filter(
+                durable_workflow::wait_reference_id
+                    .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+            )
             .group_by(durable_activity::topic)
             .select((durable_activity::topic, count_star()))
             .load::<(String, i64)>(&mut connection)
@@ -249,14 +256,14 @@ impl AdminQueryService {
                     )),
             )
             .filter(durable_activity::topic.eq_any(&keys))
-            .filter(durable_activity::status.eq(ActivityStatus::Running))
+            .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
             .filter(durable_activity::lease_expires_at.gt(now))
             .group_by(durable_activity::topic)
             .select((
                 durable_activity::topic,
                 min(durable_activity_attempt::started_at),
             ))
-            .load::<(String, Option<i64>)>(&mut connection)
+            .load::<(String, Option<DbMillis>)>(&mut connection)
             .await?;
 
         let window = hourly_window(now);
@@ -269,8 +276,13 @@ impl AdminQueryService {
             hourly_rows.push(
                 durable_activity::table
                     .filter(durable_activity::topic.eq_any(&keys))
-                    .filter(durable_activity::completed_at.ge(starts_at))
-                    .filter(durable_activity::completed_at.lt(ends_at))
+                    .filter(
+                        durable_activity::completed_at
+                            .ge(DbMillis::from_database_millis(starts_at)),
+                    )
+                    .filter(
+                        durable_activity::completed_at.lt(DbMillis::from_database_millis(ends_at)),
+                    )
                     .group_by(durable_activity::topic)
                     .select((durable_activity::topic, count_star()))
                     .load::<(String, i64)>(&mut connection)
@@ -291,8 +303,9 @@ impl AdminQueryService {
         let mut active_counts = HashMap::new();
         for (topic, status, count) in status_rows {
             let count = nonnegative_count(count)?;
-            if status == ActivityStatus::Running {
-                active_counts.insert(topic, count);
+            if status.holds_slot() {
+                let active = active_counts.entry(topic).or_insert(0_u64);
+                *active = active.saturating_add(count);
             }
         }
 
@@ -357,19 +370,21 @@ impl AdminQueryService {
                         oldest_ready_by_topic
                             .get(&definition.key)
                             .copied()
-                            .flatten(),
+                            .flatten()
+                            .map(DbMillis::get),
                     ),
                     oldest_active_age_millis: age(
                         now,
                         oldest_active_by_topic
                             .get(&definition.key)
                             .copied()
-                            .flatten(),
+                            .flatten()
+                            .map(DbMillis::get),
                     ),
                     hourly_throughput: hourly_by_topic
                         .remove(&definition.key)
                         .unwrap_or_else(|| empty_hourly_throughput(window)),
-                    captured_at: now,
+                    captured_at: now.get(),
                 }
             })
             .collect())
@@ -558,11 +573,12 @@ impl AdminQueryService {
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
             .into_boxed::<crate::Db>();
         if let Some((timestamp, id)) = cursor {
+            let timestamp = DbMillis::from_database_millis(timestamp);
             query = query.filter(
                 durable_schedule_run::scheduled_for.lt(timestamp).or(
                     durable_schedule_run::scheduled_for
                         .eq(timestamp)
-                        .and(durable_schedule_run::id.lt(id)),
+                        .and(crate::ids::untyped_id(durable_schedule_run::id).lt(id)),
                 ),
             );
         }
@@ -602,23 +618,21 @@ impl AdminQueryService {
                     .on(durable_workflow::schedule_run_id.eq(durable_schedule_run::id.nullable())),
             )
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-            .filter(not(durable_workflow::status.eq_any([
-                WorkflowStatus::Succeeded,
-                WorkflowStatus::Cancelled,
-                WorkflowStatus::Failed,
-            ])))
+            .filter(not(
+                durable_workflow::status.eq_any(WorkflowStatus::TERMINAL)
+            ))
             .select(count_star())
             .first::<i64>(&mut connection)
             .await?;
         let skipped = durable_schedule_run::table
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-            .filter(durable_schedule_run::status.eq("skipped"))
+            .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Skipped))
             .select(count_star())
             .first::<i64>(&mut connection)
             .await?;
         let coalesced = durable_schedule_run::table
             .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-            .filter(durable_schedule_run::status.eq("coalesced"))
+            .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Coalesced))
             .select(count_star())
             .first::<i64>(&mut connection)
             .await?;
@@ -642,7 +656,7 @@ impl AdminQueryService {
     pub async fn list_approvals_at(
         &self,
         filter: ApprovalListFilter,
-        now: i64,
+        now: DbMillis,
     ) -> Result<AdminPage<ApprovalSummary>, DurableError> {
         validate_now(now)?;
         validate_approval_filter(&filter)?;
@@ -655,7 +669,7 @@ impl AdminQueryService {
             .transpose()?;
         let mut query = durable_approval::table.into_boxed::<crate::Db>();
         if let Some(workflow_id) = filter.workflow_id {
-            query = query.filter(durable_approval::workflow_id.eq(workflow_id.get()));
+            query = query.filter(durable_approval::workflow_id.eq(workflow_id));
         }
         if let Some(kind) = filter.kind {
             query = query.filter(durable_approval::kind.eq(kind));
@@ -664,37 +678,44 @@ impl AdminQueryService {
             query = query.filter(durable_approval::version.eq(version));
         }
         if let Some(status) = filter.status.as_deref() {
-            query = match status {
-                "expired" => query.filter(
-                    durable_approval::status
-                        .eq("expired")
-                        .or(durable_approval::status
-                            .eq("pending")
-                            .and(durable_approval::expires_at.le(now))),
+            query = match ApprovalStatus::try_from(status) {
+                Ok(ApprovalStatus::Expired) => query.filter(
+                    durable_approval::status.eq(ApprovalStatus::Expired).or(
+                        durable_approval::status
+                            .eq(ApprovalStatus::Pending)
+                            .and(durable_approval::expires_at.le(now)),
+                    ),
                 ),
-                "pending" => query.filter(
-                    durable_approval::status.eq("pending").and(
+                Ok(ApprovalStatus::Pending) => query.filter(
+                    durable_approval::status.eq(ApprovalStatus::Pending).and(
                         durable_approval::expires_at
                             .is_null()
                             .or(durable_approval::expires_at.gt(now)),
                     ),
                 ),
-                status => query.filter(durable_approval::status.eq(status)),
+                Ok(status @ (ApprovalStatus::Resolved | ApprovalStatus::Cancelled)) => {
+                    query.filter(durable_approval::status.eq(status))
+                }
+                // An unknown filter value still matches no row.
+                Err(_) => query.filter(durable_approval::status.eq(status)),
             };
         }
         if let Some(after) = filter.requested_after {
-            query = query.filter(durable_approval::requested_at.ge(after));
+            query = query
+                .filter(durable_approval::requested_at.ge(DbMillis::from_requested_millis(after)));
         }
         if let Some(before) = filter.requested_before {
-            query = query.filter(durable_approval::requested_at.lt(before));
+            query = query
+                .filter(durable_approval::requested_at.lt(DbMillis::from_requested_millis(before)));
         }
         if let Some((timestamp, id)) = cursor {
+            let timestamp = DbMillis::from_database_millis(timestamp);
             query = query.filter(
                 durable_approval::requested_at
                     .lt(timestamp)
                     .or(durable_approval::requested_at
                         .eq(timestamp)
-                        .and(durable_approval::id.lt(id))),
+                        .and(crate::ids::untyped_id(durable_approval::id).lt(id))),
             );
         }
         let mut connection = self.pool.get().await?;
@@ -728,7 +749,7 @@ impl AdminQueryService {
                     encode_cursor(
                         "approvals",
                         &CursorPosition {
-                            timestamp: row.requested_at,
+                            timestamp: row.requested_at.get(),
                             tie_breaker: row.id.to_string(),
                         },
                     )
@@ -752,54 +773,56 @@ fn schedule_state_summary(row: &ScheduleStateRow) -> ScheduleStateSummary {
         definition_fingerprint: row.definition_fingerprint.clone(),
         definition_version: row.definition_version,
         next_local_occurrence: row.next_local_occurrence.clone(),
-        next_occurrence_at: row.next_occurrence_at,
-        last_materialized_at: row.last_materialized_at,
-        paused_at: row.paused_at,
+        next_occurrence_at: row.next_occurrence_at.get(),
+        last_materialized_at: row.last_materialized_at.map(DbMillis::get),
+        paused_at: row.paused_at.map(DbMillis::get),
         paused_by: row.paused_by,
         pause_reason: row.pause_reason.clone(),
-        created_at: row.created_at,
-        updated_at: row.updated_at,
+        created_at: row.created_at.get(),
+        updated_at: row.updated_at.get(),
     }
 }
 
 fn schedule_run_summary(row: ScheduleRunProjection) -> Result<ScheduleRunSummary, DurableError> {
     Ok(ScheduleRunSummary {
-        id: ScheduleRunId::new(row.id)?,
+        id: row.id,
         schedule_key: row.schedule_key,
         local_occurrence: row.local_occurrence,
-        scheduled_for: row.scheduled_for,
-        materialized_at: row.materialized_at,
-        status: row.status,
+        scheduled_for: row.scheduled_for.get(),
+        materialized_at: row.materialized_at.get(),
+        status: row.status.to_string(),
         reason: row.reason,
         actor_id: row.actor_id,
-        workflow_id: row.workflow_id.map(WorkflowId::new).transpose()?,
+        workflow_id: row.workflow_id,
         workflow_status: row.workflow_status.map(|status| status.to_string()),
-        workflow_completed_at: row.workflow_completed_at,
-        created_at: row.created_at,
+        workflow_completed_at: row.workflow_completed_at.map(DbMillis::get),
+        created_at: row.created_at.get(),
     })
 }
 
 fn approval_summary(
     row: ApprovalListProjection,
-    now: i64,
+    now: DbMillis,
 ) -> Result<ApprovalSummary, DurableError> {
-    let status = if row.status == "pending" && row.expires_at.is_some_and(|expiry| expiry <= now) {
-        "expired".to_string()
+    let status = if row.status == ApprovalStatus::Pending
+        && row.expires_at.is_some_and(|expiry| expiry <= now)
+    {
+        ApprovalStatus::Expired
     } else {
         row.status
     };
     Ok(ApprovalSummary {
-        id: ApprovalId::new(row.id)?,
-        workflow_id: WorkflowId::new(row.workflow_id)?,
+        id: row.id,
+        workflow_id: row.workflow_id,
         kind: row.kind,
         version: row.version,
-        status,
+        status: status.to_string(),
         decision: json_summary(row.decision_bytes)?,
         decided_by: row.decided_by,
         operator_reason: row.operator_reason,
-        requested_at: row.requested_at,
-        expires_at: row.expires_at,
-        resolved_at: row.resolved_at,
+        requested_at: row.requested_at.get(),
+        expires_at: row.expires_at.map(DbMillis::get),
+        resolved_at: row.resolved_at.map(DbMillis::get),
     })
 }
 
@@ -859,11 +882,11 @@ struct HourlyWindow {
     exclusive_end: i64,
 }
 
-fn hourly_window(now: i64) -> HourlyWindow {
-    let current_hour = hour_bucket_start(now);
+fn hourly_window(now: DbMillis) -> HourlyWindow {
+    let current_hour = hour_bucket_start(now.get());
     HourlyWindow {
         first_hour: current_hour - (HOURLY_BUCKET_COUNT as i64 - 1) * HOUR_MILLIS,
-        exclusive_end: now.saturating_add(1),
+        exclusive_end: now.get().saturating_add(1),
     }
 }
 
@@ -883,8 +906,8 @@ fn hour_bucket_bounds(window: HourlyWindow, index: usize) -> (i64, i64) {
 
 async fn load_resolved_activity_roots<C>(
     connection: &mut C,
-    candidate_roots: &[i64],
-) -> Result<HashSet<i64>, DurableError>
+    candidate_roots: &[ActivityId],
+) -> Result<HashSet<ActivityId>, DurableError>
 where
     C: AsyncConnection<Backend = crate::Db> + Send,
 {
@@ -899,7 +922,7 @@ where
                         .or(durable_activity::id.eq_any(chunk)),
                 )
                 .select((durable_activity::id, durable_activity::root_activity_id))
-                .load::<(i64, Option<i64>)>(connection)
+                .load::<(ActivityId, Option<ActivityId>)>(connection)
                 .await?
                 .into_iter()
                 .map(|(id, root_activity_id)| root_activity_id.unwrap_or(id)),
@@ -917,8 +940,8 @@ fn empty_hourly_throughput(window: HourlyWindow) -> Vec<HourlyThroughputBucket> 
         .collect()
 }
 
-fn validate_now(now: i64) -> Result<(), DurableError> {
-    if now < 0 {
+fn validate_now(now: DbMillis) -> Result<(), DurableError> {
+    if now.get() < 0 {
         return Err(DurableError::InvalidDefinition(
             "captured time cannot be negative".to_string(),
         ));
@@ -950,8 +973,8 @@ fn nonnegative_count(count: i64) -> Result<u64, DurableError> {
 
 // Clamp future timestamps to 0: metrics freeze `now` once, then can observe
 // rows written with a later DB clock (common for active `started_at`).
-fn age(now: i64, timestamp: Option<i64>) -> Option<u64> {
-    timestamp.map(|timestamp| u64::try_from(now.saturating_sub(timestamp)).unwrap_or(0))
+fn age(now: DbMillis, timestamp: Option<i64>) -> Option<u64> {
+    timestamp.map(|timestamp| u64::try_from(now.get().saturating_sub(timestamp)).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -960,20 +983,27 @@ mod tests {
         age, empty_hourly_throughput, hour_bucket_bounds, hour_bucket_start, hourly_window,
         HOURLY_BUCKET_COUNT, HOUR_MILLIS,
     };
+    use crate::DbMillis;
 
     #[test]
     fn age_is_none_without_timestamp() {
-        assert_eq!(age(1_000, None), None);
+        assert_eq!(age(DbMillis::from_database_millis(1_000), None), None);
     }
 
     #[test]
     fn age_is_delta_when_timestamp_is_in_the_past() {
-        assert_eq!(age(1_000, Some(250)), Some(750));
+        assert_eq!(
+            age(DbMillis::from_database_millis(1_000), Some(250)),
+            Some(750)
+        );
     }
 
     #[test]
     fn age_clamps_future_timestamps_to_zero() {
-        assert_eq!(age(1_000, Some(1_500)), Some(0));
+        assert_eq!(
+            age(DbMillis::from_database_millis(1_000), Some(1_500)),
+            Some(0)
+        );
     }
 
     #[test]
@@ -986,10 +1016,10 @@ mod tests {
 
     #[test]
     fn hourly_window_covers_twenty_four_hours_ending_at_now() {
-        let now = 100_000_000;
+        let now = DbMillis::from_database_millis(100_000_000);
         let window = hourly_window(now);
         assert_eq!(window.first_hour, 14_400_000);
-        assert_eq!(window.exclusive_end, now + 1);
+        assert_eq!(window.exclusive_end, now.get() + 1);
         let buckets = empty_hourly_throughput(window);
         assert_eq!(buckets.len(), HOURLY_BUCKET_COUNT);
         assert_eq!(buckets[0].starts_at, window.first_hour);
@@ -999,7 +1029,7 @@ mod tests {
 
     #[test]
     fn hour_bucket_bounds_clip_the_current_hour_to_now() {
-        let window = hourly_window(100_000_000);
+        let window = hourly_window(DbMillis::from_database_millis(100_000_000));
         assert_eq!(
             hour_bucket_bounds(window, 0),
             (window.first_hour, window.first_hour + HOUR_MILLIS)

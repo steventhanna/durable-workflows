@@ -16,8 +16,9 @@ use tracing::Instrument;
 
 use crate::{
     observability::{
-        emit_readiness_alerts, emit_schedule_materialization_alert, HealthScanReport,
-        HealthScanner, HealthScannerConfig,
+        emit_readiness_alerts, emit_schedule_materialization_alert, ActivationCounters,
+        HealthScanReport, HealthScanner, HealthScannerConfig,
+        DEFAULT_MAX_TRANSIENT_ACTIVATION_ERRORS, DEFAULT_TRANSIENT_ACTIVATION_WINDOW,
     },
     persistence, ActivityRegistry, ActivityWorker, ApprovalExpiryMaterializer, CoordinatorConfig,
     DurableError, DurablePool, ReadinessReport, ScheduleMaterializer, ScheduleRegistry,
@@ -27,13 +28,19 @@ use crate::{
 const MAX_TEMPORAL_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RuntimeConfig {
     pub coordinator: CoordinatorConfig,
     pub worker: WorkerConfig,
     pub idle_delay: Duration,
     pub restart_backoff: Duration,
     pub forced_shutdown_timeout: Duration,
+    /// Restarts of one task allowed within `restart_window`; one more cancels
+    /// the runtime.
     pub max_task_restarts: u32,
+    /// The window `max_task_restarts` counts over. A task's count starts again
+    /// once its first counted restart is older than this.
+    pub restart_window: Duration,
     pub max_workers_per_topic: u32,
     pub health_scan_interval: Duration,
     pub health_stale_after: Duration,
@@ -41,6 +48,13 @@ pub struct RuntimeConfig {
     pub timer_poll_interval: Duration,
     pub approval_expiry_poll_interval: Duration,
     pub schedule_poll_interval: Duration,
+    /// Transient database errors that roll back workflow activations of this
+    /// process allowed within `transient_activation_error_window`; one more
+    /// adds `HealthAlert::TransientActivationErrors` to the next health report.
+    pub max_transient_activation_errors: u32,
+    /// The window `max_transient_activation_errors` counts over. A count
+    /// starts again once its first error is older than this.
+    pub transient_activation_error_window: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -52,6 +66,7 @@ impl Default for RuntimeConfig {
             restart_backoff: Duration::from_secs(1),
             forced_shutdown_timeout: Duration::from_secs(5),
             max_task_restarts: 8,
+            restart_window: Duration::from_secs(10 * 60),
             max_workers_per_topic: 4,
             health_scan_interval: Duration::from_secs(60),
             health_stale_after: Duration::from_secs(5 * 60),
@@ -59,7 +74,122 @@ impl Default for RuntimeConfig {
             timer_poll_interval: Duration::from_secs(10),
             approval_expiry_poll_interval: Duration::from_secs(10),
             schedule_poll_interval: Duration::from_secs(10),
+            max_transient_activation_errors: DEFAULT_MAX_TRANSIENT_ACTIVATION_ERRORS,
+            transient_activation_error_window: DEFAULT_TRANSIENT_ACTIVATION_WINDOW,
         }
+    }
+}
+
+/// Builder-style setters. The struct is `#[non_exhaustive]`: start from
+/// [`RuntimeConfig::default`] and override fields with these. Bounds (non-zero
+/// durations and counts) are checked where the config is used, not here.
+impl RuntimeConfig {
+    #[must_use]
+    pub const fn with_coordinator(mut self, coordinator: CoordinatorConfig) -> Self {
+        self.coordinator = coordinator;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_worker(mut self, worker: WorkerConfig) -> Self {
+        self.worker = worker;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_idle_delay(mut self, idle_delay: Duration) -> Self {
+        self.idle_delay = idle_delay;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_restart_backoff(mut self, restart_backoff: Duration) -> Self {
+        self.restart_backoff = restart_backoff;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_forced_shutdown_timeout(mut self, forced_shutdown_timeout: Duration) -> Self {
+        self.forced_shutdown_timeout = forced_shutdown_timeout;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_task_restarts(mut self, max_task_restarts: u32) -> Self {
+        self.max_task_restarts = max_task_restarts;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_restart_window(mut self, restart_window: Duration) -> Self {
+        self.restart_window = restart_window;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_workers_per_topic(mut self, max_workers_per_topic: u32) -> Self {
+        self.max_workers_per_topic = max_workers_per_topic;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_scan_interval(mut self, health_scan_interval: Duration) -> Self {
+        self.health_scan_interval = health_scan_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_stale_after(mut self, health_stale_after: Duration) -> Self {
+        self.health_stale_after = health_stale_after;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_health_alerts_per_kind(
+        mut self,
+        max_health_alerts_per_kind: u32,
+    ) -> Self {
+        self.max_health_alerts_per_kind = max_health_alerts_per_kind;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_timer_poll_interval(mut self, timer_poll_interval: Duration) -> Self {
+        self.timer_poll_interval = timer_poll_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_approval_expiry_poll_interval(
+        mut self,
+        approval_expiry_poll_interval: Duration,
+    ) -> Self {
+        self.approval_expiry_poll_interval = approval_expiry_poll_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_schedule_poll_interval(mut self, schedule_poll_interval: Duration) -> Self {
+        self.schedule_poll_interval = schedule_poll_interval;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_transient_activation_errors(
+        mut self,
+        max_transient_activation_errors: u32,
+    ) -> Self {
+        self.max_transient_activation_errors = max_transient_activation_errors;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_transient_activation_error_window(
+        mut self,
+        transient_activation_error_window: Duration,
+    ) -> Self {
+        self.transient_activation_error_window = transient_activation_error_window;
+        self
     }
 }
 
@@ -91,6 +221,7 @@ pub struct DurableRuntime<C> {
     config: RuntimeConfig,
     health_alert_sink: Option<HealthAlertSink>,
     topic_worker_limits: HashMap<String, u32>,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 impl<C> DurableRuntime<C>
@@ -113,6 +244,7 @@ where
             || config.restart_backoff.is_zero()
             || config.forced_shutdown_timeout.is_zero()
             || config.max_task_restarts == 0
+            || config.restart_window.is_zero()
             || config.max_workers_per_topic == 0
             || config.health_scan_interval.is_zero()
             || config.health_stale_after.is_zero()
@@ -126,11 +258,16 @@ where
                 "durable runtime identity and bounds must be non-zero".to_string(),
             ));
         }
+        config.coordinator.validate()?;
         HealthScannerConfig {
             stale_after: config.health_stale_after,
             max_alerts_per_kind: config.max_health_alerts_per_kind,
         }
         .validate()?;
+        let activation_counters = Arc::new(ActivationCounters::new(
+            config.max_transient_activation_errors,
+            config.transient_activation_error_window,
+        )?);
         Ok(Self {
             pool,
             context,
@@ -142,6 +279,7 @@ where
             config,
             health_alert_sink: None,
             topic_worker_limits: HashMap::new(),
+            activation_counters,
         })
     }
 
@@ -215,6 +353,7 @@ where
             health_alert_sink: self.health_alert_sink,
             activity_executions,
             topic_worker_limits: self.topic_worker_limits,
+            activation_counters: self.activation_counters.clone(),
         });
         let completion_guard = CompletionGuard(completion.clone());
         let supervisor = tokio::spawn(async move {
@@ -227,6 +366,7 @@ where
             completion,
             supervisor,
             forced_shutdown_timeout: self.config.forced_shutdown_timeout,
+            activation_counters: self.activation_counters,
         })
     }
 }
@@ -237,6 +377,7 @@ pub struct RuntimeHandle {
     completion: CancellationToken,
     supervisor: JoinHandle<Vec<RuntimeTaskError>>,
     forced_shutdown_timeout: Duration,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 impl Drop for RuntimeHandle {
@@ -254,6 +395,13 @@ impl RuntimeHandle {
 
     pub fn completion_token(&self) -> CancellationToken {
         self.completion.clone()
+    }
+
+    /// Benign workflow activation outcomes (lost fences and transient
+    /// database errors) of this process's coordinators, which are logged
+    /// and skipped rather than failing the coordinator task (G1).
+    pub fn activation_counters(&self) -> Arc<ActivationCounters> {
+        self.activation_counters.clone()
     }
 
     pub async fn shutdown(mut self, deadline: Duration) -> Result<(), RuntimeShutdownError> {
@@ -315,6 +463,7 @@ struct RuntimeParts<C> {
     health_alert_sink: Option<HealthAlertSink>,
     activity_executions: ActivityExecutionManager,
     topic_worker_limits: HashMap<String, u32>,
+    activation_counters: Arc<ActivationCounters>,
 }
 
 type ActivityExecution = Pin<Box<dyn Future<Output = Result<(), DurableError>> + Send>>;
@@ -789,7 +938,7 @@ where
     );
 
     let mut errors = Vec::new();
-    let mut restarts = HashMap::<TaskSpec, u32>::new();
+    let mut restarts = HashMap::<TaskSpec, RestartBudget>::new();
     while let Some(joined) = tasks.join_next_with_id().await {
         let (task_id, result) = match joined {
             Ok((task_id, result)) => (task_id, Ok(result)),
@@ -850,9 +999,15 @@ where
             parts.cancellation.cancel();
             continue;
         }
-        let restart_count = restarts.entry(spec.clone()).or_default();
-        *restart_count = restart_count.saturating_add(1);
-        if *restart_count > parts.config.max_task_restarts {
+        let within_budget = restarts
+            .entry(spec.clone())
+            .or_insert_with(|| RestartBudget::new(tokio::time::Instant::now()))
+            .record(
+                tokio::time::Instant::now(),
+                parts.config.restart_window,
+                parts.config.max_task_restarts,
+            );
+        if !within_budget {
             parts.cancellation.cancel();
             if spec == TaskSpec::ActivityDispatcher {
                 if let Err(error) = parts.activity_executions.shutdown().await {
@@ -868,6 +1023,115 @@ where
         }
     }
     errors
+}
+
+/// Restarts of one task counted within a window that starts at the first
+/// restart after the previous window ended.
+#[derive(Debug)]
+struct RestartBudget<I = tokio::time::Instant> {
+    count: u32,
+    window_started: I,
+}
+
+/// The clock a [`RestartBudget`] reads: `tokio::time::Instant` in the
+/// runtime. Generic only so the Kani proof can use a model clock (Kani
+/// cannot call `clock_gettime`, so it cannot build a real `Instant`).
+trait BudgetInstant: Copy {
+    fn saturating_duration_since(self, earlier: Self) -> Duration;
+}
+
+impl BudgetInstant for tokio::time::Instant {
+    fn saturating_duration_since(self, earlier: Self) -> Duration {
+        tokio::time::Instant::saturating_duration_since(&self, earlier)
+    }
+}
+
+impl<I: BudgetInstant> RestartBudget<I> {
+    fn new(now: I) -> Self {
+        Self {
+            count: 0,
+            window_started: now,
+        }
+    }
+
+    /// Counts one restart at `now`; false once the window holds more than
+    /// `max_restarts`.
+    fn record(&mut self, now: I, window: Duration, max_restarts: u32) -> bool {
+        if now.saturating_duration_since(self.window_started) > window {
+            self.count = 0;
+            self.window_started = now;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count <= max_restarts
+    }
+}
+
+/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking").
+#[cfg(kani)]
+mod restart_budget_verification {
+    use super::*;
+
+    /// A model clock: the time since an arbitrary origin.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct ModelInstant(Duration);
+
+    impl BudgetInstant for ModelInstant {
+        fn saturating_duration_since(self, earlier: Self) -> Duration {
+            self.0.saturating_sub(earlier.0)
+        }
+    }
+
+    /// Any `Duration`, built without the division `Duration::from_nanos`
+    /// needs (a 64-bit division makes the proof take minutes).
+    fn any_duration() -> Duration {
+        let nanos: u32 = kani::any();
+        kani::assume(nanos < 1_000_000_000);
+        Duration::new(kani::any(), nanos)
+    }
+
+    /// `later > earlier + span`, computed on (seconds, nanoseconds) pairs
+    /// with an explicit carry; no multiplication, which SAT solvers handle
+    /// badly when they must prove it equal to `Duration` arithmetic.
+    fn exceeds(later: Duration, earlier: Duration, span: Duration) -> bool {
+        let nanos = earlier.subsec_nanos() + span.subsec_nanos();
+        let carry = nanos >= 1_000_000_000;
+        let end_nanos = if carry { nanos - 1_000_000_000 } else { nanos };
+        let end_secs =
+            u128::from(earlier.as_secs()) + u128::from(span.as_secs()) + u128::from(carry);
+        let later_secs = u128::from(later.as_secs());
+        later_secs > end_secs || (later_secs == end_secs && later.subsec_nanos() > end_nanos)
+    }
+
+    /// For any budget state, restart time, window and limit: a restart
+    /// more than `window` after the window start opens a new window with a
+    /// count of 1; otherwise the count grows by one, saturating, so it
+    /// never wraps to 0; the result is `count <= max_restarts`. A restart
+    /// time before the window start (the clock is monotonic, but the model
+    /// allows it) counts in the current window.
+    #[kani::proof]
+    fn restart_budget_resets_after_the_window_and_never_wraps() {
+        let started = any_duration();
+        let now = any_duration();
+        let window = any_duration();
+        let count: u32 = kani::any();
+        let max_restarts: u32 = kani::any();
+        let mut budget = RestartBudget {
+            count,
+            window_started: ModelInstant(started),
+        };
+
+        let allowed = budget.record(ModelInstant(now), window, max_restarts);
+
+        if exceeds(now, started, window) {
+            assert!(budget.count == 1);
+            assert!(budget.window_started == ModelInstant(now));
+        } else {
+            assert!(budget.count == count.saturating_add(1));
+            assert!(budget.window_started == ModelInstant(started));
+        }
+        assert!(budget.count >= 1);
+        assert!(allowed == (budget.count <= max_restarts));
+    }
 }
 
 struct CompletionGuard(CancellationToken);
@@ -920,14 +1184,15 @@ where
             panicked: false,
         }),
         TaskSpec::Coordinator => {
-            let coordinator = WorkflowCoordinator::new(
+            let mut coordinator = WorkflowCoordinator::new(
                 parts.pool.clone(),
                 parts.context.clone(),
                 parts.workflows.clone(),
                 parts.activities.clone(),
                 format!("{}:coordinator", parts.runtime_id),
                 parts.config.coordinator,
-            )?;
+            )?
+            .with_activation_counters(parts.activation_counters.clone());
             loop {
                 if parts.cancellation.is_cancelled() {
                     return Ok(());
@@ -952,7 +1217,10 @@ where
                 if parts.cancellation.is_cancelled() {
                     return Ok(());
                 }
-                let report = scanner.scan_once(database_now(&parts.pool).await?).await?;
+                let mut report = scanner.scan_once(database_now(&parts.pool).await?).await?;
+                report
+                    .alerts
+                    .extend(parts.activation_counters.take_transient_alert());
                 report.emit();
                 if let Some(sink) = &parts.health_alert_sink {
                     // A faulty sink must not take down workflow execution: an
@@ -1101,9 +1369,20 @@ where
                         (topic.key, configured.saturating_sub(active))
                     })
                     .collect();
-                let claims = activity_worker
+                let claims = match activity_worker
                     .claim_batch(available, &local_topic_capacity)
-                    .await?;
+                    .await
+                {
+                    Ok(claims) => claims,
+                    Err(error) if crate::dialect::is_transient_error(&error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "activity claim rolled back on a transient database error; retrying"
+                        );
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 if claims.is_empty() {
                     let delay = jittered_idle_delay(
                         idle_delays[empty_sweeps.min(idle_delays.len() - 1)],
@@ -1140,7 +1419,7 @@ async fn wait_for_work(cancellation: &CancellationToken, idle_delay: Duration) {
     }
 }
 
-async fn database_now(pool: &DurablePool) -> Result<i64, DurableError> {
+async fn database_now(pool: &DurablePool) -> Result<crate::DbMillis, DurableError> {
     let mut connection = pool.get().await?;
     persistence::database_now_millis(&mut connection).await
 }
@@ -1427,5 +1706,26 @@ mod tests {
         assert_eq!(local_topic_limit("rtms", 40, 4, &limits), 24);
         assert_eq!(local_topic_limit("billing", 40, 4, &limits), 4);
         assert_eq!(local_topic_limit("rtms", 12, 4, &limits), 12);
+    }
+
+    #[test]
+    fn restart_budget_counts_within_the_window_and_resets_after_it() {
+        let window = Duration::from_secs(600);
+        let start = tokio::time::Instant::now();
+        let mut budget = RestartBudget::new(start);
+        assert!(budget.record(start, window, 2));
+        assert!(budget.record(start + Duration::from_secs(300), window, 2));
+        assert!(
+            !budget.record(start + window, window, 2),
+            "a third restart inside the window exceeds a budget of 2"
+        );
+
+        let later = start + window + Duration::from_secs(1);
+        assert!(
+            budget.record(later, window, 2),
+            "a restart after the window starts a new count"
+        );
+        assert!(budget.record(later + Duration::from_secs(1), window, 2));
+        assert!(!budget.record(later + Duration::from_secs(2), window, 2));
     }
 }

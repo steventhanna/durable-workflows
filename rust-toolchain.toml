@@ -1,4 +1,4 @@
 # OTLP (`opentelemetry-otlp` / `prost` 0.14) needs edition 2024, which is
-# rustc 1.85+. CI and the Docker builder already use current stable.
+# rustc 1.85+. The pinned version also fixes compiler diagnostic snapshots.
 [toolchain]
-channel = "stable"
+channel = "1.92.0"

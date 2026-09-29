@@ -1,0 +1,7 @@
+error[E0615]: attempted to take value of method `deduplication_key` on type `StartOptions`
+ --> tests/ui/fail/start_options_dedup_key_field_private.rs:8:13
+  |
+8 |     options.deduplication_key = Some("key".to_string());
+  |             ^^^^^^^^^^^^^^^^^ method, not a field
+  |
+  = help: methods are immutable and cannot be assigned to

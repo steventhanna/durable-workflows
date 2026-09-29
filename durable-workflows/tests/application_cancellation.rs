@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use async_trait::async_trait;
@@ -86,10 +87,9 @@ fn worker(
         ),
         Arc::new(durable_workflows::register_durable_topics!(CaptureTopic).expect("topics")),
         "cleanup-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(20),
-            shutdown_grace: Duration::from_millis(150),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(20))
+            .with_shutdown_grace(Duration::from_millis(150)),
     )
     .expect("worker")
 }
@@ -126,14 +126,13 @@ async fn schedule_activity(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let workflow_id = DurableStore::new(pool.clone())
         .start(&HostWorkflow, StartOptions::default())
         .await
         .expect("workflow start")
-        .workflow_id
-        .get();
-    let now = durable_workflows::persistence::now_millis();
+        .workflow_id;
+    let now = support::db_now(pool).await;
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
@@ -147,7 +146,7 @@ async fn schedule_activity(
                 .expect("payload"),
             status: durable_workflows::persistence::ActivityStatus::try_from("pending")
                 .expect("valid fixture status"),
-            available_at: now,
+            available_at: DbMillis::from_database_millis(now),
             max_attempts,
             attempt_count: 0,
             timeout_millis,
@@ -163,8 +162,8 @@ async fn schedule_activity(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: DbMillis::from_database_millis(now),
+            updated_at: DbMillis::from_database_millis(now),
             completed_at: None,
         })
         .execute(&mut connection)
@@ -173,14 +172,14 @@ async fn schedule_activity(
     let activity_id = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity id");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -249,13 +248,11 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
     use durable_workflows::{
         persistence::ActivityAttemptRow,
         schema::{durable_activity_attempt, durable_workflow_event},
-        WorkflowId,
     };
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
     let (workflow_id, activity_id) = schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
-    let workflow_id = WorkflowId::new(workflow_id).expect("workflow id");
     let (_, next_activity_id) = schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
     let worker = worker(pool.clone(), Arc::new(CleanupContext::default()));
     let claim = worker
@@ -263,7 +260,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         .await
         .expect("claim")
         .expect("old claim");
-    assert_eq!(claim.activity_id().expect("activity id").get(), activity_id);
+    assert_eq!(claim.activity_id(), activity_id);
     assert!(worker
         .claim_one("capture")
         .await
@@ -314,10 +311,22 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         .first::<ActivityAttemptRow>(&mut connection)
         .await
         .expect("attempt");
-    assert!(attempt.finished_at.is_some());
-    assert_eq!(attempt.outcome.as_deref(), Some("application_cancelled"));
+    // N2: the revoked attempt stays open, holding its lease and topic slot,
+    // until its handler stops or its lease expires.
+    assert!(attempt.finished_at.is_none());
+    let revoked = durable_activity::table
+        .find(activity_id)
+        .select(ActivityRow::as_select())
+        .first::<ActivityRow>(&mut connection)
+        .await
+        .expect("activity");
+    assert_eq!(revoked.status.as_str(), "cancelling");
+    assert_eq!(
+        revoked.last_error_category.as_deref(),
+        Some("application_cancelled")
+    );
     let events = durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq("workflow_cancelled"))
         .select((
             durable_workflow_event::actor_type,
@@ -336,7 +345,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         )]
     );
     let status = durable_workflow::table
-        .find(workflow_id.get())
+        .find(workflow_id)
         .select(durable_workflow::status)
         .first::<durable_workflows::persistence::WorkflowStatus>(&mut connection)
         .await
@@ -347,26 +356,60 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
         worker.heartbeat(&claim).await,
         Err(DurableError::FencedWrite)
     ));
+    assert!(worker
+        .claim_one("capture")
+        .await
+        .expect("claim while revoked")
+        .is_none());
+    // This claim has no handler, so lease expiry settles the revoke. The
+    // trace records that no handler holds it (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "cleanup-worker",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set(durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(1_i64))))
+        .execute(&mut connection)
+        .await
+        .expect("expire lease");
+    drop(connection);
     let next_claim = worker
         .claim_one("capture")
         .await
         .expect("next claim")
         .expect("released capacity");
+    assert_eq!(next_claim.activity_id(), next_activity_id);
+    let mut connection = pool.get().await.expect("connection");
+    let attempt = durable_activity_attempt::table
+        .find((activity_id, 1))
+        .select(ActivityAttemptRow::as_select())
+        .first::<ActivityAttemptRow>(&mut connection)
+        .await
+        .expect("attempt");
+    assert!(attempt.finished_at.is_some());
     assert_eq!(
-        next_claim.activity_id().expect("next id").get(),
-        next_activity_id
+        attempt.outcome.map(|outcome| outcome.as_str()),
+        Some("lease_expired")
     );
+    let settled = durable_activity::table
+        .find(activity_id)
+        .select(ActivityRow::as_select())
+        .first::<ActivityRow>(&mut connection)
+        .await
+        .expect("activity");
+    assert_eq!(settled.status.as_str(), "cancelled");
+    drop(connection);
 
     let (pending_workflow, pending_activity) =
         schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
     let mut connection = pool.get().await.expect("connection");
-    DurableStore::cancel_with_conn(
-        &mut connection,
-        WorkflowId::new(pending_workflow).expect("pending workflow"),
-        "stopped before dispatch",
-    )
-    .await
-    .expect("cancel pending");
+    DurableStore::cancel_with_conn(&mut connection, pending_workflow, "stopped before dispatch")
+        .await
+        .expect("cancel pending");
     let pending = durable_activity::table
         .find(pending_activity)
         .select(ActivityRow::as_select())
@@ -385,7 +428,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
             .expect("start")
             .workflow_id;
         let mut connection = pool.get().await.expect("connection");
-        diesel::update(durable_workflow::table.find(id.get()))
+        diesel::update(durable_workflow::table.find(id))
             .set(durable_workflow::status.eq(status))
             .execute(&mut connection)
             .await
@@ -397,7 +440,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
             .await
             .expect("cancel status");
         let actual = durable_workflow::table
-            .find(id.get())
+            .find(id)
             .select(durable_workflow::status)
             .first::<durable_workflows::persistence::WorkflowStatus>(&mut connection)
             .await
@@ -413,5 +456,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
     }
 }
 
+#[path = "application_cancellation/reconcile_lock.rs"]
+mod reconcile_lock;
 #[path = "application_cancellation/timeout_cleanup.rs"]
 mod timeout_cleanup;

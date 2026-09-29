@@ -29,20 +29,24 @@
  *   TC2_Continue / TC2_Complete / TC2_RunActivity / TC2_RunChild   T-C2 coordinator.rs commit_on_connection,
  *                                 commit_wait_transition, commit_activity, commit_child
  *   TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)  T-C3 coordinator.rs record_activation_failure
- *   CoordFenceMiss(r, w, tok)     T-C2/T-C3 fence miss -> FencedWrite -> task error (G1)
+ *   CoordFenceMiss(r, w, tok)     T-C2/T-C3 fence miss -> FencedWrite -> rollback, logged; not a task error
  *   T-W1 (activity_worker.rs claim_batch / claim_one), simulation form, one action per statement group:
  *     TW1_BeginBatch(r)           topic rows FOR UPDATE SKIP LOCKED (all or nothing), then now
  *     TW1_BeginOne(r, t, tnow)    claim_one: now sampled BEFORE the blocking topic FOR UPDATE
- *     TW1_ReconcileScan(r, t)     reconcile_expired: plain candidate read (running, lease <= now)
- *     TW1_ReconcileRow(r, a, availableAt)  reconcile_expired: workflow FOR UPDATE, activity FOR UPDATE + recheck,
- *                                 updates (pending at availableAt = now + retry delay, or dead-lettered at now)
+ *     TW1_ReconcileScan(r, t)     reconcile_expired: plain candidate read (running or cancelling, lease <= now)
+ *     TW1_ReconcileRow(r, a, availableAt)  reconcile_expired: workflow FOR UPDATE SKIP LOCKED, activity FOR UPDATE + recheck,
+ *                                 updates (pending at availableAt = now + retry delay, or dead-lettered at now;
+ *                                 a cancelling row settles: settle_revoked, N2)
+ *     TW1_ReconcileLockSkip(r, a) reconcile_expired: SKIP LOCKED passed the workflow row (another transaction
+ *                                 holds it): a stays expired and unsettled, counted in in_flight, for a later sweep
  *     TW1_Count(r)                in_flight count + candidate join (two plain reads)
  *     TW1_ClaimRow(r, a, tok)     claim_locked_candidate: workflow + activity FOR UPDATE SKIP LOCKED + recheck, claim
+ *     TW1_QuarantineRow(r, a)     claim_locked_candidate: the locked row is past its attempt cap or has invalid
+ *                                 bounds -> dead-lettered, its workflow blocked; the T-W1 goes on (G10 fixed)
  *     TW1_SkipRow(r, a)           claim_locked_candidate returns None (recheck fails or SKIP LOCKED)
  *     TW1_Commit(r)               COMMIT
- *   T-W1 replay form: TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, claimed) (one committed T-W1)
- *   TW1_Error(r, a, reason)       T-W1 claim_locked_candidate error on row a (attempt_cap | invalid_bounds)
- *                                 -> the whole T-W1 rolls back, task error (G10)
+ *   T-W1 replay form: TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, quarantined, claimed)
+ *                                 (one committed T-W1)
  *   EnvCorruptActivityBounds(a)   environment: an external write (raw SQL, serde-built command) leaves
  *                                 activity a with invalid timeout/lease bounds (ENABLE_ENV_EDITS)
  *   EnvSetWf(w, row) / EnvSetAct(a, row) / EnvSetAtt(a, n, row) / EnvAppendEvent(w, ev)
@@ -50,9 +54,10 @@
  *                                 write sets one durable row / appends one deliverable event (ENABLE_ENV_EDITS)
  *   TW2_Send(r, a, tok, hb) / TW2_Commit(hb, sample, leaseExp) / TW2_FenceMiss(hb) / TW2_Drop(hb)
  *                                 T-W2 activity_worker.rs heartbeat_once / heartbeat_loop
- *   HandlerReturn(r, a, tok, outcome)  L-W handler returns / times out (local step)
+ *   HandlerReturn(r, a, tok, outcome)  L-W handler returns / times out / stops after a revoke (local step)
  *   LocalDeadline(r, a, tok)      L-W activity_worker.rs execute_claim: local lease deadline -> no T-W3
  *   TW3_Finish(r, a, tok, outcome, availableAt, tnow)  T-W3 activity_worker.rs finish_on_connection
+ *   TW3_Revoked(r, a, tok, tnow)  T-W3 finish_on_connection on a cancelling row -> settle_revoked (N2)
  *   TW3_FenceMiss(r, a, tok)      T-W3 fence miss or missing wait -> rollback
  *   AdminPause(w, tnow)           T-A2 admin/control.rs pause_workflow (+ pause_activity: S36)
  *   AdminResume(w, tnow)          T-A3 admin/control.rs resume_workflow / resume_status
@@ -73,14 +78,23 @@
  *   S12 inv_S12_attemptsBounded   S13 inv_S13_oneHandler, inv_S13_topicConcurrency
  *   S14 inv_S14_actTerminal       S15 inv_S15_actWfCoupling    S16 inv_S16_successOnce
  *   S17 inv_S17_capAtClaim (as stated), inv_S17_capAlways (between commits)
- *   S18 inv_S18_dedup             S19 inv_S19_successor, inv_S19_sourceTerminal   S23 inv_S23_childOnce
- *   S24 inv_S24_exceptTX2 (as claimed), inv_S24_parentWakes (unrestricted)   S25 inv_S25_cancelAtomic
- *   G2  inv_S24_parentWakes (T-X2 path)          G7  inv_S17_capAlways (RR_SNAPSHOT only)
- *   G10 inv_G10_noClaimAbort (one row aborts every topic's claims) G11 inv_G11_cancelReachesChildren
- *   N1  inv_N1_tx2OwnLineage (T-X2 lineage query on a child key: supersession and ReturnLatest)
- *   G1  inv_G1_noSelfCancelFromOperator (an operator pause/cancel during a claim costs restart budget)
- *   N2  inv_S13_topicConcurrency (executing handlers per topic can exceed the cap after cancel)
- *   N3  inv_S19_sourceTerminal (public StartOptions.restarted_from_workflow_id accepts a live source)
+ *   S18 inv_S18_dedup             S19 inv_S19_successor, inv_S19_sourceTerminal (both in `safety`)   S23 inv_S23_childOnce
+ *   S24 inv_S24_parentWakes (every path, T-X2 included)   S25 inv_S25_cancelAtomic
+ *   G2  fixed: T-X2 re-points the superseded row's waiting parents to its successor (S24 in `safety`)
+ *   G7  inv_S17_capAlways (RR_SNAPSHOT only)
+ *   G10 fixed: TW1_QuarantineRow (an invalid row no longer aborts every topic's claims)
+ *   G11 fixed: T-X3/T-A4, and T-X2 when it supersedes a blocked row, cancel every generation of
+ *       the owned auto-keyed children, recursively (cancelTargets; inv_G11_cancelReachesChildren,
+ *       inv_G11_cancelReachesGenerations in `safety`).
+ *       Domain-keyed children keep running (intended). T-A5 is unmodeled.
+ *   N1  fixed: T-X2's newest generation is the end of the keyed row's restartedFrom chain (tx2Latest)
+ *   D4  TC2_RunChild attaches to the newest generation of the keyed row (newestGen)
+ *   G8  fixed: TC2_RunChild never attaches to the caller or an ancestor, through restart lineage
+ *       too (selfAndAncestors; inv_G8_noAncestorWait, in `safety`)
+ *   G1  inv_G1_noSelfCancelFromOperator (fixed; in `safety`: a coordinator never errors)
+ *   N2  fixed: cancel/pause revoke a running activity to cancelling, which keeps its slot until
+ *       TW3_Revoked or reconcile settles it (inv_S13_topicConcurrency, in `safety`)
+ *   N3  fixed: StartOptions.restarted_from_workflow_id is crate-private; TX1_Start's `from` must be terminal
  *
  * Abstractions (INVARIANTS §7.2): payloads, state JSON, history events,
  * errors, backoff and the reconcile retry delay (nondeterministic 0/1 tick; a jittered
@@ -110,7 +124,7 @@ module durable {
   const MAX_TASK_RESTARTS: int    // RuntimeConfig.max_task_restarts (per task; supervisor.rs)
 
   // version of the trace-checking interface (action names and parameters, views)
-  pure val TRACE_IFACE_VERSION = 4
+  pure val TRACE_IFACE_VERSION = 6
 
   pure val WF_IDS = 1.to(MAX_WF)
   pure val ACT_IDS = 1.to(MAX_ACT)
@@ -129,7 +143,7 @@ module durable {
   type ActRow = {
     status: str, wf: int, topic: str, attemptCount: int, maxAttempts: int,
     availableAt: int, token: int, leaseExp: int,
-    invalidBounds: bool           // timeout_millis <= 0 or lease_duration_millis <= timeout_millis
+    invalidBounds: bool           // timeout_millis <= 0, lease_duration_millis <= timeout_millis, or retry_policy_json out of RetryPolicy bounds
   }
   type AttRow = { used: bool, token: int, open: bool }
   type Event = { dseq: int, typ: str, ref: int, cmd: int }  // cmd = workflow commandSequence at append
@@ -143,22 +157,21 @@ module durable {
   // In-flight T-W1. phase: idle | topics (between topics) | reconcile | claim.
   // wAct/wWf/wAtt hold its own (uncommitted) writes for the rows in tA/tW.
   // lockA/lockW: rows it holds FOR UPDATE until COMMIT.
+  // unsettled: expired lease holders whose workflow lock reconcile skipped (counted in in_flight).
   type Tw1 = {
     phase: str, mode: str, now: int, topic: str, todo: Set[str], cands: Set[int], wanted: int,
     lockA: Set[int], lockW: Set[int], tA: Set[int], tW: Set[int],
     wAct: int -> ActRow, wWf: int -> WfRow, wAtt: int -> (int -> AttRow),
-    claimed: Set[Exec], snap: bool, snapAct: int -> ActRow, snapWf: int -> WfRow
+    claimed: Set[Exec], unsettled: Set[int], snap: bool, snapAct: int -> ActRow, snapWf: int -> WfRow
   }
   type Proc = { claims: int -> Claim, execs: Set[Exec], hbs: Set[Hb], tw1: int -> Tw1, topicHolder: int }
   type Ghost = {
     staleWfCommit: bool, staleActCommit: bool, capExceededAtClaim: bool,
-    tx2OutsideLineage: bool, claimAborted: bool, noEventError: bool,
+    noEventError: bool,
     revivedExpiredLease: bool, nextHb: int,
     lastIssuedWf: int -> int, lastIssuedAct: int -> int, taskErrors: int -> int,
-    // restart budget per task (supervisor.rs: cumulative per TaskSpec, in process memory)
-    coordErrors: int -> int, dispErrors: int -> int,
-    // G1: the lease token an operator action revoked per workflow; operator-caused task errors
-    opRevoked: int -> int, opTaskErrors: int -> int
+    // Coordinator restart budget; dispatcher errors have no modeled action.
+    coordErrors: int -> int
   }
 
   //--------------------------------------------------------------- variables
@@ -194,7 +207,7 @@ module durable {
     lockA: Set(), lockW: Set(), tA: Set(), tW: Set(),
     wAct: ACT_IDS.mapBy(a => emptyAct), wWf: WF_IDS.mapBy(w => emptyWf),
     wAtt: ACT_IDS.mapBy(a => ATT_NOS.mapBy(n => noAtt)),
-    claimed: Set(), snap: false, snapAct: ACT_IDS.mapBy(a => emptyAct), snapWf: WF_IDS.mapBy(w => emptyWf)
+    claimed: Set(), unsettled: Set(), snap: false, snapAct: ACT_IDS.mapBy(a => emptyAct), snapWf: WF_IDS.mapBy(w => emptyWf)
   }
 
   pure def setWf(d: Db, w: int, r: WfRow): Db = d.with("wf", d.wf.set(w, r))
@@ -239,26 +252,34 @@ module durable {
   pure def childOutcome(s: str): str =
     if (s == "succeeded") "child_succeeded" else if (s == "failed") "child_failed" else "child_cancelled"
 
-  // cancel_activities (src/store.rs)
+  // a row that holds a lease, a topic slot and an open attempt (ActivityStatus::LEASE_HOLDERS,
+  // SLOT_HOLDERS): running, or cancelling (revoked, its handler may still execute; N2)
+  pure def holdsLease(s: str): bool = s == "running" or s == "cancelling"
+
+  // cancel_activities (src/store.rs): pending -> cancelled; running -> cancelling with the
+  // lease, token and open attempt kept (N2 fixed); a cancelling row stays cancelling (only its
+  // lastErrorCategory, not modeled, changes). The attempt closes when the revoke settles.
   pure def cancelActivities(d: Db, w: int): Db =
     ACT_IDS.fold(d, (acc, a) => {
       val ar = acc.act.get(a)
-      if (ar.wf == w and (ar.status == "pending" or ar.status == "running"))
-        setAct(if (ar.status == "running") closeAttempt(acc, a) else acc, a,
-               ar.with("status", "cancelled").with("token", 0).with("leaseExp", 0))
+      if (ar.wf == w and ar.status == "pending")
+        setAct(acc, a, ar.with("status", "cancelled").with("token", 0).with("leaseExp", 0))
+      else if (ar.wf == w and ar.status == "running")
+        setAct(acc, a, ar.with("status", "cancelling"))
       else acc
     })
 
-  // follow restartedFrom from x; true iff orig is on the chain
-  pure def inLineage(d: Db, x: int, orig: int): bool = {
-    val walk = WF_IDS.fold({ cur: x, found: x == orig }, (st, i) => {
-      val nxt = if (st.cur == 0) 0 else d.wf.get(st.cur).restartedFrom
-      { cur: nxt, found: st.found or (nxt != 0 and nxt == orig) }
-    })
-    walk.found
+  // settle_revoked (activity_worker.rs): a cancelling row's attempt closes and its lease is
+  // cleared; cancelled if its workflow is terminal (availableAt kept), else pending at tnow
+  pure def settleAvail(d: Db, a: int, tnow: int): int =
+    if (isTerminal(d.wf.get(d.act.get(a).wf).status)) d.act.get(a).availableAt else tnow
+  pure def settleRevoked(d: Db, a: int, tnow: int): Db = {
+    val cur = d.act.get(a)
+    val terminal = isTerminal(d.wf.get(cur.wf).status)
+    setAct(closeAttempt(d, a), a, cur.with("status", if (terminal) "cancelled" else "pending")
+                                     .with("availableAt", settleAvail(d, a, tnow)).with("token", 0).with("leaseExp", 0))
   }
 
-  pure def maxOf(s: Set[int]): int = s.fold(0, (m, x) => if (x > m) x else m)
 
   //------------------------------------------------------ T-W1 row locks
   pure def actLocked(p: Proc, a: int): bool = RUNTIMES.exists(r => p.tw1.get(r).lockA.contains(a))
@@ -284,7 +305,7 @@ module durable {
     tw.phase == "topics" or (tw.phase == "claim" and (tw.cands == Set() or hereOn(tw, tw.topic) >= tw.wanted))
 
   pure def liveOnTopic(d: Db, t: str, tnow: int): int =
-    ACT_IDS.filter(a => d.act.get(a).topic == t and d.act.get(a).status == "running" and d.act.get(a).leaseExp > tnow).size()
+    ACT_IDS.filter(a => d.act.get(a).topic == t and holdsLease(d.act.get(a).status) and d.act.get(a).leaseExp > tnow).size()
 
   //----------------------------------------------------------------- commit
   action commit(d: Db, p: Proc, g: Ghost, name: str): bool = all {
@@ -316,10 +337,28 @@ module durable {
   pure def successorsOf(d: Db, src: int): Set[int] =
     WF_IDS.filter(x => src != 0 and d.wf.get(x).status != "none" and d.wf.get(x).restartedFrom == src)
   pure def anyOf(s: Set[int]): int = s.fold(0, (acc, x) => x)
+  // store.rs lock_newest_generation: follow the restartedFrom chain from x to its end
+  // (S19: at most one successor per row, so the chain is linear); 0 stays 0
+  pure def newestGen(d: Db, x: int): int =
+    WF_IDS.fold(x, (cur, i) => { val s = successorsOf(d, cur); if (s == Set()) cur else anyOf(s) })
+  // coordinator.rs is_caller_or_ancestor: w and its ancestors. Each step follows the parent,
+  // or from a row without one (a T-X2/T-A5 successor) the row it was restarted from, whose
+  // parent G2 may have re-attached to it. MAX_WF rounds reach the root.
+  pure def lineageUp(r: WfRow): int = if (r.parent != 0) r.parent else r.restartedFrom
+  pure def selfAndAncestors(d: Db, w: int): Set[int] =
+    WF_IDS.fold(Set(w), (acc, i) => acc.union(acc.map(x => lineageUp(d.wf.get(x))).filter(p => p != 0)))
+  // T-X2 (G2 fixed): every parent waiting on the superseded row c waits on its successor
+  // instead. The code re-attaches only when the successor runs c's version and otherwise
+  // wakes the parents with child_failed (child_superseded); versions are not modeled.
+  pure def reattachParents(d: Db, c: int, succ: int): Db =
+    WF_IDS.fold(d, (acc, p) => if (waitsOnChild(acc.wf.get(p), c)) setWf(acc, p, acc.wf.get(p).with("waitRef", succ)) else acc)
 
   // T-X1: start_with_conn -> insert_prepared -> insert_started. `from` =
   // StartOptions.restarted_from_workflow_id (0 = none). Both a key and `from` ->
-  // InvalidDefinition before any SQL (not a step).
+  // InvalidDefinition before any SQL (not a step). N3 fixed: the field is crate-private and
+  // only T-A5 (admin restart) sets it; T-A5 is recorded as Unmodeled, and it may restart a
+  // paused or blocked source, which it cancels in the same transaction. The model's TX1_Start
+  // with `from` stands for T-A5 on a terminal source, so `from` must be terminal (S19).
   //   inserted = true : wNew = db.nextWf, a new ready row
   //   inserted = false, key != 0 : dedup hit, wNew = the existing row, no write
   //   inserted = false, key == 0 : restart-key collision -> Conflict, wNew = 0, no row
@@ -328,7 +367,7 @@ module durable {
     val succ = successorsOf(db, from)
     all {
       not(key != NO_KEY and from != 0),
-      from == 0 or (WF_IDS.contains(from) and db.wf.get(from).status != "none"),
+      from == 0 or (WF_IDS.contains(from) and isTerminal(db.wf.get(from).status)),
       if (inserted) all {
         existing == Set(), succ == Set(), wNew == db.nextWf, wNew <= MAX_WF,
         commitAt(newStarted(db, wNew, { ...emptyWf, status: "ready", kind: kind, dedup: key, availableAt: tnow, restartedFrom: from }),
@@ -341,27 +380,28 @@ module durable {
     }
   }
 
-  // T-X2 lookups: the original (kind, key) row and the newest row of its "lineage":
-  // same kind and (id = root or rootWorkflowId = root), root = original's root
+  // T-X2 lookups: the original (kind, key) row and its newest generation, the end of its
+  // restartedFrom chain (N1 fixed: no longer the newest row of the original's root)
   pure def tx2Orig(d: Db, kind: str, key: int): int = anyOf(rowsWithKey(d, kind, key))
-  pure def tx2Latest(d: Db, kind: str, key: int): int = {
-    val orig = tx2Orig(d, kind, key)
-    val root = if (orig == 0) 0 else rootOf(d, orig)
-    maxOf(WF_IDS.filter(x => orig != 0 and d.wf.get(x).status != "none" and d.wf.get(x).kind == kind
-                             and (x == root or d.wf.get(x).root == root)))
-  }
+  pure def tx2Latest(d: Db, kind: str, key: int): int = newestGen(d, tx2Orig(d, kind, key))
 
   // T-X2: start_or_restart_recoverable_with_conn(kind, key). orig/latest are the rows the
   // code locks (0 = none); sNew is the inserted row (0 = none).
   //   orig = 0                          : insert (kind, key)           -> TX2_StartNew
   //   superseded = false, latest live   : return latest, no write      -> TX2_ReturnLatest
   //   superseded = false, successor exists: Conflict, all rolled back  -> TX2_Conflict
-  //   superseded = true                 : cancel latest's dead letters, blocked -> cancelled, successor sNew
+  //                                       (unreachable here: latest ends its chain; the code keeps the path)
+  //   superseded = true                 : successor sNew, cancel latest's dead letters,
+  //                                       blocked -> cancelled and its waiting parents re-pointed to sNew,
+  //                                       and (G11) the cascade cancels every live generation of the
+  //                                       children it owns, as cancel_owned_descendants
   action TX2_RecoverableStart(kind: str, key: int, orig: int, latest: int, superseded: bool, sNew: int, tnow: int): bool = {
     val root = if (orig == 0) 0 else rootOf(db, orig)
     val lr = db.wf.get(latest)
     val failedOrBlocked = latest != 0 and (lr.status == "failed" or lr.status == "blocked")
     val succ = successorsOf(db, latest)
+    // the cascade's targets below the blocked row it supersedes
+    val ts = if (latest != 0 and lr.status == "blocked") cancelTargets(db, latest).exclude(Set(latest)) else Set()
     all {
       key != NO_KEY,
       orig == tx2Orig(db, kind, key), latest == tx2Latest(db, kind, key),
@@ -373,44 +413,111 @@ module durable {
                  proc, ghost, "TX2_StartNew", tnow),
       } else if (not(superseded)) all {
         sNew == 0,
-        // N1: the returned row need not be on orig's restart chain (an unrelated sibling)
-        if (not(failedOrBlocked))
-          commitAt(db, proc, ghost.with("tx2OutsideLineage", ghost.tx2OutsideLineage or not(inLineage(db, latest, orig))),
-                   "TX2_ReturnLatest", tnow)
+        if (not(failedOrBlocked)) commitAt(db, proc, ghost, "TX2_ReturnLatest", tnow)
         else all { succ != Set(), succ.forall(x => not(wfLocked(proc, x))), commitAt(db, proc, ghost, "TX2_Conflict", tnow) },
       } else all {
         failedOrBlocked, succ == Set(), sNew == db.nextWf, sNew <= MAX_WF,
         not(ACT_IDS.exists(a => db.act.get(a).wf == latest and actLocked(proc, a))),
+        ts.forall(x => all {
+          not(wfLocked(proc, x)),
+          not(ACT_IDS.exists(a => db.act.get(a).wf == x and actLocked(proc, a))),
+        }),
         // cancel its dead_lettered activities
         val d1 = ACT_IDS.fold(db, (acc, a) =>
           if (acc.act.get(a).wf == latest and acc.act.get(a).status == "dead_lettered")
             setAct(acc, a, acc.act.get(a).with("status", "cancelled")) else acc)
-        // blocked -> cancelled, wait fields KEPT, no parent wake (G2)
-        val d2 = if (lr.status == "blocked") setWf(d1, latest, lr.with("status", "cancelled").with("token", 0).with("leaseExp", 0)) else d1
+        // blocked -> cancelled (its own wait fields kept), its waiting parents re-pointed to sNew
+        // then the G11 cascade to its owned generations (ts is empty unless it was blocked)
+        val d2 = if (lr.status == "blocked") cancelWriteTo(reattachParents(setWf(d1, latest, lr.with("status", "cancelled").with("token", 0).with("leaseExp", 0)), latest, sNew), ts)
+                 else d1
         val d3 = newStarted(d2, sNew, { ...emptyWf, status: "ready", kind: kind, availableAt: tnow, root: root, restartedFrom: latest })
-        commitAt(d3, proc, ghost.with("tx2OutsideLineage", ghost.tx2OutsideLineage or not(inLineage(db, latest, orig))),
-                 "TX2_RecoverableStart", tnow),
+        commitAt(d3, proc, ghost, "TX2_RecoverableStart", tnow),
       },
     }
   }
 
-  // store.rs cancel_locked_workflow (T-X3 and T-A4): cancel_activities, fenced workflow ->
-  // cancelled (wait and lease cleared), wake waiting parents with child_cancelled
-  def cancelOk(w: int): bool = all {
+  // G11: store.rs cancel_owned_descendants. r is owned by p when its key is the one
+  // commit_child generated for it, child:{p}:{cmd} (autoKey(p, cmd), cmd < 10); a
+  // domain-keyed child (child_with_key) is not owned.
+  pure def ownedBy(r: WfRow, p: int): bool =
+    p != 0 and r.parent == p and r.dedup >= autoKey(p, 0) and r.dedup < autoKey(p + 1, 0)
+  // g and the rows it was restarted from (its restartedFrom chain back to the first
+  // generation); MAX_WF rounds reach the start of any chain
+  pure def restartOrigins(d: Db, g: int): Set[int] =
+    WF_IDS.fold(Set(g), (acc, i) => acc.union(acc.map(x => d.wf.get(x).restartedFrom).filter(x => x != 0)))
+  // g is a generation of a child that p owns (the child itself or a T-X2/T-A5 successor)
+  pure def ownedGenOf(d: Db, g: int, p: int): bool =
+    d.wf.get(g).status != "none" and restartOrigins(d, g).exists(c => ownedBy(d.wf.get(c), p))
+  // w and, recursively, every live generation of a child owned by a target. The chain walk
+  // passes terminal generations; the recursion into a generation's own children needs it to
+  // be cancelled here (a target). MAX_WF rounds reach every depth.
+  // Reference form; `cancelTargets` below computes the same set (inv_cancelFormsAgree).
+  pure def cancelTargetsRef(d: Db, w: int): Set[int] =
+    WF_IDS.fold(Set(w), (acc, i) =>
+      acc.union(WF_IDS.filter(g => isLive(d.wf.get(g).status) and acc.exists(p => ownedGenOf(d, g, p)))))
+
+  // The form the actions use. Apalache unrolls a fold whose accumulator is a set into
+  // ever larger symbolic sets, and folding a Db over such a set copies the whole Db per
+  // candidate element: the reference cascade took minutes per step to translate. Here
+  // every set is a boolean vector over WF_IDS, and the write is pointwise.
+  // originsVec(d, g).get(x) iff x is in restartOrigins(d, g) (restartedFrom is 0 or an id)
+  pure def originsVec(d: Db, g: int): int -> bool =
+    WF_IDS.fold(WF_IDS.mapBy(x => x == g), (v, i) =>
+      WF_IDS.mapBy(x => v.get(x) or WF_IDS.exists(y => v.get(y) and d.wf.get(y).restartedFrom == x)))
+  // ownedGenVec(d, g).get(p) iff ownedGenOf(d, g, p)
+  pure def ownedGenVec(d: Db, g: int): int -> bool = {
+    val o = originsVec(d, g)
+    WF_IDS.mapBy(p => d.wf.get(g).status != "none" and WF_IDS.exists(c => o.get(c) and ownedBy(d.wf.get(c), p)))
+  }
+  pure def cancelTargets(d: Db, w: int): Set[int] = {
+    val og = WF_IDS.mapBy(g => ownedGenVec(d, g))
+    val v = WF_IDS.fold(WF_IDS.mapBy(x => x == w), (acc, i) =>
+      WF_IDS.mapBy(g => acc.get(g) or (isLive(d.wf.get(g).status) and WF_IDS.exists(p => acc.get(p) and og.get(g).get(p)))))
+    WF_IDS.filter(x => v.get(x))
+  }
+
+  // store.rs cancel_locked_workflow (T-X3 and T-A4): for w and each target of the cascade:
+  // cancel_activities, fenced workflow -> cancelled (wait and lease cleared); wake the
+  // parents waiting on w with child_cancelled. The parents waiting on a descendant are
+  // its owner, cancelled in the same step, so their wake is empty. The cascade waits for
+  // every lock a T-W1 holds on a target or its activities. ts = cancelTargets(db, w).
+  def cancelOk(w: int, ts: Set[int]): bool = all {
     WF_IDS.contains(w),
     isLive(db.wf.get(w).status),
-    not(wfLocked(proc, w)),
-    not(ACT_IDS.exists(a => db.act.get(a).wf == w and actLocked(proc, a))),
+    ts.forall(x => all {
+      not(wfLocked(proc, x)),
+      not(ACT_IDS.exists(a => db.act.get(a).wf == x and actLocked(proc, a))),
+    }),
   }
-  pure def cancelWrite(d: Db, w: int): Db =
+  pure def cancelOne(d: Db, w: int): Db =
     setWf(cancelActivities(d, w), w,
           d.wf.get(w).with("status", "cancelled").with("waitKind", "").with("waitRef", 0).with("token", 0).with("leaseExp", 0))
+  // Reference form: cancelOne for each target in turn
+  pure def cancelWriteRef(d: Db, w: int): Db =
+    cancelTargetsRef(d, w).fold(d, (acc, x) => cancelOne(acc, x))
+  // The same write, pointwise: cancelOne(acc, x) changes only row x and the activities of x,
+  // and reads them unchanged, so the order and the fold do not matter
+  pure def cancelWriteTo(d: Db, ts: Set[int]): Db =
+    d.with("act", ACT_IDS.mapBy(a => {
+       val ar = d.act.get(a)
+       if (ts.contains(ar.wf) and ar.status == "pending") ar.with("status", "cancelled").with("token", 0).with("leaseExp", 0)
+       else if (ts.contains(ar.wf) and ar.status == "running") ar.with("status", "cancelling")
+       else ar
+     }))
+     .with("wf", WF_IDS.mapBy(x =>
+       if (ts.contains(x)) d.wf.get(x).with("status", "cancelled").with("waitKind", "").with("waitRef", 0).with("token", 0).with("leaseExp", 0)
+       else d.wf.get(x)))
+  pure def cancelWrite(d: Db, w: int): Db = cancelWriteTo(d, cancelTargets(d, w))
 
   // T-X3: cancel_with_conn; on a terminal row it is a no-op (not a step)
-  action TX3_Cancel(w: int, tnow: int): bool = all {
-    cancelOk(w),
-    wakeParentsOk(cancelWrite(db, w), w),
-    commitAt(wakeParents(cancelWrite(db, w), w, "child_cancelled", tnow), proc, ghost, "TX3_Cancel", tnow),
+  action TX3_Cancel(w: int, tnow: int): bool = {
+    val ts = cancelTargets(db, w)
+    val d1 = cancelWriteTo(db, ts)
+    all {
+      cancelOk(w, ts),
+      wakeParentsOk(d1, w),
+      commitAt(wakeParents(d1, w, "child_cancelled", tnow), proc, ghost, "TX3_Cancel", tnow),
+    }
   }
 
   //------------------------------------------------------------ coordinator
@@ -439,9 +546,9 @@ module durable {
     }
   }
 
-  // the supervisor cancels the whole runtime once a task's restart count exceeds MAX_TASK_RESTARTS
+  // A coordinator error beyond the restart budget stops this modeled runtime.
   pure def stoppedRt(g: Ghost, r: int): bool =
-    g.coordErrors.get(r) > MAX_TASK_RESTARTS or g.dispErrors.get(r) > MAX_TASK_RESTARTS
+    g.coordErrors.get(r) > MAX_TASK_RESTARTS
   pure def coordError(g: Ghost, r: int): Ghost =
     g.with("taskErrors", g.taskErrors.setBy(r, x => x + 1)).with("coordErrors", g.coordErrors.setBy(r, x => x + 1))
 
@@ -461,17 +568,12 @@ module durable {
     }
   }
 
-  // T-C2 / T-C3 lose the fence: rollback, FencedWrite propagates, coordinator task restarts (G1).
-  // When an operator pause/cancel revoked this token, the error is operator-caused.
-  action CoordFenceMiss(r: int, w: int, tok: int): bool = {
-    val op = tok != 0 and WF_IDS.contains(w) and ghost.opRevoked.get(w) == tok
-    all {
-      holds(r, w, tok),
-      not(wfFenceOk(db, proc.claims.get(r))),
-      commit(db, proc.with("claims", proc.claims.set(r, noClaim)),
-             coordError(ghost, r).with("opTaskErrors", ghost.opTaskErrors.setBy(r, x => if (op) x + 1 else x)),
-             "CoordFenceMiss"),
-    }
+  // T-C2 / T-C3 lose the fence: rollback. activate_one logs FencedWrite and the coordinator
+  // task goes on (G1 fixed): an operator pause/cancel or a lease recovery is not a task error.
+  action CoordFenceMiss(r: int, w: int, tok: int): bool = all {
+    holds(r, w, tok),
+    not(wfFenceOk(db, proc.claims.get(r))),
+    commit(db, proc.with("claims", proc.claims.set(r, noClaim)), ghost, "CoordFenceMiss"),
   }
 
   // T-C2 common part: claim held, fence holds, the consumed event exists
@@ -519,9 +621,11 @@ module durable {
     }
   }
 
-  // T-C2 RunChild(kind, key): key is a domain key or autoKey(w, cmd). existing = the row
-  // with (kind, key), 0 = none: then insert cNew = db.nextWf; else attach (cNew = 0),
-  // locking the child and waking at once if it is already terminal.
+  // T-C2 RunChild(kind, key): key is a domain key or autoKey(w, cmd). existing = the newest
+  // generation of the row with (kind, key) (D4), 0 = none: then insert cNew = db.nextWf; else
+  // attach (cNew = 0), locking the child and waking at once if it is already terminal.
+  // G8 fixed: an existing row that is w or an ancestor of w is InvalidDefinition, rolled back;
+  // the code then records TC3_ActivationFailure.
   action TC2_RunChild(r: int, w: int, tok: int, kind: str, key: int, existing: int, cNew: int, tnow: int): bool = {
     val cmd = db.wf.get(w).cmdSeq + 1
     val waitOn = if (existing == 0) cNew else existing
@@ -529,7 +633,8 @@ module durable {
     all {
       ENABLE_CHILDREN,
       tc2Ok(r, w, tok), key != NO_KEY,
-      existing == anyOf(rowsWithKey(db, kind, key)),
+      existing == newestGen(db, anyOf(rowsWithKey(db, kind, key))),
+      not(selfAndAncestors(db, w).contains(existing)),
       if (existing == 0) all {
         cNew == db.nextWf, cNew <= MAX_WF,
         val d2 = newStarted(db, cNew, { ...emptyWf, status: "ready", kind: kind, dedup: key, availableAt: tnow,
@@ -606,6 +711,21 @@ module durable {
     val cur = v.act.get(a)
     cur.status == "pending" and cur.availableAt <= tnow and waitsOnAct(v, cur.wf, a)
   }
+  // G10 (fixed): claim_locked_candidate quarantines a locked claimable row that is past its
+  // attempt cap ("attempt_cap", checked first) or has invalid timeout/lease bounds or retry
+  // policy ("invalid_bounds"): the row is dead-lettered (invalid_row) and its workflow blocked, and the
+  // T-W1 goes on. ("missing_definition" is a skip, not modeled: every runtime has every
+  // definition, F3.)
+  pure def quarantineReason(v: Db, a: int): str = {
+    val cur = v.act.get(a)
+    if (cur.attemptCount + 1 > cur.maxAttempts) "attempt_cap" else if (cur.invalidBounds) "invalid_bounds" else "none"
+  }
+  pure def quarantinable(v: Db, a: int, tnow: int): bool = claimable(v, a, tnow) and quarantineReason(v, a) != "none"
+  pure def quarantineWrite(v: Db, a: int): Db = {
+    val cur = v.act.get(a)
+    val w = cur.wf
+    setWf(setAct(v, a, cur.with("status", "dead_lettered")), w, v.wf.get(w).with("status", "blocked"))
+  }
 
   // --- simulation form: one action per statement group (READ COMMITTED interleavings) ---
 
@@ -630,14 +750,14 @@ module durable {
     commit(db, proc.with("topicHolder", r).with("tw1", proc.tw1.set(r, beginTw1(db, "one", tnow, Set(t)))), ghost, "TW1_BeginOne"),
   }
 
-  // reconcile_expired, statement 1: plain read of expired running rows on topic t
+  // reconcile_expired, statement 1: plain read of expired running/cancelling rows on topic t
   // (the first plain read of T-W1: under historical RR it fixes the snapshot)
   action TW1_ReconcileScan(r: int, t: str): bool = {
     val tw0 = proc.tw1.get(r)
     val tw = if (RR_SNAPSHOT and not(tw0.snap)) tw0.with("snap", true).with("snapAct", db.act).with("snapWf", db.wf) else tw0
     val cands = ACT_IDS.filter(a => {
       val v = plainAct(db, tw, a)
-      v.topic == t and v.status == "running" and v.leaseExp <= tw.now
+      v.topic == t and holdsLease(v.status) and v.leaseExp <= tw.now
     })
     all {
       tw0.phase != "idle", topicDone(tw0), tw0.todo.contains(t),
@@ -647,19 +767,26 @@ module durable {
   }
 
   // reconcile_expired, per candidate: workflow FOR UPDATE, activity FOR UPDATE with the
-  // filters rechecked (current read), then the updates (buffered until COMMIT).
+  // filters rechecked (current read), then the updates (buffered until COMMIT). A running
+  // row is retried or dead-lettered; a cancelling row settles (settleRevoked).
   // availableAt: the reconciled row's new available_at (ignored when the recheck skips it)
   action TW1_ReconcileRow(r: int, a: int, availableAt: int): bool = {
     val tw = proc.tw1.get(r)
     val v = overlay(db, tw)
     val cur = v.act.get(a)
     val w = cur.wf
-    val hit = cur.status == "running" and cur.topic == tw.topic and cur.leaseExp <= tw.now
-    val block = cur.attemptCount >= cur.maxAttempts and waitsOnAct(v, w, a)
+    val hit = holdsLease(cur.status) and cur.topic == tw.topic and cur.leaseExp <= tw.now
+    val block = cur.status == "running" and cur.attemptCount >= cur.maxAttempts and waitsOnAct(v, w, a)
     val tw1 = tw.with("cands", tw.cands.exclude(Set(a))).with("lockW", tw.lockW.union(Set(w)))
     all {
       tw.phase == "reconcile", tw.cands.contains(a),
-      if (hit) and {
+      if (hit and cur.status == "cancelling") and {
+        // an expired revoked row settles (attempt outcome lease_expired, N2)
+        availableAt == settleAvail(v, a, tw.now),
+        setTw1(r, keep(tw1, settleRevoked(v, a, tw.now)).with("tA", tw.tA.union(Set(a))).with("lockA", tw.lockA.union(Set(a))),
+               "TW1_ReconcileRow"),
+      }
+      else if (hit) and {
         reconcileAvailOk(v, a, tw.now, availableAt),
         setTw1(r, keep(tw1, reconcileWrite(v, a, availableAt)).with("tA", tw.tA.union(Set(a))).with("lockA", tw.lockA.union(Set(a)))
                    .with("tW", if (block) tw.tW.union(Set(w)) else tw.tW), "TW1_ReconcileRow"),
@@ -668,13 +795,28 @@ module durable {
     }
   }
 
-  // in_flight count, then (if wanted > 0) the candidate join; both plain reads
+  // reconcile_expired, per candidate: the workflow FOR UPDATE SKIP LOCKED passed a row that
+  // another transaction holds (not modeled: an application transaction can hold it for as long
+  // as it likes, so the choice is free). Nothing is locked or written; a stays expired and
+  // unsettled until a later sweep, and this T-W1's in_flight count keeps its slot, since a
+  // heartbeat may still revive it after the count (G7 stays closed).
+  action TW1_ReconcileLockSkip(r: int, a: int): bool = {
+    val tw = proc.tw1.get(r)
+    all {
+      tw.phase == "reconcile", tw.cands.contains(a),
+      setTw1(r, tw.with("cands", tw.cands.exclude(Set(a))).with("unsettled", tw.unsettled.union(Set(a))),
+             "TW1_ReconcileLockSkip"),
+    }
+  }
+
+  // in_flight count (live slot holders, plus the ones reconcile left unsettled), then (if
+  // wanted > 0) the candidate join; both plain reads
   action TW1_Count(r: int): bool = {
     val tw = proc.tw1.get(r)
     val t = tw.topic
     val inFlight = ACT_IDS.filter(a => {
       val v = plainAct(db, tw, a)
-      v.topic == t and v.status == "running" and v.leaseExp > tw.now
+      v.topic == t and holdsLease(v.status) and (v.leaseExp > tw.now or tw.unsettled.contains(a))
     }).size()
     val limit = if (tw.mode == "one") 1 else localAvail(proc, r)
     val wanted = min2(TOPIC_CAP.get(t) - inFlight, limit - tw.claimed.size())
@@ -692,7 +834,7 @@ module durable {
 
   // claim_locked_candidate: workflow and activity FOR UPDATE SKIP LOCKED with the filters
   // rechecked (current read); lease token tok = db.nextToken (a UUID: consumed even if T-W1
-  // later rolls back). Attempt-cap overrun or invalid bounds is TW1_Error instead.
+  // later rolls back). Attempt-cap overrun or invalid bounds is TW1_QuarantineRow instead.
   action TW1_ClaimRow(r: int, a: int, tok: int): bool = {
     val tw = proc.tw1.get(r)
     val v = overlay(db, tw)
@@ -713,6 +855,20 @@ module durable {
                                                 .with("cands", tw.cands.exclude(Set(a)))
                                                 .with("claimed", tw.claimed.union(Set(e))))),
              ghost, "TW1_ClaimRow"),
+    }
+  }
+
+  // claim_locked_candidate quarantines the locked row (G10 fixed); no claim, no token
+  action TW1_QuarantineRow(r: int, a: int): bool = {
+    val tw = proc.tw1.get(r)
+    val v = overlay(db, tw)
+    val w = v.act.get(a).wf
+    all {
+      tw.phase == "claim", tw.cands.contains(a), hereOn(tw, tw.topic) < tw.wanted,
+      quarantinable(v, a, tw.now),
+      setTw1(r, keep(tw, quarantineWrite(v, a)).with("tA", tw.tA.union(Set(a))).with("tW", tw.tW.union(Set(w)))
+                  .with("lockA", tw.lockA.union(Set(a))).with("lockW", tw.lockW.union(Set(w)))
+                  .with("cands", tw.cands.exclude(Set(a))), "TW1_QuarantineRow"),
     }
   }
 
@@ -742,20 +898,31 @@ module durable {
   }
 
   // --- replay form: one committed T-W1 in one step ---
-  // reconciled: expired rows the transaction reconciled (in order); claimed: rows it claimed
+  // reconciled: expired rows the transaction reconciled (in order; revoked = a cancelling row
+  // settled, N2); quarantined: rows it
+  // quarantined (G10 fixed) with the reason; claimed: rows it claimed
   // (in order) with their tokens and lease expiries; inFlightSeen / localAvail: per-topic
   // values the transaction observed (maps over all of TOPICS). Guards check only the
   // current-read fences; inv_S17_capAtClaim judges the claim count against live leases.
-  pure def replayReconcile(d0: Db, rec: List[{ a: int, exhausted: bool, availableAt: int }], tnow: int): { d: Db, ok: bool } =
+  pure def replayReconcile(d0: Db, rec: List[{ a: int, exhausted: bool, availableAt: int, revoked: bool }], tnow: int): { d: Db, ok: bool } =
     rec.foldl({ d: d0, ok: true }, (st, x) =>
       if (not(ACT_IDS.contains(x.a))) st.with("ok", false)
       else {
         val cur = st.d.act.get(x.a)
-        if (cur.status == "running" and cur.leaseExp <= tnow and x.exhausted == reconcileExhausted(st.d, x.a)
+        if (cur.status == "cancelling" and cur.leaseExp <= tnow and x.revoked and not(x.exhausted)
+            and x.availableAt == settleAvail(st.d, x.a, tnow))
+          st.with("d", settleRevoked(st.d, x.a, tnow))
+        else if (cur.status == "running" and cur.leaseExp <= tnow and not(x.revoked) and x.exhausted == reconcileExhausted(st.d, x.a)
             and reconcileAvailOk(st.d, x.a, tnow, x.availableAt))
           st.with("d", reconcileWrite(st.d, x.a, x.availableAt))
         else st.with("ok", false)
       })
+  pure def replayQuarantine(d0: Db, q: List[{ a: int, reason: str }], tnow: int): { d: Db, ok: bool } =
+    q.foldl({ d: d0, ok: true }, (st, x) =>
+      if (not(ACT_IDS.contains(x.a))) st.with("ok", false)
+      else if (quarantinable(st.d, x.a, tnow) and quarantineReason(st.d, x.a) == x.reason)
+        st.with("d", quarantineWrite(st.d, x.a))
+      else st.with("ok", false))
   pure def replayClaims(d0: Db, cl: List[{ a: int, tok: int, leaseExp: int }], r: int, tnow: int): { d: Db, ok: bool, execs: Set[Exec] } =
     cl.foldl({ d: d0, ok: true, execs: Set() }, (st, x) =>
       if (not(ACT_IDS.contains(x.a))) st.with("ok", false)
@@ -768,50 +935,22 @@ module durable {
         else st.with("ok", false)
       })
 
-  action TW1_Claim(r: int, tnow: int, localAvailSeen: str -> int, reconciled: List[{ a: int, exhausted: bool, availableAt: int }],
-                   inFlightSeen: str -> int, claimed: List[{ a: int, tok: int, leaseExp: int }]): bool = {
+  action TW1_Claim(r: int, tnow: int, localAvailSeen: str -> int, reconciled: List[{ a: int, exhausted: bool, availableAt: int, revoked: bool }],
+                   inFlightSeen: str -> int, quarantined: List[{ a: int, reason: str }],
+                   claimed: List[{ a: int, tok: int, leaseExp: int }]): bool = {
     val rec = replayReconcile(db, reconciled, tnow)
-    val cl = replayClaims(rec.d, claimed, r, tnow)
+    val qu = replayQuarantine(rec.d, quarantined, tnow)
+    val cl = replayClaims(qu.d, claimed, r, tnow)
     all {
       RUNTIMES.contains(r), not(stoppedRt(ghost, r)),
       proc.topicHolder == 0, proc.tw1.get(r).phase == "idle",
       localAvailSeen.keys() == TOPICS, inFlightSeen.keys() == TOPICS,
-      rec.ok, cl.ok,
+      rec.ok, qu.ok, cl.ok,
       TOPICS.forall(t => {
         val n = cl.execs.filter(e => cl.d.act.get(e.act).topic == t).size()
         n <= TOPIC_CAP.get(t) - inFlightSeen.get(t) and n <= localAvailSeen.get(t)
       }),
       commitAt(cl.d, proc.with("execs", proc.execs.union(cl.execs)), tw1Ghost(ghost, cl.d, cl.execs, tnow), "TW1_Claim", tnow),
-    }
-  }
-
-  // G10: claim_locked_candidate locks a claimable row a and finds it past its attempt cap
-  // ("attempt_cap", checked first) or with invalid timeout/lease bounds ("invalid_bounds") ->
-  // error: the whole T-W1 rolls back (every topic's reconciles and claims) and the dispatcher
-  // task ends (task error). In simulation it aborts r's in-flight T-W1 at a candidate the claim
-  // loop would reach; in replay (none in flight) it needs row a to be such a row at `now`.
-  // ("missing_definition" is not modeled: every runtime has every definition, F3.)
-  pure def claimErrorRow(v: Db, a: int, tnow: int, reason: str): bool = {
-    val cur = v.act.get(a)
-    val overCap = cur.attemptCount + 1 > cur.maxAttempts
-    and {
-      claimable(v, a, tnow),
-      if (reason == "attempt_cap") overCap else reason == "invalid_bounds" and not(overCap) and cur.invalidBounds,
-    }
-  }
-  action TW1_Error(r: int, a: int, reason: str): bool = {
-    val tw = proc.tw1.get(r)
-    val inflight = tw.phase != "idle"
-    val v = if (inflight) overlay(db, tw) else db
-    val tnow = if (inflight) tw.now else now
-    all {
-      RUNTIMES.contains(r), ACT_IDS.contains(a),
-      if (inflight) tw.phase == "claim" and tw.cands.contains(a) and hereOn(tw, tw.topic) < tw.wanted
-      else proc.topicHolder == 0,
-      claimErrorRow(v, a, tnow, reason),
-      commit(db, proc.with("topicHolder", if (proc.topicHolder == r) 0 else proc.topicHolder).with("tw1", proc.tw1.set(r, idleTw1)),
-             ghost.with("claimAborted", true).with("taskErrors", ghost.taskErrors.setBy(r, x => x + 1))
-                  .with("dispErrors", ghost.dispErrors.setBy(r, x => x + 1)), "TW1_Error"),
     }
   }
 
@@ -824,14 +963,20 @@ module durable {
   pure def hasHb(p: Proc, hb: int): bool = p.hbs.exists(h => h.id == hb)
   pure def runningExecOf(p: Proc, h: Hb): Set[Exec] = p.execs.filter(e => isExec(e, h.rt, h.act, h.token) and e.phase == "running")
 
-  // L-W: handler returns (or times out -> retryable) before the local deadline
+  // Exec phases: running -> (HandlerReturn) succeeded | retryable | permanent; running ->
+  // (TW2_Commit on a cancelling row) revoking -> (HandlerReturn "revoked") revoked. A revoking
+  // handler has been told to stop and may still execute until its lease deadline (N2).
+  pure val HANDLER_OUTCOMES = Set("succeeded", "retryable", "permanent")
+  pure def returned(ph: str): bool = HANDLER_OUTCOMES.contains(ph) or ph == "revoked"
+
+  // L-W: handler returns (or times out -> retryable) before the local deadline; a revoked
+  // handler returns "revoked" once it stopped or its cleanup grace (<= lease deadline) elapsed
   action HandlerReturn(r: int, a: int, tok: int, outcome: str): bool = {
     val e = findExec(proc, r, a, tok)
     all {
       hasExec(proc, r, a, tok),
-      e.phase == "running",
-      Set("succeeded", "retryable", "permanent").contains(outcome),
-      now < e.deadline,
+      if (outcome == "revoked") e.phase == "revoking"
+      else all { e.phase == "running", HANDLER_OUTCOMES.contains(outcome), now < e.deadline },
       commit(db, proc.with("execs", proc.execs.exclude(Set(e)).union(Set(e.with("phase", outcome)))), ghost, "HandlerReturn"),
     }
   }
@@ -864,12 +1009,13 @@ module durable {
 
   pure def hbFenceOk(d: Db, h: Hb): bool = {
     val ar = d.act.get(h.act)
-    ar.status == "running" and ar.attemptCount == h.attempt and ar.token == h.token and attOpenWith(d, h.act, h.attempt, h.token)
+    holdsLease(ar.status) and ar.attemptCount == h.attempt and ar.token == h.token and attOpenWith(d, h.act, h.attempt, h.token)
   }
 
-  // T-W2 commit: DB now = sample, lease expiry leaseExp (> sample). Fenced on status=running,
-  // attemptCount, leaseToken and the open attempt; NO expiry check (S10, G7). The UPDATE
-  // blocks while an in-flight T-W1 holds the activity row.
+  // T-W2 commit: DB now = sample, lease expiry leaseExp (> sample). Fenced on status in
+  // {running, cancelling}, attemptCount, leaseToken and the open attempt; NO expiry check (S10,
+  // G7). The UPDATE blocks while an in-flight T-W1 holds the activity row. On a cancelling row
+  // the renewal reports Renewed::Revoked: a running execution becomes revoking (N2).
   action TW2_Commit(hb: int, sample: int, leaseExp: int): bool = {
     val h = findHb(proc, hb)
     val ar = db.act.get(h.act)
@@ -882,7 +1028,8 @@ module durable {
       leaseExp > sample,
       commitAt(setAct(db, h.act, ar.with("leaseExp", leaseExp)),
                proc.with("hbs", proc.hbs.exclude(Set(h)))
-                   .with("execs", others.union(alive.map(e => e.with("deadline", leaseExp - 1 + DRIFT)))),
+                   .with("execs", others.union(alive.map(e => e.with("deadline", leaseExp - 1 + DRIFT)
+                                                                 .with("phase", if (ar.status == "cancelling" and e.phase == "running") "revoking" else e.phase)))),
                ghost.with("revivedExpiredLease", ghost.revivedExpiredLease or (ar.leaseExp <= now and alive.size() == 0))
                     .with("staleActCommit", ghost.staleActCommit or h.token != ghost.lastIssuedAct.get(h.act)),
                "TW2_Commit", sample),
@@ -916,9 +1063,10 @@ module durable {
     ar.status == "running" and ar.attemptCount == e.attempt and ar.token == e.token and attOpenWith(d, e.act, e.attempt, e.token)
   }
 
-  // T-W3 finish of execution (r, a, tok) with the handler's outcome: succeeded -> workflow
-  // ready; retryable below the cap -> pending at availableAt (>= tnow); else dead-lettered and
-  // the workflow blocked. Locks the activity, then the workflow: blocks on T-W1's locks.
+  // T-W3 finish of execution (r, a, tok) with the handler's outcome on a running row: succeeded
+  // -> workflow ready; retryable below the cap -> pending at availableAt (>= tnow); else
+  // dead-lettered and the workflow blocked. Locks the workflow, then the activity: blocks on
+  // T-W1's locks. A cancelling row takes TW3_Revoked instead, whatever the outcome.
   action TW3_Finish(r: int, a: int, tok: int, outcome: str, availableAt: int, tnow: int): bool = {
     val e = findExec(proc, r, a, tok)
     val ar = db.act.get(a)
@@ -929,7 +1077,7 @@ module durable {
     val d0 = closeAttempt(db, a)
     all {
       hasExec(proc, r, a, tok),
-      e.phase == outcome, outcome != "running",
+      e.phase == outcome, HANDLER_OUTCOMES.contains(outcome),
       not(actLocked(proc, a)), not(wfLocked(proc, w)),
       actFenceOk(db, e),
       if (outcome == "succeeded") {
@@ -951,26 +1099,51 @@ module durable {
     }
   }
 
-  // T-W3 rollback: fence miss, or success/dead-letter without the workflow wait
+  // finish_on_connection's first fence (leased_activity!): status in {running, cancelling},
+  // attemptCount, leaseToken and the open attempt
+  pure def leasedFenceOk(d: Db, e: Exec): bool = {
+    val ar = d.act.get(e.act)
+    holdsLease(ar.status) and ar.attemptCount == e.attempt and ar.token == e.token and attOpenWith(d, e.act, e.attempt, e.token)
+  }
+
+  // T-W3 on a revoked attempt (N2): after any handler return, a cancelling row with the
+  // execution's attempt and token settles (settle_revoked: attempt closed with the recorded
+  // revoke outcome; cancelled if the workflow is terminal, else pending at tnow). The
+  // handler's result is not applied.
+  action TW3_Revoked(r: int, a: int, tok: int, tnow: int): bool = {
+    val e = findExec(proc, r, a, tok)
+    val w = db.act.get(a).wf
+    all {
+      hasExec(proc, r, a, tok),
+      returned(e.phase),
+      not(actLocked(proc, a)), not(wfLocked(proc, w)),
+      leasedFenceOk(db, e), db.act.get(a).status == "cancelling",
+      commitAt(settleRevoked(db, a, tnow), proc.with("execs", proc.execs.exclude(Set(e))),
+               ghost.with("staleActCommit", ghost.staleActCommit or tok != ghost.lastIssuedAct.get(a)), "TW3_Revoked", tnow),
+    }
+  }
+
+  // T-W3 rollback: fence miss (the attempt was settled or reconciled), or success/dead-letter
+  // of a running row without the workflow wait
   action TW3_FenceMiss(r: int, a: int, tok: int): bool = {
     val e = findExec(proc, r, a, tok)
     val w = db.act.get(a).wf
     all {
       hasExec(proc, r, a, tok),
-      e.phase != "running",
+      returned(e.phase),
       not(actLocked(proc, a)), not(wfLocked(proc, w)),
-      not(actFenceOk(db, e)) or ((e.phase == "succeeded" or e.phase == "permanent" or e.attempt >= e.maxAttempts)
-                                 and not(waitsOnAct(db, w, a))),
+      not(leasedFenceOk(db, e))
+        or (db.act.get(a).status == "running" and e.phase != "revoked"
+            and (e.phase == "succeeded" or e.phase == "permanent" or e.attempt >= e.maxAttempts)
+            and not(waitsOnAct(db, w, a))),
       commit(db, proc.with("execs", proc.execs.exclude(Set(e))), ghost, "TW3_FenceMiss"),
     }
   }
 
   //------------------------------------------------ operator (admin/control.rs)
   // Each locks the workflow FOR UPDATE first; a rejected request (Conflict) is not a step.
-  // A running row's lease is cleared: its coordinator's T-C2/T-C3 misses the fence (G1);
-  // ghost.opRevoked remembers the revoked token.
-  pure def opRevoke(g: Ghost, d: Db, w: int): Ghost =
-    if (d.wf.get(w).status == "running") g.with("opRevoked", g.opRevoked.set(w, d.wf.get(w).token)) else g
+  // A running workflow row's lease is cleared: its coordinator's T-C2/T-C3 misses the fence
+  // (CoordFenceMiss). A running activity row is revoked (cancelling), not cleared (N2).
 
   // pause_activity: the workflow waits on a running activity
   pure def pausesActivity(d: Db, w: int): bool = {
@@ -979,18 +1152,17 @@ module durable {
   }
 
   // T-A2 pause_workflow: reject paused/terminal. If waiting on a running activity,
-  // pause_activity (activity FOR UPDATE) closes its attempt (operator_paused) and sets it
-  // pending at availableAt = tnow with maxAttempts + 1 and the lease cleared (S36); the handler
-  // keeps running until its heartbeat or finish misses the fence (N2). Fenced workflow ->
-  // paused with the lease cleared; wait fields and availableAt are kept.
+  // pause_activity (activity FOR UPDATE) revokes it: cancelling with maxAttempts + 1
+  // (operator_paused), the lease, token and open attempt kept (S36, N2 fixed); it settles to
+  // pending when its handler stops (TW3_Revoked) or its lease expires (reconcile). A
+  // cancelling row is left alone. Fenced workflow -> paused with the lease cleared; wait
+  // fields and availableAt are kept.
   action AdminPause(w: int, tnow: int): bool = {
     val r = db.wf.get(w)
     val a = r.waitRef
     val bump = pausesActivity(db, w)
     val ar = if (ACT_IDS.contains(a)) db.act.get(a) else emptyAct
-    val d1 = if (bump) setAct(closeAttempt(db, a), a, ar.with("status", "pending").with("availableAt", tnow)
-                                                        .with("maxAttempts", ar.maxAttempts + 1)
-                                                        .with("token", 0).with("leaseExp", 0))
+    val d1 = if (bump) setAct(db, a, ar.with("status", "cancelling").with("maxAttempts", ar.maxAttempts + 1))
              else db
     all {
       WF_IDS.contains(w), r.status != "none", r.status != "paused", not(isTerminal(r.status)),
@@ -998,7 +1170,7 @@ module durable {
       (r.waitKind == "activity" and ACT_IDS.contains(a)) implies not(actLocked(proc, a)),
       bump implies ar.maxAttempts + 1 <= MAX_ATTEMPTS,                 // sizing bound, not a code check
       commitAt(setWf(d1, w, r.with("status", "paused").with("token", 0).with("leaseExp", 0)), proc,
-               opRevoke(ghost, db, w), if (bump) "AdminPauseActivity" else "AdminPause", tnow),
+               ghost, if (bump) "AdminPauseActivity" else "AdminPause", tnow),
     }
   }
 
@@ -1008,7 +1180,7 @@ module durable {
     if (r.waitKind == "") "ready"
     else if (r.waitKind == "activity") {
       val s = if (ACT_IDS.contains(r.waitRef)) d.act.get(r.waitRef).status else "none"
-      if (s == "pending" or s == "running") "waiting_activity"
+      if (s == "pending" or s == "running" or s == "cancelling") "waiting_activity"
       else if (s == "dead_lettered") "blocked"
       else if (s == "succeeded") "ready"
       else "conflict"
@@ -1031,12 +1203,16 @@ module durable {
     }
   }
 
-  // T-A4 cancel_workflow: terminal -> Conflict; else cancel_locked_workflow as T-X3. Children
-  // are not cancelled (G11).
-  action AdminCancel(w: int, tnow: int): bool = all {
-    cancelOk(w),
-    wakeParentsOk(cancelWrite(db, w), w),
-    commitAt(wakeParents(cancelWrite(db, w), w, "child_cancelled", tnow), proc, opRevoke(ghost, db, w), "AdminCancel", tnow),
+  // T-A4 cancel_workflow: terminal -> Conflict; else cancel_locked_workflow as T-X3, which
+  // cancels the owned subtree (G11 fixed).
+  action AdminCancel(w: int, tnow: int): bool = {
+    val ts = cancelTargets(db, w)
+    val d1 = cancelWriteTo(db, ts)
+    all {
+      cancelOk(w, ts),
+      wakeParentsOk(d1, w),
+      commitAt(wakeParents(d1, w, "child_cancelled", tnow), proc, ghost, "AdminCancel", tnow),
+    }
   }
 
   //-------------------------------------------------------------- environment
@@ -1055,7 +1231,7 @@ module durable {
                    .with("execs", proc.execs.filter(e => e.rt != r))
                    .with("tw1", proc.tw1.set(r, idleTw1))
                    .with("topicHolder", if (proc.topicHolder == r) 0 else proc.topicHolder),
-           ghost.with("coordErrors", ghost.coordErrors.set(r, 0)).with("dispErrors", ghost.dispErrors.set(r, 0)), "Crash"),
+           ghost.with("coordErrors", ghost.coordErrors.set(r, 0)), "Crash"),
   }
 
   // external write (raw SQL, as the G10 gap test does): activity a's timeout/lease bounds
@@ -1117,11 +1293,10 @@ module durable {
     },
     ghost' = {
       staleWfCommit: false, staleActCommit: false, capExceededAtClaim: false,
-      tx2OutsideLineage: false, claimAborted: false, noEventError: false, revivedExpiredLease: false,
+      noEventError: false, revivedExpiredLease: false,
       nextHb: 1,
       lastIssuedWf: WF_IDS.mapBy(w => 0), lastIssuedAct: ACT_IDS.mapBy(a => 0), taskErrors: RUNTIMES.mapBy(r => 0),
-      coordErrors: RUNTIMES.mapBy(r => 0), dispErrors: RUNTIMES.mapBy(r => 0),
-      opRevoked: WF_IDS.mapBy(w => 0), opTaskErrors: RUNTIMES.mapBy(r => 0),
+      coordErrors: RUNTIMES.mapBy(r => 0),
     },
     prevWf' = WF_IDS.mapBy(w => "none"),
     prevAct' = ACT_IDS.mapBy(a => "none"),
@@ -1134,10 +1309,13 @@ module durable {
     prevAct' = ACT_IDS.mapBy(x => db.act.get(x).status),
   }
 
-  // reconcile's new available_at for row a in r's in-flight T-W1, given a retry delay
+  // reconcile's new available_at for row a in r's in-flight T-W1, given a retry delay (a
+  // cancelling row settles: settleAvail)
   def reconcileAvail(r: int, a: int, delay: int): int = {
     val tw = proc.tw1.get(r)
-    if (ACT_IDS.contains(a) and reconcileExhausted(overlay(db, tw), a)) tw.now else tw.now + delay
+    val v = overlay(db, tw)
+    if (ACT_IDS.contains(a) and v.act.get(a).status == "cancelling") settleAvail(v, a, tw.now)
+    else if (ACT_IDS.contains(a) and reconcileExhausted(v, a)) tw.now else tw.now + delay
   }
 
   action step: bool = {
@@ -1155,7 +1333,6 @@ module durable {
     nondet childKey = Set("domain", "auto").oneOf()
     nondet topic = TOPICS.oneOf()
     nondet backoff = Set(0, 1).oneOf()
-    nondet outcome = Set("succeeded", "retryable", "permanent").oneOf()
     nondet tnowOne = Set(now, if (now > 0) now - 1 else 0).oneOf()
     nondet badBounds = Set(false, ENABLE_ENV_EDITS).oneOf()
     nondet prio = Set(false, true).oneOf()
@@ -1166,12 +1343,15 @@ module durable {
     // dummy elements keep oneOf() total; every action guards on membership
     nondet e = (if (proc.execs == Set()) Set(noExec) else proc.execs).oneOf()
     nondet h = (if (proc.hbs == Set()) Set(noHb) else proc.hbs).oneOf()
+    // HandlerReturn accepts "revoked" only from a revoking exec and a HANDLER_OUTCOMES value only
+    // from a running one, so drawing the outcome by the exec's phase removes no transition
+    nondet outcome = (if (e.phase == "revoking") Set("revoked") else HANDLER_OUTCOMES).oneOf()
     // values derived from the state (a trace supplies them instead)
     val c = proc.claims.get(r)
     val cw = c.wf
     val cmd = if (cw == 0) 0 else db.wf.get(cw).cmdSeq + 1
     val ck = if (childKey == "domain") DOMAIN_KEY else autoKey(cw, cmd)
-    val cEx = anyOf(rowsWithKey(db, "C", ck))
+    val cEx = newestGen(db, anyOf(rowsWithKey(db, "C", ck)))
     val tx1W = if (inserted) db.nextWf else if (key != NO_KEY) anyOf(rowsWithKey(db, "P", key)) else 0
     val o2 = tx2Orig(db, kind, DOMAIN_KEY)
     val s2 = if (o2 == 0 or superseded) db.nextWf else 0
@@ -1193,12 +1373,12 @@ module durable {
         TW1_BeginOne(r, topic, tnowOne),
         TW1_ReconcileScan(r, topic),
         TW1_ReconcileRow(r, a, reconcileAvail(r, a, backoff)),
+        TW1_ReconcileLockSkip(r, a),
         TW1_Count(r),
         TW1_ClaimRow(r, a, db.nextToken),
         TW1_SkipRow(r, a),
         TW1_Commit(r),
-        TW1_Error(r, a, "attempt_cap"),
-        TW1_Error(r, a, "invalid_bounds"),
+        TW1_QuarantineRow(r, a),
         EnvCorruptActivityBounds(ea),
         AdminPause(w, now),
         AdminResume(w, now),
@@ -1210,6 +1390,7 @@ module durable {
         TW2_FenceMiss(h.id),
         TW2_Drop(h.id),
         TW3_Finish(e.rt, e.act, e.token, e.phase, now + backoff, now),
+        TW3_Revoked(e.rt, e.act, e.token, now),
         TW3_FenceMiss(e.rt, e.act, e.token),
         Crash(r),
         Tick,
@@ -1256,11 +1437,11 @@ module durable {
   // S8: activation attempts bounded
   val inv_S8_activationBounded = WF_IDS.forall(w => db.wf.get(w).actAttempts <= MAX_ACTIVATION)
 
-  // S9: running activity <=> token and expiry set; one current executor per token
+  // S9: running or cancelling activity <=> token and expiry set; one current executor per token
   val inv_S9_actLease = ACT_IDS.forall(a => {
     val r = db.act.get(a)
     and {
-      (r.status == "running") iff (r.token != 0 and r.leaseExp != 0),
+      holdsLease(r.status) iff (r.token != 0 and r.leaseExp != 0),
       proc.execs.filter(e => e.act == a and e.token == r.token and r.token != 0).size() <= 1,
     }
   })
@@ -1268,11 +1449,11 @@ module durable {
   // S10: no committed heartbeat/finish with a stale token
   val inv_S10_noStaleActCommit = not(ghost.staleActCommit)
 
-  // S11: running <=> exactly one open attempt, the current one, with the same token
+  // S11: running or cancelling <=> exactly one open attempt, the current one, with the same token
   val inv_S11_openAttempt = ACT_IDS.forall(a => {
     val r = db.act.get(a)
     val opens = ATT_NOS.filter(n => db.att.get(a).get(n).open)
-    if (r.status == "running") opens == Set(r.attemptCount) and db.att.get(a).get(r.attemptCount).token == r.token
+    if (holdsLease(r.status)) opens == Set(r.attemptCount) and db.att.get(a).get(r.attemptCount).token == r.token
     else opens.size() == 0
   })
 
@@ -1285,11 +1466,12 @@ module durable {
     }
   })
 
-  // S13: at most one handler executes per activity (executing = running phase, before local deadline)
-  def executing(e: Exec): bool = e.phase == "running" and now < e.deadline
+  // S13: at most one handler executes per activity (executing = running, or revoking and still
+  // cleaning up, before the local deadline)
+  def executing(e: Exec): bool = (e.phase == "running" or e.phase == "revoking") and now < e.deadline
   val inv_S13_oneHandler = ACT_IDS.forall(a => proc.execs.filter(e => e.act == a and executing(e)).size() <= 1)
-  // N2: "real concurrency stays within the topic cap" (INVARIANTS.md G7). Violated without G7:
-  // cancel frees the slot at once, the cancelled handler runs until its heartbeat fence miss (L12).
+  // S13/S17 per topic: real concurrency stays within the topic cap. N2 (fixed): a cancel or
+  // pause keeps the revoked row's slot (cancelling) until its handler stops or its lease expires.
   val inv_S13_topicConcurrency = TOPICS.forall(t =>
     proc.execs.filter(e => executing(e) and db.act.get(e.act).topic == t).size() <= TOPIC_CAP.get(t))
 
@@ -1303,15 +1485,18 @@ module durable {
     }
   })
 
-  // S15: activity/workflow coupling; a paused workflow keeps its wait on a pending activity
+  // S15: activity/workflow coupling; a paused workflow keeps its wait on a pending activity; a
+  // cancelling activity's workflow is terminal or still waits on it (paused, or resumed)
   pure def pausedOnAct(d: Db, w: int, a: int): bool =
-    d.wf.get(w).status == "paused" and d.wf.get(w).waitKind == "activity" and d.wf.get(w).waitRef == a
+    if (not(WF_IDS.contains(w))) false
+    else d.wf.get(w).status == "paused" and d.wf.get(w).waitKind == "activity" and d.wf.get(w).waitRef == a
   val inv_S15_actWfCoupling = and {
     ACT_IDS.forall(a => {
       val r = db.act.get(a)
       and {
         r.status == "running" implies waitsOnAct(db, r.wf, a),
         r.status == "pending" implies (waitsOnAct(db, r.wf, a) or pausedOnAct(db, r.wf, a)),
+        r.status == "cancelling" implies (waitsOnAct(db, r.wf, a) or pausedOnAct(db, r.wf, a) or isTerminal(db.wf.get(r.wf).status)),
       }
     }),
     WF_IDS.forall(w => db.wf.get(w).status == "blocked" implies db.act.get(db.wf.get(w).waitRef).status == "dead_lettered"),
@@ -1337,8 +1522,8 @@ module durable {
     val src = db.wf.get(x).restartedFrom
     src != 0 implies WF_IDS.forall(y => (y != x) implies db.wf.get(y).restartedFrom != src)
   })
-  // N3 (stronger form): the source of a successor is terminal. T-X2 and admin restart only
-  // restart terminal rows; a public StartOptions.restarted_from_workflow_id is not checked.
+  // S19 (stronger form, N3 fixed): the source of a successor is terminal. T-X2 restarts only a
+  // failed or blocked row (cancelling a blocked one) and the restart field is crate-private.
   val inv_S19_sourceTerminal = WF_IDS.forall(x => {
     val src = db.wf.get(x).restartedFrom
     src != 0 implies isTerminal(db.wf.get(src).status)
@@ -1350,54 +1535,65 @@ module durable {
     db.events.get(p).filter(e => e.ref == c and e.cmd == e1.cmd
       and Set("child_succeeded", "child_failed", "child_cancelled").contains(e.typ)).size() <= 1)))
 
-  // S24: a parent waiting on a child never waits on a terminal child (wake is in the child's terminal txn)
+  // S24: a parent waiting on a child never waits on a terminal child (wake, or for a T-X2
+  // supersession the re-attach to the successor, is in the child's terminal txn)
   val inv_S24_parentWakes = WF_IDS.forall(p => {
     val r = db.wf.get(p)
     r.status == "waiting_child" implies not(isTerminal(db.wf.get(r.waitRef).status))
   })
 
-  // S24 in the scope INVARIANTS.md claims (every terminal transition except T-X2 supersession)
-  val inv_S24_exceptTX2 = WF_IDS.forall(p => {
-    val r = db.wf.get(p)
-    r.status == "waiting_child" implies
-      (not(isTerminal(db.wf.get(r.waitRef).status)) or WF_IDS.exists(y => db.wf.get(y).restartedFrom == r.waitRef))
-  })
-
-  // S25: a cancelled workflow has no pending/running activity
+  // S25: a cancelled workflow has no pending/running activity; its revoked ones are cancelling
+  // until they settle to cancelled (a cancelling row's workflow is cancelled, paused, or waits on it)
   val inv_S25_cancelAtomic = ACT_IDS.forall(a => {
     val r = db.act.get(a)
-    (r.status == "pending" or r.status == "running") implies db.wf.get(r.wf).status != "cancelled"
+    and {
+      (r.status == "pending" or r.status == "running") implies db.wf.get(r.wf).status != "cancelled",
+      r.status == "cancelling" implies Set("cancelled", "paused", "waiting_activity").contains(db.wf.get(r.wf).status),
+    }
   })
 
-  // G10 (spec gap): a T-W1 never aborts because of one row (TW1_Error rolls back every
-  // topic's claims). Violated once a claimable row has invalid bounds (ENABLE_ENV_EDITS).
-  val inv_G10_noClaimAbort = not(ghost.claimAborted)
-
-  // G11 (spec gap): cancelling a parent reaches its children
+  // G11 (fixed): a cancelled workflow owns no live child. Domain-keyed children are not owned
+  // and may outlive it (intended).
   val inv_G11_cancelReachesChildren = WF_IDS.forall(p => db.wf.get(p).status == "cancelled" implies
-    WF_IDS.forall(c => (db.wf.get(c).parent == p and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
+    WF_IDS.forall(c => (ownedBy(db.wf.get(c), p) and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
+  // G11 (fixed), generations: a cancel step (T-X3, T-A4, or a T-X2 that supersedes a blocked
+  // row) leaves no live generation of a child owned by any row it cancelled. An action
+  // property: a later T-X2 or T-A5 may restart a terminal child of a cancelled parent on purpose.
+  val inv_G11_cancelReachesGenerations = Set("TX3_Cancel", "AdminCancel", "TX2_RecoverableStart").contains(lastAction) implies
+    WF_IDS.forall(p => (db.wf.get(p).status == "cancelled" and prevWf.get(p) != "cancelled") implies
+      WF_IDS.forall(g => ownedGenOf(db, g, p) implies isTerminal(db.wf.get(g).status)))
 
-  // N1: T-X2 supersedes or returns only a row on the keyed row's own restart chain
-  val inv_N1_tx2OwnLineage = not(ghost.tx2OutsideLineage)
+  // G8 (fixed): no workflow waits on itself or an ancestor, restart lineage included
+  // (selfAndAncestors). Cycles through non-ancestors (two keyed rows that name each other)
+  // are not guarded.
+  val inv_G8_noAncestorWait = WF_IDS.forall(w => {
+    val r = db.wf.get(w)
+    not(r.waitKind == "child" and selfAndAncestors(db, w).contains(r.waitRef))
+  })
 
-  // G1 (spec gap): an operator action never costs a runtime its restart budget. A pause or
-  // cancel of a running row makes its coordinator's T-C2/T-C3 miss the fence; FencedWrite is a
-  // task error that counts toward MAX_TASK_RESTARTS and never resets, so enough of them
-  // self-cancel the runtime (stoppedRt). Stated in its strong form: no operator-caused task error.
-  val inv_G1_noSelfCancelFromOperator = RUNTIMES.forall(r => ghost.opTaskErrors.get(r) == 0)
+  // G1 (fixed): an operator action never costs a runtime its restart budget. A pause or cancel
+  // of a running row makes its coordinator's T-C2/T-C3 miss the fence (CoordFenceMiss), which is
+  // not a task error. Stated in its strong form: the coordinator task never errors (LC1_NoEvent,
+  // its only remaining error, is excluded by S5).
+  val inv_G1_noSelfCancelFromOperator = RUNTIMES.forall(r => ghost.coordErrors.get(r) == 0)
 
   // conjunction of the invariants expected to hold. Checked separately: S17 (G7 under the
-  // historical RR snapshot), S24 unrestricted (G2), S13 per topic (N2), S19 source terminal (N3),
-  // G1, G10, G11, N1.
+  // historical RR snapshot).
   val safety = and {
     inv_S1_wfLease, inv_S2_noStaleWfCommit, inv_S5_delivery, inv_S5_noEventError, inv_S6_wfTerminalAbsorbing,
     inv_S7_waitCoupling, inv_S8_activationBounded, inv_S9_actLease, inv_S10_noStaleActCommit,
-    inv_S11_openAttempt, inv_S12_attemptsBounded, inv_S13_oneHandler, inv_S14_actTerminal,
-    inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor,
-    inv_S23_childOnce, inv_S24_exceptTX2, inv_S25_cancelAtomic,
+    inv_S11_openAttempt, inv_S12_attemptsBounded, inv_S13_oneHandler, inv_S13_topicConcurrency, inv_S14_actTerminal,
+    inv_S15_actWfCoupling, inv_S16_successOnce, inv_S18_dedup, inv_S19_successor, inv_S19_sourceTerminal,
+    inv_S23_childOnce, inv_S24_parentWakes, inv_S25_cancelAtomic, inv_G1_noSelfCancelFromOperator,
+    inv_G8_noAncestorWait, inv_G11_cancelReachesChildren, inv_G11_cancelReachesGenerations,
   }
   // safety plus S17 (expected to hold under READ COMMITTED)
   val safetyRc = safety and inv_S17_capAtClaim and inv_S17_capAlways
+
+  // Not a protocol invariant: the cancel cascade the actions use (cancelTargets, cancelWrite)
+  // equals its reference form (cancelTargetsRef, cancelWriteRef) for every workflow id
+  val inv_cancelFormsAgree = WF_IDS.forall(w =>
+    cancelTargets(db, w) == cancelTargetsRef(db, w) and cancelWrite(db, w) == cancelWriteRef(db, w))
 
   //============================================ WITNESSES (expected to fail)
   // Each is the negation of a reachable interesting state; a violation proves reachability.
@@ -1407,10 +1603,10 @@ module durable {
   val wit_childSucceeded = not(WF_IDS.exists(w => db.events.get(w).exists(e => e.typ == "child_succeeded")))
   val wit_activitySucceeded = not(WF_IDS.exists(w => db.events.get(w).exists(e => e.typ == "activity_succeeded")))
   val wit_revivedLease = not(ghost.revivedExpiredLease)
-  val wit_coordFenceMiss = RUNTIMES.forall(r => ghost.taskErrors.get(r) == 0)
-  val wit_selfCancelled = RUNTIMES.forall(r => not(stoppedRt(ghost, r)))
-  val wit_pausedActivity = not(ACT_IDS.exists(a => pausedOnAct(db, db.act.get(a).wf, a) and db.act.get(a).status == "pending"))
+  val wit_coordFenceMiss = lastAction != "CoordFenceMiss"
+  val wit_pausedActivity = not(ACT_IDS.exists(a => db.act.get(a).status == "pending" and pausedOnAct(db, db.act.get(a).wf, a)))
   val wit_reconciled = lastAction != "TW1_ReconcileRow"
+  val wit_quarantined = lastAction != "TW1_QuarantineRow"
   val wit_tw1Interleaved = not(RUNTIMES.exists(r => proc.tw1.get(r).phase != "idle")
                                and Set("TW2_Commit", "TX3_Cancel", "TC2_RunActivity", "TW3_Succeeded").contains(lastAction))
 
@@ -1421,7 +1617,7 @@ module durable {
   // handlers return) = weak fairness of TC2/HandlerReturn for the holder.
   def expiredWf(w: int): bool = db.wf.get(w).status == "running" and db.wf.get(w).leaseExp <= now
   def readyDue(w: int): bool = db.wf.get(w).status == "ready" and db.wf.get(w).availableAt <= now
-  def expiredAct(a: int): bool = db.act.get(a).status == "running" and db.act.get(a).leaseExp <= now
+  def expiredAct(a: int): bool = holdsLease(db.act.get(a).status) and db.act.get(a).leaseExp <= now
 
   // Fairness: some coordinator recovers/claims whenever it can (F2, F3).
   temporal fairCoordinator = RUNTIMES.forall(r => WF_IDS.forall(w =>
@@ -1429,7 +1625,9 @@ module durable {
   temporal fairDispatcher = RUNTIMES.forall(r => and {
     weakFair(TW1_BeginBatch(r), (db, proc)), weakFair(TW1_Count(r), (db, proc)), weakFair(TW1_Commit(r), (db, proc)),
     TOPICS.forall(t => weakFair(TW1_ReconcileScan(r, t), (db, proc))),
-    ACT_IDS.forall(a => weakFair(TW1_ReconcileRow(r, a, reconcileAvail(r, a, 1)), (db, proc)) and weakFair(TW1_ClaimRow(r, a, db.nextToken), (db, proc))),
+    // strong: a sweep may skip a row whose workflow another transaction holds (TW1_ReconcileLockSkip),
+    // so L5 needs that transaction to commit and a later sweep to reconcile the row
+    ACT_IDS.forall(a => strongFair(TW1_ReconcileRow(r, a, reconcileAvail(r, a, 1)), (db, proc)) and weakFair(TW1_ClaimRow(r, a, db.nextToken), (db, proc))),
   })
 
   // L1: a due ready workflow is eventually claimed (or otherwise leaves ready)

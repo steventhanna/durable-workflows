@@ -1,6 +1,7 @@
 extern crate self as durable_workflows;
 
 pub mod admin;
+mod clock;
 mod definition;
 mod dialect;
 mod error;
@@ -21,6 +22,7 @@ pub mod trace;
 #[path = "trace/noop.rs"]
 mod trace;
 mod transition;
+mod tx;
 
 pub mod migrations;
 
@@ -62,10 +64,19 @@ pub use durable_workflows_macros::{
 // do not need matching direct dependencies.
 #[doc(hidden)]
 pub use async_trait;
+pub use clock::DbMillis;
 pub use error::{ActivityError, DurableError, WorkflowError};
 pub use flow::{DurableFlow, FlowJournal, JournalEntry, WfCtx, WfError};
 pub use ids::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
-pub use policy::{deterministic_jitter_percentile, BackoffPolicy, RetryPolicy};
+
+/// SQL types for typed IDs and database timestamps.
+pub mod sql_types {
+    pub use crate::clock::sql_types::DbMillis;
+    pub use crate::ids::sql_types::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
+}
+pub use policy::{
+    deterministic_jitter_percentile, BackoffPolicy, RetryPolicy, MAX_RETRY_DELAY_SECS,
+};
 pub use progress::{
     ProgressEvent, ProgressReportOutcome, ProgressReporter, ProgressSeverity,
     MAX_PROGRESS_DESCRIPTION_BYTES, MAX_PROGRESS_EVENTS_PER_ATTEMPT,

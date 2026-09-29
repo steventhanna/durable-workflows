@@ -1,0 +1,10 @@
+error[E0499]: cannot borrow `*coordinator` as mutable more than once at a time
+  --> tests/ui/fail/coordinator_second_claim_while_claimed.rs:10:18
+   |
+ 9 |     let first = coordinator.claim_one().await?;
+   |                 ----------- first mutable borrow occurs here
+10 |     let second = coordinator.claim_one().await?;
+   |                  ^^^^^^^^^^^ second mutable borrow occurs here
+11 |     drop(second);
+12 |     if let Some(first) = first {
+   |                          ----- first borrow later used here

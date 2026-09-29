@@ -1,21 +1,24 @@
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
+use crate::DbMillis;
 use diesel::{
     dsl::not, ExpressionMethods, JoinOnDsl, NullableExpressionMethods, QueryDsl, SelectableHelper,
 };
 use diesel_async::RunQueryDsl;
 
 use crate::{
-    persistence::{self, NewScheduleRunRow, ScheduleRunRow, ScheduleStateRow, WorkflowStatus},
+    persistence::{
+        self, NewScheduleRunRow, ScheduleRunRow, ScheduleRunStatus, ScheduleStateRow,
+        WorkflowStatus,
+    },
+    schedule::ScheduleCursor,
     schema::{durable_schedule_run, durable_schedule_state, durable_workflow},
+    tx::{self, Locked, Tx},
     DurableError, DurablePool, LocalTimeDisposition, MisfirePolicy, OverlapPolicy,
-    ScheduleCalendar, ScheduleOccurrence, ScheduleRegistry, ScheduleRunId,
-    ScheduleStateReconcileOutcome,
+    ScheduleCalendar, ScheduleOccurrence, ScheduleRegistry, ScheduleStateReconcileOutcome,
 };
 
 const MAX_DUE_OCCURRENCES_PER_TICK: usize = 10_000;
-const LOCAL_OCCURRENCE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleMaterializationReport {
@@ -73,7 +76,7 @@ where
     pub async fn materialize_schedule(
         &self,
         schedule_key: &str,
-        now: i64,
+        now: DbMillis,
     ) -> Result<ScheduleMaterializationReport, DurableError> {
         match self
             .registry
@@ -111,108 +114,113 @@ where
         let registry = self.registry.clone();
         let schedule_key = schedule_key.to_string();
         let mut connection = self.pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
-            crate::trace::declare_unmodeled("schedule_materialize", true);
-            let state = durable_schedule_state::table
-                .find(&schedule_key)
-                .for_update()
-                .select(ScheduleStateRow::as_select())
-                .first::<ScheduleStateRow>(connection)
-                .await?;
-            if state.definition_version != metadata.version
-                || state.definition_fingerprint != metadata.fingerprint
-            {
-                return Err(DurableError::Conflict(format!(
-                    "schedule {schedule_key} definition changed while materializing"
-                )));
-            }
-            let mut report = ScheduleMaterializationReport::empty(&schedule_key);
-            if state.paused_at.is_some() {
-                report.paused = true;
-                return Ok(report);
-            }
-            let mut active = active_workflow_count(connection, &schedule_key).await?;
-            let mut queued = queued_run_exists(connection, &schedule_key).await?;
-            if metadata.overlap == OverlapPolicy::QueueOne && active == 0 && queued {
-                promote_queued(
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("schedule_materialize", true);
+                let state = tx::lock_first(
                     connection,
-                    registry.as_ref(),
-                    context.as_ref(),
-                    &schedule_key,
+                    scope,
+                    durable_schedule_state::table
+                        .find(&schedule_key)
+                        .for_update()
+                        .select(ScheduleStateRow::as_select()),
                 )
                 .await?;
-                active = 1;
-                queued = false;
-                report.started = report.started.saturating_add(1);
-            }
-
-            let local = NaiveDateTime::parse_from_str(
-                &state.next_local_occurrence,
-                LOCAL_OCCURRENCE_FORMAT,
-            )
-            .map_err(|error| {
-                DurableError::InvalidState(format!(
-                    "schedule {schedule_key} has invalid persisted local occurrence: {error}"
-                ))
-            })?;
-            let mut occurrence = calendar.occurrence_at_local(local)?;
-            if occurrence.local_occurrence != state.next_local_occurrence
-                || occurrence.due_at != state.next_occurrence_at
-            {
-                return Err(DurableError::InvalidState(format!(
-                    "schedule {schedule_key} persisted local and UTC occurrences disagree"
-                )));
-            }
-            let (due, next, outcomes) = plan_due_chunk(
-                &calendar,
-                occurrence,
-                metadata.misfire,
-                metadata.misfire_grace_millis,
-                now,
-            )?;
-            occurrence = next;
-            report.inspected = u32::try_from(due.len()).map_err(|_| {
-                DurableError::InvalidState("schedule occurrence count exceeds u32".to_string())
-            })?;
-            for (occurrence, outcome) in due.into_iter().zip(outcomes) {
-                let target = MaterializationTarget {
-                    registry: registry.as_ref(),
-                    context: context.as_ref(),
-                    schedule_key: &schedule_key,
-                    overlap: metadata.overlap,
-                    active: &mut active,
-                    queued: &mut queued,
-                    now,
-                };
-                materialize_occurrence(connection, target, occurrence, outcome, &mut report)
-                    .await?;
-            }
-            if report.inspected == 0 {
-                return Ok(report);
-            }
-            let changed = diesel::update(
-                durable_schedule_state::table
-                    .find(&schedule_key)
-                    .filter(durable_schedule_state::definition_version.eq(metadata.version))
-                    .filter(
-                        durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
+                if state.definition_version != metadata.version
+                    || state.definition_fingerprint != metadata.fingerprint
+                {
+                    return Err(DurableError::Conflict(format!(
+                        "schedule {schedule_key} definition changed while materializing"
+                    )));
+                }
+                let mut report = ScheduleMaterializationReport::empty(&schedule_key);
+                if state.paused_at.is_some() {
+                    report.paused = true;
+                    return Ok(trace.commit(report));
+                }
+                let mut active = active_workflow_count(connection, state.as_ref()).await?;
+                let mut queued = queued_run_exists(connection, &schedule_key).await?;
+                if metadata.overlap == OverlapPolicy::QueueOne && active == 0 && queued {
+                    promote_queued(
+                        connection,
+                        registry.as_ref(),
+                        context.as_ref(),
+                        &schedule_key,
                     )
-                    .filter(
-                        durable_schedule_state::next_local_occurrence
-                            .eq(&state.next_local_occurrence),
-                    ),
-            )
-            .set((
-                durable_schedule_state::next_local_occurrence.eq(&occurrence.local_occurrence),
-                durable_schedule_state::next_occurrence_at.eq(occurrence.due_at),
-                durable_schedule_state::last_materialized_at.eq(Some(now)),
-                durable_schedule_state::updated_at.eq(now),
-            ))
-            .execute(connection)
-            .await?;
-            ensure_single_change(changed)?;
-            Ok(report)
-        })
+                    .await?;
+                    active = 1;
+                    queued = false;
+                    report.started = report.started.saturating_add(1);
+                }
+
+                let cursor = ScheduleCursor::load(&schedule_key, &state.next_local_occurrence)?;
+                let mut occurrence = calendar.occurrence_at_local(cursor.local().datetime())?;
+                if occurrence.local_occurrence != state.next_local_occurrence
+                    || occurrence.due_at != state.next_occurrence_at.get()
+                {
+                    return Err(DurableError::InvalidState(format!(
+                        "schedule {schedule_key} persisted local and UTC occurrences disagree"
+                    )));
+                }
+                let (due, next, outcomes) = plan_due_chunk(
+                    &calendar,
+                    occurrence,
+                    metadata.misfire,
+                    metadata.misfire_grace_millis,
+                    now,
+                )?;
+                occurrence = next;
+                report.inspected = u32::try_from(due.len()).map_err(|_| {
+                    DurableError::InvalidState("schedule occurrence count exceeds u32".to_string())
+                })?;
+                for (occurrence, outcome) in due.into_iter().zip(outcomes) {
+                    let target = MaterializationTarget {
+                        registry: registry.as_ref(),
+                        context: context.as_ref(),
+                        schedule_key: &schedule_key,
+                        overlap: metadata.overlap,
+                        active: &mut active,
+                        queued: &mut queued,
+                        now,
+                    };
+                    materialize_occurrence(connection, target, occurrence, outcome, &mut report)
+                        .await?;
+                }
+                if report.inspected == 0 {
+                    return Ok(trace.commit(report));
+                }
+                let cursor = cursor.advance_to(occurrence.local())?;
+                let changed = diesel::update(
+                    durable_schedule_state::table
+                        .find(&schedule_key)
+                        .filter(durable_schedule_state::definition_version.eq(metadata.version))
+                        .filter(
+                            durable_schedule_state::definition_fingerprint
+                                .eq(&metadata.fingerprint),
+                        )
+                        .filter(
+                            durable_schedule_state::next_local_occurrence
+                                .eq(&state.next_local_occurrence),
+                        ),
+                )
+                .set((
+                    durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
+                    durable_schedule_state::next_occurrence_at
+                        .eq(DbMillis::from_requested_millis(occurrence.due_at)),
+                    durable_schedule_state::last_materialized_at.eq(Some(now)),
+                    durable_schedule_state::updated_at.eq(now),
+                ))
+                .execute(connection)
+                .await?;
+                ensure_single_change(changed)?;
+                Ok(trace.commit(report))
+            },
+        )
         .await
     }
 }
@@ -229,7 +237,7 @@ fn plan_due_chunk(
     mut occurrence: ScheduleOccurrence,
     policy: MisfirePolicy,
     grace_millis: i64,
-    now: i64,
+    now: DbMillis,
 ) -> Result<
     (
         Vec<ScheduleOccurrence>,
@@ -239,7 +247,7 @@ fn plan_due_chunk(
     DurableError,
 > {
     let mut due = Vec::new();
-    while occurrence.due_at <= now && due.len() < MAX_DUE_OCCURRENCES_PER_TICK {
+    while occurrence.due_at <= now.get() && due.len() < MAX_DUE_OCCURRENCES_PER_TICK {
         due.push(occurrence.clone());
         occurrence = calendar.next_after_local(occurrence.local_datetime)?;
     }
@@ -249,13 +257,13 @@ fn plan_due_chunk(
         MisfirePolicy::CatchUp { max_occurrences } => max_occurrences,
     };
     let mut following_runnable = 0;
-    if occurrence.due_at <= now {
+    if occurrence.due_at <= now.get() {
         if let Some(last) = due.last() {
             let mut after = last.local_datetime;
             // Later runnable slots determine which entries in this chunk are
             // outside the global latest-N budget. They remain pending for the next tick.
             while following_runnable < budget {
-                let Some(next) = calendar.next_runnable_through(after, now)? else {
+                let Some(next) = calendar.next_runnable_through(after, now.get())? else {
                     break;
                 };
                 following_runnable += 1;
@@ -271,7 +279,7 @@ fn classify(
     due: &[ScheduleOccurrence],
     policy: MisfirePolicy,
     grace_millis: i64,
-    now: i64,
+    now: DbMillis,
     following_runnable: u32,
 ) -> Vec<OccurrenceOutcome> {
     let mut outcomes = vec![OccurrenceOutcome::Skip("dst_gap"); due.len()];
@@ -285,7 +293,7 @@ fn classify(
     match policy {
         MisfirePolicy::Skip => {
             for index in runnable {
-                outcomes[index] = if due[index].due_at.saturating_add(grace_millis) < now {
+                outcomes[index] = if due[index].due_at.saturating_add(grace_millis) < now.get() {
                     OccurrenceOutcome::Skip("misfire_skip")
                 } else {
                     OccurrenceOutcome::Start
@@ -327,7 +335,7 @@ struct MaterializationTarget<'a, C> {
     overlap: OverlapPolicy,
     active: &'a mut i64,
     queued: &'a mut bool,
-    now: i64,
+    now: DbMillis,
 }
 
 async fn materialize_occurrence<C>(
@@ -354,9 +362,9 @@ where
                 .values(NewScheduleRunRow {
                     schedule_key: target.schedule_key.to_string(),
                     local_occurrence: occurrence.local_occurrence,
-                    scheduled_for: occurrence.scheduled_for,
+                    scheduled_for: DbMillis::from_requested_millis(occurrence.scheduled_for),
                     materialized_at: target.now,
-                    status: "queued".to_string(),
+                    status: ScheduleRunStatus::Queued,
                     reason: Some("overlap_queue_one".to_string()),
                     actor_id: None,
                     workflow_id: None,
@@ -371,18 +379,20 @@ where
         (outcome, _) => outcome,
     };
     let (status, reason) = match outcome {
-        OccurrenceOutcome::Start => ("materializing", None),
-        OccurrenceOutcome::Skip(reason) => ("skipped", Some(reason.to_string())),
-        OccurrenceOutcome::Coalesce => ("coalesced", Some("run_latest".to_string())),
+        OccurrenceOutcome::Start => (ScheduleRunStatus::Materializing, None),
+        OccurrenceOutcome::Skip(reason) => (ScheduleRunStatus::Skipped, Some(reason.to_string())),
+        OccurrenceOutcome::Coalesce => {
+            (ScheduleRunStatus::Coalesced, Some("run_latest".to_string()))
+        }
     };
     let run_id = crate::dialect::insert_schedule_run(
         connection,
         NewScheduleRunRow {
             schedule_key: target.schedule_key.to_string(),
             local_occurrence: occurrence.local_occurrence,
-            scheduled_for: occurrence.scheduled_for,
+            scheduled_for: DbMillis::from_requested_millis(occurrence.scheduled_for),
             materialized_at: target.now,
-            status: status.to_string(),
+            status,
             reason,
             actor_id: None,
             workflow_id: None,
@@ -392,7 +402,7 @@ where
     .await?;
     match outcome {
         OccurrenceOutcome::Start => {
-            let schedule_run_id = ScheduleRunId::new(run_id)?;
+            let schedule_run_id = run_id;
             let workflow_id = target
                 .registry
                 .start_occurrence(
@@ -405,12 +415,12 @@ where
                 .await?;
             let changed = diesel::update(
                 durable_schedule_run::table
-                    .find(schedule_run_id.get())
-                    .filter(durable_schedule_run::status.eq("materializing")),
+                    .find(schedule_run_id)
+                    .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Materializing)),
             )
             .set((
-                durable_schedule_run::status.eq("started"),
-                durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
+                durable_schedule_run::status.eq(ScheduleRunStatus::Started),
+                durable_schedule_run::workflow_id.eq(Some(workflow_id)),
             ))
             .execute(connection)
             .await?;
@@ -424,21 +434,22 @@ where
     Ok(())
 }
 
-async fn active_workflow_count(
+/// Non-terminal workflows started by runs of the schedule whose state row
+/// `state` locked (S29). The key comes from the locked row.
+pub(crate) async fn active_workflow_count(
     connection: &mut crate::DurableConnection,
-    schedule_key: &str,
+    state: Locked<'_, &ScheduleStateRow>,
 ) -> Result<i64, DurableError> {
+    let schedule_key = state.row().schedule_key.as_str();
     Ok(durable_workflow::table
         .inner_join(
             durable_schedule_run::table
                 .on(durable_workflow::schedule_run_id.eq(durable_schedule_run::id.nullable())),
         )
         .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-        .filter(not(durable_workflow::status.eq_any([
-            WorkflowStatus::Succeeded,
-            WorkflowStatus::Cancelled,
-            WorkflowStatus::Failed,
-        ])))
+        .filter(not(
+            durable_workflow::status.eq_any(WorkflowStatus::TERMINAL)
+        ))
         .count()
         .get_result::<i64>(connection)
         .await?)
@@ -450,7 +461,7 @@ async fn queued_run_exists(
 ) -> Result<bool, DurableError> {
     Ok(durable_schedule_run::table
         .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-        .filter(durable_schedule_run::status.eq("queued"))
+        .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Queued))
         .count()
         .get_result::<i64>(connection)
         .await?
@@ -468,7 +479,7 @@ where
 {
     let run = durable_schedule_run::table
         .filter(durable_schedule_run::schedule_key.eq(schedule_key))
-        .filter(durable_schedule_run::status.eq("queued"))
+        .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Queued))
         .order((
             durable_schedule_run::scheduled_for.asc(),
             durable_schedule_run::id.asc(),
@@ -477,24 +488,24 @@ where
         .select(ScheduleRunRow::as_select())
         .first::<ScheduleRunRow>(connection)
         .await?;
-    let schedule_run_id = ScheduleRunId::new(run.id)?;
+    let schedule_run_id = run.id;
     let workflow_id = registry
         .start_occurrence(
             schedule_key,
             context,
             connection,
             schedule_run_id,
-            run.scheduled_for,
+            run.scheduled_for.get(),
         )
         .await?;
     let changed = diesel::update(
         durable_schedule_run::table
             .find(run.id)
-            .filter(durable_schedule_run::status.eq("queued")),
+            .filter(durable_schedule_run::status.eq(ScheduleRunStatus::Queued)),
     )
     .set((
-        durable_schedule_run::status.eq("started"),
-        durable_schedule_run::workflow_id.eq(Some(workflow_id.get())),
+        durable_schedule_run::status.eq(ScheduleRunStatus::Started),
+        durable_schedule_run::workflow_id.eq(Some(workflow_id)),
         durable_schedule_run::reason.eq(Some("queue_one_promoted".to_string())),
     ))
     .execute(connection)
@@ -515,12 +526,12 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    fn assert_chunked_matches_full(timezone: &str, start: chrono::DateTime<Utc>, now: i64) {
+    fn assert_chunked_matches_full(timezone: &str, start: chrono::DateTime<Utc>, now: DbMillis) {
         let calendar = ScheduleCalendar::new("0 * * * * *", timezone).expect("calendar");
         let first = calendar.next_after(start).expect("first occurrence");
         let mut next = first.clone();
         let mut all = Vec::new();
-        while next.due_at <= now {
+        while next.due_at <= now.get() {
             all.push(next.clone());
             next = calendar
                 .next_after_local(next.local_datetime)
@@ -539,7 +550,7 @@ mod tests {
             let mut actual = Vec::new();
             let mut occurrence = first.clone();
             let mut ticks = 0;
-            while occurrence.due_at <= now {
+            while occurrence.due_at <= now.get() {
                 let (due, next, outcomes) =
                     plan_due_chunk(&calendar, occurrence.clone(), policy, 60_000, now)
                         .expect("recoverable chunk");
@@ -564,7 +575,11 @@ mod tests {
             .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
             .single()
             .expect("start");
-        assert_chunked_matches_full("UTC", start, start.timestamp_millis() + 20_001 * 60_000);
+        assert_chunked_matches_full(
+            "UTC",
+            start,
+            DbMillis::from_database_millis(start.timestamp_millis() + 20_001 * 60_000),
+        );
     }
 
     #[test]
@@ -578,7 +593,9 @@ mod tests {
             assert_chunked_matches_full(
                 "America/Denver",
                 start,
-                (boundary + chrono::Duration::hours(3)).timestamp_millis(),
+                DbMillis::from_database_millis(
+                    (boundary + chrono::Duration::hours(3)).timestamp_millis(),
+                ),
             );
         }
     }

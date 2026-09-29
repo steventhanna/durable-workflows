@@ -1,0 +1,49 @@
+name: kani
+
+# Bounded model checking of the pure-logic modules with Kani (CLAUDE.md,
+# "Bounded model checking"). A separate workflow, off the per-PR critical
+# path: it runs on PRs that touch a module with harnesses, on main, weekly,
+# and on demand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - durable-workflows/src/policy.rs
+      - durable-workflows/src/error.rs
+      - durable-workflows/src/ids.rs
+      - durable-workflows/src/persistence/mod.rs
+      - durable-workflows/src/runtime/supervisor.rs
+      - durable-workflows/Cargo.toml
+      - Cargo.lock
+      - .github/workflows/kani.yml
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned: a new Kani brings a new nightly toolchain and a new CBMC, which
+  # can change proof times. Bump it on purpose and rerun locally.
+  KANI_VERSION: 0.68.0
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+      - name: Install Kani ${{ env.KANI_VERSION }}
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      # Every harness in the crate (the default postgres backend; the
+      # harnessed code does not depend on the backend).
+      - run: cargo kani -p durable-workflows --output-format terse

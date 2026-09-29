@@ -14,7 +14,10 @@ notifications, document delivery and scheduled jobs.
 > **Status:** pre-1.0. MySQL (8.0.16+ and 8.4) and PostgreSQL (14+) are both
 > supported, and CI runs the full suite on MySQL 8.0 and 8.4 and on Postgres
 > 14 and 17. The storage schema may still change before 1.0. See
-> [Known issues](#known-issues) for the confirmed protocol gaps.
+> [Known issues](#known-issues).
+
+To learn how the engine works, start with
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Features
 
@@ -71,7 +74,9 @@ let manager = AsyncDieselConnectionManager::<durable_workflows::DurableConnectio
 ```
 
 The `fake-clock` feature lets the test suite override the database clock. It
-is for tests only: **never enable `fake-clock` in production.**
+is for tests only: **never enable `fake-clock` in production.** A build
+without debug assertions (the `release` profile) that enables it fails to
+compile.
 
 ### Creating the tables
 
@@ -164,14 +169,22 @@ Each process runs a `DurableRuntime`. It supervises a small set of loops:
 
 - a **workflow coordinator** that claims ready workflows and applies their
   next transition;
-- **activity workers** per topic that claim due activities under a lease and
-  record each attempt;
+- one **activity dispatcher** that claims due activities across all topics
+  in one batch, under each topic's concurrency cap, and spawns one execution
+  per claim; each execution holds a lease, heartbeats, and records its
+  attempt;
 - **materializers** that turn due timers, expiring approvals and cron
   occurrences into workflow events;
-- a **health scanner** that reports stuck or failing work.
+- a **health scanner** that runs on an interval and reports missing workflow
+  or activity definitions and topics, workflows that exhausted their
+  activation attempts, dead-lettered activities with no successful retry,
+  and workflows and activities whose lease expired longer ago than
+  `health_stale_after`. It logs each report and passes it to an optional
+  `HealthAlertSink`.
 
 All coordination goes through the database. Any number of processes can run
-the runtime against the same tables.
+the runtime against the same tables. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+describes the components, the state machines and the concurrency model.
 
 ## Contracts
 
@@ -192,7 +205,8 @@ the runtime against the same tables.
 - **Keys compare by exact bytes.** Deduplication keys, topic keys, schedule
   keys and operation keys are case- and accent-sensitive on both backends:
   `email` and `Email` are different topics.
-- **`fake-clock` is test-only.** Never enable it in production.
+- **`fake-clock` is test-only.** Never enable it in production. A release
+  build (no debug assertions) with the feature is a compile error.
 
 ## Verification
 
@@ -205,7 +219,9 @@ has reproduction tests for most of the suspected gaps in INVARIANTS §6 and for 
 more (N1, N2) found by the model. A test that confirms its gap is `#[ignore]`d
 with the reason, so the suite stays green; a fix removes the `#[ignore]`. A
 test that refuted its gap (G4, closed by READ COMMITTED) stays as a
-regression test. G5, G7, G9 and G12 are not reproduced by a test yet.
+regression test. G5 and G12 are fixed, with tests in the schedule suites; G9
+was fixed without one, and G7 is closed under READ COMMITTED (the Quint model shows why,
+see [`spec/README.md`](spec/README.md)).
 
 Trace checking ([`docs/TRACE_CHECKING.md`](docs/TRACE_CHECKING.md)) records
 every engine transaction of the test suites and replays the traces through
@@ -214,34 +230,11 @@ self-test, since each must show its invariant violation.
 
 ## Known issues
 
-These gaps are confirmed by ignored tests in
-[`tests/gaps.rs`](durable-workflows/tests/gaps.rs). Details and interleavings
-are in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps) and
-[`spec/README.md`](spec/README.md).
-
-- **G1** — A benign race (such as an operator pausing a workflow during its
-  step) makes the coordinator return `FencedWrite`, which uses up the
-  runtime's restart budget. The budget never resets, so repeated races stop
-  the runtime.
-- **G2** — A recoverable start on a blocked keyed child cancels that child
-  but does not wake its parent, which stays `waiting_child` forever.
-- **G3** — A `step` that panics never counts an activation attempt; after
-  lease recovery it panics again, without limit, in every runtime that
-  claims it.
-- **G6** — Under a concurrent child deduplication race, a parent can wait on
-  a child of a different definition version; the parent then fails on replay.
-- **G8** — `child_with_key` can resolve to the calling workflow (or an
-  ancestor), which then waits on itself forever.
-- **G10** — One invalid activity row (for example a lease no longer than its
-  timeout) makes the activity claim fail on every topic, not only its own.
-- **G11** — Cancelling a parent workflow does not cancel its children; they
-  keep running.
-- **N1** — A recoverable start on a child key can cancel and restart a
-  different sibling child in the same tree, or return an unrelated sibling's
-  id.
-- **N2** — An application cancel or operator pause frees the topic
-  concurrency slot while the cancelled handler is still running, so a cap-1
-  topic can briefly run two handlers.
+No confirmed protocol gap is open. The behaviors that are documented as
+intended, such as a child started with a domain key outliving its cancelled
+parent, are listed in [INVARIANTS §6](docs/INVARIANTS.md#6-suspected-gaps);
+[`tests/gaps.rs`](durable-workflows/tests/gaps.rs) keeps the reproduction
+test of each fixed gap as a regression test.
 
 ## Contributing
 

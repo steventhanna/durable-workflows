@@ -3,6 +3,7 @@ mod support;
 use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
+use durable_workflows::DbMillis;
 use durable_workflows::DurableConnection;
 use durable_workflows::{
     admin::{
@@ -40,7 +41,7 @@ async fn topic_metrics_report_the_persisted_cap_and_registry_mismatch() {
         .values((
             durable_topic_lock::topic.eq("provider"),
             durable_topic_lock::max_concurrency.eq(1_i32),
-            durable_topic_lock::updated_at.eq(NOW),
+            durable_topic_lock::updated_at.eq(DbMillis::from_database_millis(NOW)),
         ))
         .execute(&mut connection)
         .await
@@ -50,7 +51,11 @@ async fn topic_metrics_report_the_persisted_cap_and_registry_mismatch() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics remain visible during a rolling mismatch");
     let metrics = page.items.as_slice().first().expect("provider metrics");
@@ -132,13 +137,12 @@ impl ScheduleHandler for RegisteredSchedule {
     }
 }
 
-async fn start_workflow(pool: &durable_workflows::DurablePool) -> i64 {
+async fn start_workflow(pool: &durable_workflows::DurablePool) -> WorkflowId {
     DurableStore::new(pool.clone())
         .start(&MetricsWorkflow, StartOptions::default())
         .await
         .expect("workflow starts")
         .workflow_id
-        .get()
 }
 
 struct ActivitySeed<'a> {
@@ -152,18 +156,18 @@ struct ActivitySeed<'a> {
 
 async fn insert_activity(
     connection: &mut DurableConnection,
-    workflow_id: i64,
+    workflow_id: durable_workflows::WorkflowId,
     seed: ActivitySeed<'_>,
-) -> i64 {
+) -> durable_workflows::ActivityId {
     insert_activity_on_topic(connection, workflow_id, "provider", seed).await
 }
 
 async fn insert_activity_on_topic(
     connection: &mut DurableConnection,
-    workflow_id: i64,
+    workflow_id: durable_workflows::WorkflowId,
     topic: &str,
     seed: ActivitySeed<'_>,
-) -> i64 {
+) -> durable_workflows::ActivityId {
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
             workflow_id,
@@ -175,7 +179,7 @@ async fn insert_activity_on_topic(
             payload_json: "{}".to_string(),
             status: durable_workflows::persistence::ActivityStatus::try_from(seed.status)
                 .expect("valid fixture status"),
-            available_at: seed.available_at,
+            available_at: DbMillis::from_database_millis(seed.available_at),
             max_attempts: 3,
             attempt_count: seed.attempt_count,
             timeout_millis: 10_000,
@@ -190,12 +194,12 @@ async fn insert_activity_on_topic(
             lease_token: seed
                 .lease_expires_at
                 .map(|_| "00000000-0000-0000-0000-000000000111".to_string()),
-            lease_expires_at: seed.lease_expires_at,
+            lease_expires_at: seed.lease_expires_at.map(DbMillis::from_database_millis),
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: seed.available_at - 1_000,
-            updated_at: seed.available_at,
-            completed_at: seed.completed_at,
+            created_at: DbMillis::from_database_millis(seed.available_at - 1_000),
+            updated_at: DbMillis::from_database_millis(seed.available_at),
+            completed_at: seed.completed_at.map(DbMillis::from_database_millis),
         })
         .execute(connection)
         .await
@@ -237,8 +241,8 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
             attempt_number: 1,
             worker_id: "metrics-worker".to_string(),
             lease_token: "00000000-0000-0000-0000-000000000111".to_string(),
-            started_at: NOW - 8_000,
-            heartbeat_at: NOW - 100,
+            started_at: DbMillis::from_database_millis(NOW - 8_000),
+            heartbeat_at: DbMillis::from_database_millis(NOW - 100),
             finished_at: None,
             outcome: None,
             error_category: None,
@@ -278,7 +282,7 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(ready_id)),
+            durable_workflow::wait_reference_id.eq(Some(ready_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -300,7 +304,7 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(retry_id)),
+            durable_workflow::wait_reference_id.eq(Some(retry_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -358,7 +362,11 @@ async fn topic_metrics_use_one_captured_clock_and_exact_lease_fences() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics");
     assert_eq!(page.items.len(), 1);
@@ -479,7 +487,11 @@ async fn topic_metrics_dead_letter_count_excludes_resolved_workflows() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics");
     let metrics = &page.items[0];
@@ -523,7 +535,7 @@ async fn topic_metrics_dead_letter_count_excludes_retried_chains_on_open_workflo
             topic: "provider".to_string(),
             payload_json: "{}".to_string(),
             status: durable_workflows::persistence::ActivityStatus::Succeeded,
-            available_at: NOW - HOUR_MILLIS + 500,
+            available_at: DbMillis::from_database_millis(NOW - HOUR_MILLIS + 500),
             max_attempts: 3,
             attempt_count: 1,
             timeout_millis: 10_000,
@@ -539,9 +551,9 @@ async fn topic_metrics_dead_letter_count_excludes_retried_chains_on_open_workflo
             lease_expires_at: None,
             root_activity_id: Some(dead_letter_id),
             replaces_activity_id: Some(dead_letter_id),
-            created_at: NOW - HOUR_MILLIS,
-            updated_at: NOW - HOUR_MILLIS + 500,
-            completed_at: Some(NOW - HOUR_MILLIS + 500),
+            created_at: DbMillis::from_database_millis(NOW - HOUR_MILLIS),
+            updated_at: DbMillis::from_database_millis(NOW - HOUR_MILLIS + 500),
+            completed_at: Some(DbMillis::from_database_millis(NOW - HOUR_MILLIS + 500)),
         })
         .execute(&mut connection)
         .await
@@ -558,7 +570,11 @@ async fn topic_metrics_dead_letter_count_excludes_retried_chains_on_open_workflo
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("topic metrics");
     let metrics = &page.items[0];
@@ -621,7 +637,7 @@ async fn topic_metrics_batch_counts_stay_isolated_per_topic() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(fax_ready_id)),
+            durable_workflow::wait_reference_id.eq(Some(fax_ready_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -632,7 +648,11 @@ async fn topic_metrics_batch_counts_stay_isolated_per_topic() {
     topics.register(MetricsTopic::Provider).expect("provider");
     topics.register(MetricsTopic::Fax).expect("fax");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("batched topic metrics");
     assert_eq!(
@@ -697,7 +717,7 @@ async fn topic_metrics_treat_spellings_as_distinct_topics() {
         .values((
             durable_topic_lock::topic.eq("PROVIDER"),
             durable_topic_lock::max_concurrency.eq(1_i32),
-            durable_topic_lock::updated_at.eq(NOW),
+            durable_topic_lock::updated_at.eq(DbMillis::from_database_millis(NOW)),
         ))
         .execute(&mut connection)
         .await
@@ -735,7 +755,11 @@ async fn topic_metrics_treat_spellings_as_distinct_topics() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).expect("topic");
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .expect("exact-spelling topic metrics");
     assert_eq!(
@@ -814,13 +838,13 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
                 definition_fingerprint: fingerprint,
                 definition_version: version,
                 next_local_occurrence: "2099-01-01T00:00:00".to_string(),
-                next_occurrence_at: NOW + HOUR_MILLIS,
-                last_materialized_at: Some(NOW - HOUR_MILLIS),
+                next_occurrence_at: DbMillis::from_database_millis(NOW + HOUR_MILLIS),
+                last_materialized_at: Some(DbMillis::from_database_millis(NOW - HOUR_MILLIS)),
                 paused_at: None,
                 paused_by: None,
                 pause_reason: None,
-                created_at: NOW - 10_000,
-                updated_at: NOW - 5_000,
+                created_at: DbMillis::from_database_millis(NOW - 10_000),
+                updated_at: DbMillis::from_database_millis(NOW - 5_000),
             })
             .execute(&mut connection)
             .await
@@ -831,13 +855,14 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
             .values(NewScheduleRunRow {
                 schedule_key: "registered_schedule".to_string(),
                 local_occurrence: format!("occurrence-{offset}"),
-                scheduled_for: NOW - offset * HOUR_MILLIS,
-                materialized_at: NOW - offset * HOUR_MILLIS,
-                status: status.to_string(),
+                scheduled_for: DbMillis::from_database_millis(NOW - offset * HOUR_MILLIS),
+                materialized_at: DbMillis::from_database_millis(NOW - offset * HOUR_MILLIS),
+                status: durable_workflows::persistence::ScheduleRunStatus::try_from(status)
+                    .expect("schedule run status"),
                 reason: Some(format!("bounded {status}")),
                 actor_id: None,
                 workflow_id: None,
-                created_at: NOW - offset * HOUR_MILLIS,
+                created_at: DbMillis::from_database_millis(NOW - offset * HOUR_MILLIS),
             })
             .execute(&mut connection)
             .await
@@ -846,7 +871,7 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
     let active_run_id = durable_schedule_run::table
         .filter(durable_schedule_run::status.eq("started"))
         .select(durable_schedule_run::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ScheduleRunId>(&mut connection)
         .await
         .expect("active run ID");
     diesel::update(durable_workflow::table.find(workflow_id))
@@ -902,7 +927,7 @@ async fn schedule_health_includes_unregistered_state_and_bounded_recent_runs() {
     assert_eq!(registered.coalesced_count, 1);
     assert_eq!(registered.recent_runs.len(), 2);
     assert_eq!(
-        registered.last_run.as_ref().map(|run| run.id.get()),
+        registered.last_run.as_ref().map(|run| run.id),
         Some(active_run_id)
     );
 
@@ -941,13 +966,13 @@ async fn schedule_run_cursors_support_max_length_schedule_keys() {
                 "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
             definition_version: 1,
             next_local_occurrence: "2099-01-01T00:00:00".to_string(),
-            next_occurrence_at: NOW + HOUR_MILLIS,
-            last_materialized_at: Some(NOW),
+            next_occurrence_at: DbMillis::from_database_millis(NOW + HOUR_MILLIS),
+            last_materialized_at: Some(DbMillis::from_database_millis(NOW)),
             paused_at: None,
             paused_by: None,
             pause_reason: None,
-            created_at: NOW,
-            updated_at: NOW,
+            created_at: DbMillis::from_database_millis(NOW),
+            updated_at: DbMillis::from_database_millis(NOW),
         })
         .execute(&mut connection)
         .await
@@ -957,13 +982,13 @@ async fn schedule_run_cursors_support_max_length_schedule_keys() {
             .values(NewScheduleRunRow {
                 schedule_key: schedule_key.clone(),
                 local_occurrence: format!("occurrence-{offset}"),
-                scheduled_for: NOW - offset,
-                materialized_at: NOW - offset,
-                status: "skipped".to_string(),
+                scheduled_for: DbMillis::from_database_millis(NOW - offset),
+                materialized_at: DbMillis::from_database_millis(NOW - offset),
+                status: durable_workflows::persistence::ScheduleRunStatus::Skipped,
                 reason: None,
                 actor_id: None,
                 workflow_id: None,
-                created_at: NOW - offset,
+                created_at: DbMillis::from_database_millis(NOW - offset),
             })
             .execute(&mut connection)
             .await
@@ -1010,7 +1035,7 @@ async fn approval_listing_classifies_expiry_without_loading_decisions() {
         (1, "pending", Some(NOW - 1), None),
         (
             2,
-            "approved",
+            "resolved",
             None,
             Some(r#"{"secret":"approval-decision"}"#.to_string()),
         ),
@@ -1024,13 +1049,16 @@ async fn approval_listing_classifies_expiry_without_loading_decisions() {
                 prompt_metadata_json: r#"{"secret":"approval-prompt"}"#.to_string(),
                 validation_schema_json: "{}".to_string(),
                 validation_version: 1,
-                status: status.to_string(),
-                requested_at: NOW - i64::from(sequence) * 1_000,
-                expires_at,
+                status: durable_workflows::persistence::ApprovalStatus::try_from(status)
+                    .expect("approval status"),
+                requested_at: DbMillis::from_database_millis(NOW - i64::from(sequence) * 1_000),
+                expires_at: expires_at.map(DbMillis::from_database_millis),
                 decision_payload_json: decision,
-                decided_by: (status == "approved").then_some(7),
-                operator_reason: (status == "approved").then(|| "Reviewed".to_string()),
-                resolved_at: (status == "approved").then_some(NOW - 100),
+                decided_by: (status == "resolved").then_some(7),
+                operator_reason: (status == "resolved").then(|| "Reviewed".to_string()),
+                resolved_at: (status == "resolved")
+                    .then_some(NOW - 100)
+                    .map(DbMillis::from_database_millis),
             })
             .execute(&mut connection)
             .await
@@ -1044,7 +1072,7 @@ async fn approval_listing_classifies_expiry_without_loading_decisions() {
                 status: Some("expired".to_string()),
                 ..ApprovalListFilter::default()
             },
-            NOW,
+            DbMillis::from_database_millis(NOW),
         )
         .await
         .expect("expired approvals");
@@ -1079,7 +1107,7 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
     )
     .await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::created_at.eq(NOW - 5_000))
+        .set(durable_activity::created_at.eq(DbMillis::from_database_millis(NOW - 5_000)))
         .execute(&mut connection)
         .await
         .unwrap();
@@ -1087,7 +1115,7 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
         ))
         .execute(&mut connection)
         .await
@@ -1096,7 +1124,11 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
     let mut topics = TopicRegistry::new();
     topics.register(MetricsTopic::Provider).unwrap();
     let page = AdminQueryService::new(pool.clone())
-        .list_topic_metrics_at(&topics, PageRequest::default(), NOW)
+        .list_topic_metrics_at(
+            &topics,
+            PageRequest::default(),
+            DbMillis::from_database_millis(NOW),
+        )
         .await
         .unwrap();
     assert_eq!(page.items[0].ready_count, 1);
@@ -1110,7 +1142,7 @@ async fn prioritized_continuation_ready_age_uses_creation_time() {
     assert_eq!(activities.items[0].available_at, NOW - 5_000);
     let detail = query
         .get_activity(
-            durable_workflows::ActivityId::new(activity_id).unwrap(),
+            activity_id,
             durable_workflows::admin::ActivityDetailRequest::default(),
         )
         .await

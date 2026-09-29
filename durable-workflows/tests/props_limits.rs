@@ -112,6 +112,7 @@ proptest! {
         let (got_category, got_message) = match &error {
             ActivityError::Retryable { category, message } => (category, message),
             ActivityError::Permanent { category, message } => (category, message),
+            other => panic!("unexpected ActivityError variant: {other:?}"),
         };
         prop_assert_eq!(matches!(error, ActivityError::Retryable { .. }), retryable);
         assert_maximal_prefix(&category, got_category, MAX_CATEGORY_BYTES)?;

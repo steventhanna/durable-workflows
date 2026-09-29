@@ -16,8 +16,13 @@
 //! Every seed asserts that its own trace holds a `Crash`, a `TC1_Claim` that
 //! recovered an expired workflow lease, a `TW1_Claim` that reconciled an
 //! expired activity lease, and a fence miss: the driver aims its crashes at
-//! runtimes that hold leases and its cancels and pauses at workflows whose
-//! activity is running, which makes each of them reliable per seed.
+//! runtimes that hold leases (a forced crash waits for a holder of its kind),
+//! keeps the survivors running until the orphaned leases are taken over, and
+//! aims its cancels and pauses at workflows whose activity is running, which
+//! makes each of them reliable per seed. A seed that reaches half its run
+//! without a fence miss runs the fence probe: the next workflow step is held
+//! until another runtime has recovered its expired lease, then released, so
+//! its commit misses the fence (`CoordFenceMiss`).
 //!
 //! `DURABLE_TRACE_WORKLOAD_SEEDS=N` (N > 4) also runs seeds 5..=N in
 //! `workload_extra_seeds`, four at a time; each gets its own database and
@@ -110,18 +115,42 @@ struct Workload {
     /// (workflow, command sequence) pairs whose one-time slow step already ran.
     /// Timing only: a step's result never depends on it.
     slowed: Mutex<HashSet<(i64, u32)>>,
+    probe: Mutex<FenceProbe>,
+    /// Releases the step the probe holds.
+    release: tokio::sync::Notify,
+}
+
+/// The driver's fence probe. Timing only, like `slowed`.
+#[derive(Default)]
+struct FenceProbe {
+    armed: bool,
+    held: Option<i64>,
 }
 
 impl Workload {
     /// Some steps take a while; a few outlast the coordinator lease once, so
     /// another runtime recovers the workflow and the first one misses its fence.
-    /// Only steps that insert no row (`stale_ok`: Continue, Complete) outlast
-    /// it: a stale RunActivity / RunChild commit hits the recovering commit's
-    /// unique key before its fence (a known engine issue, reported with the
-    /// workload) and ends without a `CoordFenceMiss`.
-    async fn pace_step(&self, workflow: i64, sequence: u32, stale_ok: bool) {
+    async fn pace_step(&self, workflow: i64, sequence: u32) {
+        let hold = self
+            .probe
+            .lock()
+            .map(|mut probe| {
+                let take = probe.armed && probe.held.is_none();
+                if take {
+                    probe.armed = false;
+                    probe.held = Some(workflow);
+                }
+                take
+            })
+            .unwrap_or(false);
+        if hold {
+            // The driver releases the step once another runtime has recovered
+            // the workflow; the cap keeps a stuck driver from hanging the step.
+            let _ = tokio::time::timeout(Duration::from_secs(20), self.release.notified()).await;
+            return;
+        }
         let roll = mix(self.seed, workflow as u64, u64::from(sequence), SALT_PACE) % 100;
-        let delay = if roll < 10 && stale_ok {
+        let delay = if roll < 10 {
             let first = self
                 .slowed
                 .lock()
@@ -298,8 +327,7 @@ impl WorkflowHandler for WorkloadFlow {
         let workload = context.application();
         let workflow = context.workflow_id().map_or(0, WorkflowId::get);
         let roll = mix(workload.seed, workflow as u64, u64::from(state), SALT_FLOW);
-        let stale_ok = state >= MAX_COMMANDS || roll % 100 < 18 || roll % 100 > 77;
-        workload.pace_step(workflow, state, stale_ok).await;
+        workload.pace_step(workflow, state).await;
         if state >= MAX_COMMANDS {
             return Ok(WorkflowTransition::Complete { output: () });
         }
@@ -362,19 +390,19 @@ fn registries() -> Registries {
 }
 
 fn runtime_config() -> RuntimeConfig {
-    RuntimeConfig {
-        coordinator: CoordinatorConfig {
-            lease_duration: Duration::from_secs(2),
-            ..CoordinatorConfig::default()
-        },
-        worker: WorkerConfig {
-            heartbeat_interval: Duration::from_millis(500),
-            shutdown_grace: Duration::from_millis(500),
-        },
-        idle_delay: Duration::from_millis(150),
-        restart_backoff: Duration::from_millis(100),
-        ..RuntimeConfig::default()
-    }
+    RuntimeConfig::default()
+        .with_coordinator(
+            CoordinatorConfig::default()
+                .with_lease_duration(Duration::from_secs(2))
+                .with_step_timeout(Duration::from_millis(1900)),
+        )
+        .with_worker(
+            WorkerConfig::default()
+                .with_heartbeat_interval(Duration::from_millis(500))
+                .with_shutdown_grace(Duration::from_millis(500)),
+        )
+        .with_idle_delay(Duration::from_millis(150))
+        .with_restart_backoff(Duration::from_millis(100))
 }
 
 struct LiveRuntime {
@@ -529,13 +557,13 @@ impl Snapshot {
             .activities
             .iter()
             .filter(|row| row.status.as_str() == "running" && !owner_crashed(row))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect();
         let orphaned: HashSet<i64> = self
             .activities
             .iter()
             .filter(|row| row.status.as_str() == "running" && owner_crashed(row))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect();
         let waits_on = |row: &WorkflowRow, set: &HashSet<i64>| {
             row.status.as_str() == "waiting_activity"
@@ -547,7 +575,7 @@ impl Snapshot {
             .workflows
             .iter()
             .filter(|row| waits_on(row, &running))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect();
         if !hot.is_empty() {
             return hot;
@@ -555,7 +583,7 @@ impl Snapshot {
         self.workflows
             .iter()
             .filter(|row| allowed.contains(&row.status.as_str()) && !waits_on(row, &orphaned))
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect()
     }
 
@@ -563,7 +591,7 @@ impl Snapshot {
         self.workflows
             .iter()
             .filter(|row| row.status.as_str() == "paused")
-            .map(|row| row.id)
+            .map(|row| row.id.get())
             .collect()
     }
 
@@ -662,6 +690,8 @@ async fn run_seed(seed: u64) -> Option<Stats> {
     let workload = Arc::new(Workload {
         seed,
         slowed: Mutex::new(HashSet::new()),
+        probe: Mutex::new(FenceProbe::default()),
+        release: tokio::sync::Notify::new(),
     });
     let mut rng = DriverRng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
     let runtime_count = 2 + rng.below(2);
@@ -680,8 +710,17 @@ async fn run_seed(seed: u64) -> Option<Stats> {
     let total = Duration::from_secs(workload_secs());
     let mut crashes = 0;
     let mut crashed = HashSet::new();
+    // Whether a crash has left an activity / a workflow lease to expire; the
+    // coverage assertions need one of each.
+    let mut orphaned_activity = false;
+    let mut orphaned_workflow = false;
     let mut starting = true;
-    while started.elapsed() < total {
+    let mut probed = false;
+    // A run whose forced crashes found no lease holder yet goes on (up to
+    // twice its length) until they have.
+    while started.elapsed() < total
+        || (started.elapsed() < total * 2 && !(orphaned_activity && orphaned_workflow))
+    {
         tokio::time::sleep(Duration::from_millis(200 + rng.below(600))).await;
         let length = trace_len(&pool).await;
         if length >= HARD_STEP_CAP {
@@ -690,18 +729,58 @@ async fn run_seed(seed: u64) -> Option<Stats> {
         if length >= SOFT_STEP_CAP {
             starting = false;
         }
+        // From half the run on, a seed with no fence miss yet runs the probe
+        // once. It runs inline, so no crash or cancel meets the held step.
+        if !probed
+            && length < HARD_STEP_CAP
+            && started.elapsed() * 2 > total
+            && Stats::from_records(&trace_records(&pool).await).fence_misses == 0
+        {
+            probed = true;
+            fence_probe(&pool, &store, &workload).await;
+            continue;
+        }
         if !starting {
             continue;
         }
         let state = snapshot(&pool).await;
-        // At least two crashes (one per lease kind): forced from 40% and 70%
-        // of the run on.
+        // A crash that orphans an activity lease is forced from 40% of the
+        // run on and one that orphans a workflow lease from 70%, until each
+        // has happened.
         let late = started.elapsed() * 5 > total * 2;
         let later = started.elapsed() * 10 > total * 7;
-        let roll = if (crashes == 0 && late) || (crashes == 1 && later) {
-            95
+        let forced = if late && !orphaned_activity {
+            Some(true)
+        } else if later && !orphaned_workflow {
+            Some(false)
         } else {
-            rng.below(100)
+            None
+        };
+        // A forced crash waits up to 2 s for a runtime holding a lease of its
+        // kind; without one, this round does ordinary work instead, so the
+        // seed keeps starting the workflows whose leases it needs.
+        let mut forced_victim = None;
+        if let Some(activities) = forced {
+            let polling = tokio::time::Instant::now();
+            while forced_victim.is_none() && polling.elapsed() < Duration::from_secs(2) {
+                let holders: Vec<usize> = snapshot(&pool)
+                    .await
+                    .lease_holders(activities)
+                    .iter()
+                    .filter_map(|holder| runtimes.iter().position(|runtime| &runtime.id == holder))
+                    .collect();
+                forced_victim = rng.pick(&holders);
+                if forced_victim.is_none() {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            }
+        }
+        // Random crashes leave room for the forced ones.
+        let unmet = u32::from(!orphaned_activity) + u32::from(!orphaned_workflow);
+        let roll = match (forced, forced_victim) {
+            (_, Some(_)) => 95,
+            (Some(_), None) => rng.below(78),
+            (None, None) => rng.below(100),
         };
         match roll {
             0..=54 => {
@@ -759,11 +838,11 @@ async fn run_seed(seed: u64) -> Option<Stats> {
                     }
                 }
             }
-            78..=99 if crashes < MAX_CRASHES => {
+            78..=99 if forced_victim.is_some() || crashes + unmet < MAX_CRASHES => {
                 // Alternate between activity and workflow lease holders, so a
                 // reconcile and a recovery follow: wait up to 2 s for one.
                 let activities = crashes.is_multiple_of(2);
-                let mut victim = None;
+                let mut victim = forced_victim;
                 let polling = tokio::time::Instant::now();
                 while victim.is_none() && polling.elapsed() < Duration::from_secs(2) {
                     let holders: Vec<usize> = snapshot(&pool)
@@ -783,9 +862,14 @@ async fn run_seed(seed: u64) -> Option<Stats> {
                     usize::try_from(rng.below(runtimes.len() as u64)).unwrap_or(0)
                 });
                 let runtime = runtimes.remove(victim);
+                let victim_id = runtime.id.clone();
                 crashed.insert(runtime.id.clone());
                 crash(&pool, runtime).await;
                 crashes += 1;
+                // The runtime is gone: a lease it still holds must expire.
+                let left = snapshot(&pool).await;
+                orphaned_activity |= left.lease_holders(true).contains(&victim_id);
+                orphaned_workflow |= left.lease_holders(false).contains(&victim_id);
                 runtimes.push(spawn_runtime(&url, &workload, format!("rt{next_runtime}")).await);
                 next_runtime += 1;
             }
@@ -793,6 +877,19 @@ async fn run_seed(seed: u64) -> Option<Stats> {
         }
     }
 
+    // Keep the survivors running until every orphaned lease has been taken
+    // over: an activity lease (3 s) is reconciled by the next dispatcher
+    // sweep after it expires, and an empty sweep backs off up to 10 s.
+    let settling = tokio::time::Instant::now();
+    while settling.elapsed() < Duration::from_secs(20) {
+        let stats = Stats::from_records(&trace_records(&pool).await);
+        if (!orphaned_activity || stats.reconciles > 0)
+            && (!orphaned_workflow || stats.recoveries > 0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     for runtime in &runtimes {
         runtime.handle.cancellation_token().cancel();
     }
@@ -811,6 +908,58 @@ async fn run_seed(seed: u64) -> Option<Stats> {
         stats.actions
     );
     Some(stats)
+}
+
+/// Holds the next workflow step until another runtime has recovered the
+/// workflow's expired lease (the coordinator lease is 2 s and a step does not
+/// renew it), then releases it: its commit misses the fence.
+async fn fence_probe(pool: &DurablePool, store: &DurableStore, workload: &Workload) {
+    if let Ok(mut probe) = workload.probe.lock() {
+        probe.armed = true;
+    }
+    // A fresh workflow's first step arrives even when every other one waits.
+    store
+        .start(&WorkloadFlow { depth: 0 }, StartOptions::default())
+        .await
+        .expect("probe workflow starts");
+    let polling = tokio::time::Instant::now();
+    let mut held = None;
+    while held.is_none() && polling.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        held = workload.probe.lock().ok().and_then(|probe| probe.held);
+    }
+    let Some(workflow) = held else {
+        if let Ok(mut probe) = workload.probe.lock() {
+            probe.armed = false;
+        }
+        return;
+    };
+    let lease_token = |row: &WorkflowRow| row.lease_token.clone();
+    let held_token = lease_token(&workflow_row(pool, workflow).await);
+    let polling = tokio::time::Instant::now();
+    while polling.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if lease_token(&workflow_row(pool, workflow).await) != held_token {
+            break;
+        }
+    }
+    workload.release.notify_one();
+    let polling = tokio::time::Instant::now();
+    while polling.elapsed() < Duration::from_secs(5)
+        && Stats::from_records(&trace_records(pool).await).fence_misses == 0
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn workflow_row(pool: &DurablePool, workflow: i64) -> WorkflowRow {
+    let mut connection = pool.get().await.expect("connection");
+    durable_workflow::table
+        .find(durable_workflows::WorkflowId::new(workflow).expect("workflow ID"))
+        .select(WorkflowRow::as_select())
+        .first::<WorkflowRow>(&mut connection)
+        .await
+        .expect("probe workflow row")
 }
 
 fn assert_interesting(seed: u64, stats: &Stats) {

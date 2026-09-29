@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::time::Duration;
@@ -343,7 +344,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
     let Some(mut connection) = support::fresh_connection().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now_on(&mut connection).await;
 
     for (version, status, key) in [(1, "ready", "active"), (99, "succeeded", "terminal")] {
         diesel::insert_into(durable_workflow::table)
@@ -360,7 +361,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 error_message: None,
                 wait_kind: None,
                 wait_reference_id: None,
-                available_at: now,
+                available_at: DbMillis::from_database_millis(now),
                 activation_attempts: 0,
                 max_activation_attempts: 3,
                 consecutive_continuations: 0,
@@ -375,9 +376,11 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 parent_command_sequence: None,
                 command_sequence: 0,
                 delivered_event_sequence: 0,
-                created_at: now,
-                updated_at: now,
-                completed_at: (status == "succeeded").then_some(now),
+                created_at: DbMillis::from_database_millis(now),
+                updated_at: DbMillis::from_database_millis(now),
+                completed_at: (status == "succeeded")
+                    .then_some(now)
+                    .map(DbMillis::from_database_millis),
             })
             .execute(&mut connection)
             .await
@@ -387,7 +390,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
     let workflow_id = durable_workflow::table
         .filter(durable_workflow::deduplication_key.eq("active"))
         .select(durable_workflow::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::WorkflowId>(&mut connection)
         .await
         .expect("active workflow exists");
 
@@ -403,7 +406,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 payload_json: r#"{"value":1}"#.to_string(),
                 status: durable_workflows::persistence::ActivityStatus::try_from(status)
                     .expect("valid fixture status"),
-                available_at: now,
+                available_at: DbMillis::from_database_millis(now),
                 max_attempts: 3,
                 attempt_count: 0,
                 timeout_millis: 30_000,
@@ -418,9 +421,11 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 lease_expires_at: None,
                 root_activity_id: None,
                 replaces_activity_id: None,
-                created_at: now,
-                updated_at: now,
-                completed_at: (status == "succeeded").then_some(now),
+                created_at: DbMillis::from_database_millis(now),
+                updated_at: DbMillis::from_database_millis(now),
+                completed_at: (status == "succeeded")
+                    .then_some(now)
+                    .map(DbMillis::from_database_millis),
             })
             .execute(&mut connection)
             .await
@@ -446,7 +451,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
     let historical_activity_id = durable_activity::table
         .filter(durable_activity::version.eq(99))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("historical activity");
     diesel::update(durable_activity::table.find(historical_activity_id))
@@ -458,7 +463,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
         .set((
             durable_workflow::status.eq("blocked"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(historical_activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(historical_activity_id.get())),
         ))
         .execute(&mut connection)
         .await

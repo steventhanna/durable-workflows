@@ -272,6 +272,7 @@ pub struct ScheduleStateSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum ScheduleHealthIssue {
     MissingState,
     UnregisteredState,
@@ -470,6 +471,7 @@ pub struct ApprovalSummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", content = "data", rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum TimelineEntry {
     WorkflowEvent {
         event_type: String,

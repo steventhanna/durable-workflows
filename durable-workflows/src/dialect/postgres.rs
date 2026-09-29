@@ -2,6 +2,7 @@ use diesel::OptionalExtension;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 
 use super::{is_unique_violation, TransactionCallback, WorkflowInsert};
+use crate::tx::{CommandParent, Committed, Locked, Tx};
 use crate::{
     persistence::{
         NewActivityRow, NewApprovalRow, NewScheduleRunRow, NewScheduleStateRow, NewTopicLockRow,
@@ -11,7 +12,7 @@ use crate::{
         durable_activity, durable_approval, durable_schedule_run, durable_schedule_state,
         durable_topic_lock, durable_workflow,
     },
-    DurableConnection, DurableError,
+    ActivityId, ApprovalId, DurableConnection, DurableError, ScheduleRunId, WorkflowId,
 };
 
 // `now()` is the transaction start time; callers sample the clock after
@@ -33,8 +34,8 @@ pub(crate) async fn transaction<'a, 'conn, R, E, F>(
     callback: F,
 ) -> Result<R, E>
 where
-    for<'r> F: AsyncFnOnce(&'r mut DurableConnection) -> Result<R, E>
-        + TransactionCallback<&'r mut DurableConnection, Result<R, E>, Fut: Send>
+    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<Committed<R>, E>
+        + TransactionCallback<Tx<'r>, Result<Committed<R>, E>, Fut: Send>
         + Send
         + 'a,
     E: From<diesel::result::Error> + Send + 'a,
@@ -44,7 +45,7 @@ where
     connection
         .build_transaction()
         .read_committed()
-        .run(async move |connection| crate::trace::scoped(connection, callback).await)
+        .run(async move |connection| crate::tx::enter(connection, callback).await)
         .await
 }
 
@@ -83,18 +84,18 @@ pub(crate) async fn insert_workflow(
 async fn insert_workflow_row(
     connection: &mut DurableConnection,
     row: NewWorkflowRow,
-) -> Result<Option<i64>, diesel::result::Error> {
+) -> Result<Option<WorkflowId>, diesel::result::Error> {
     diesel::insert_into(durable_workflow::table)
         .values(row)
         .on_conflict((durable_workflow::kind, durable_workflow::deduplication_key))
         .do_nothing()
         .returning(durable_workflow::id)
-        .get_result::<i64>(connection)
+        .get_result::<WorkflowId>(connection)
         .await
         .optional()
 }
 
-fn restart_conflict(restarted_from_workflow_id: Option<i64>) -> DurableError {
+fn restart_conflict(restarted_from_workflow_id: Option<WorkflowId>) -> DurableError {
     match restarted_from_workflow_id {
         Some(id) => DurableError::Conflict(format!("workflow {id} already has a successor")),
         None => DurableError::Conflict(
@@ -103,36 +104,44 @@ fn restart_conflict(restarted_from_workflow_id: Option<i64>) -> DurableError {
     }
 }
 
-pub(crate) async fn insert_activity(
+/// Takes the locked parent workflow, so the insert cannot run before the
+/// fence lock (N4): a stale claim then gets `FencedWrite`, not a duplicate key.
+pub(crate) async fn insert_activity<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
+    parent: Locked<'tx, &P>,
     row: NewActivityRow,
-) -> Result<i64, DurableError> {
+) -> Result<ActivityId, DurableError> {
+    debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     Ok(diesel::insert_into(durable_activity::table)
         .values(row)
         .returning(durable_activity::id)
-        .get_result::<i64>(connection)
+        .get_result::<ActivityId>(connection)
         .await?)
 }
 
-pub(crate) async fn insert_approval(
+/// Takes the locked parent workflow, so the insert cannot run before the
+/// fence lock (N4): a stale claim then gets `FencedWrite`, not a duplicate key.
+pub(crate) async fn insert_approval<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
+    parent: Locked<'tx, &P>,
     row: NewApprovalRow,
-) -> Result<i64, DurableError> {
+) -> Result<ApprovalId, DurableError> {
+    debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     Ok(diesel::insert_into(durable_approval::table)
         .values(row)
         .returning(durable_approval::id)
-        .get_result::<i64>(connection)
+        .get_result::<ApprovalId>(connection)
         .await?)
 }
 
 pub(crate) async fn insert_schedule_run(
     connection: &mut DurableConnection,
     row: NewScheduleRunRow,
-) -> Result<i64, DurableError> {
+) -> Result<ScheduleRunId, DurableError> {
     Ok(diesel::insert_into(durable_schedule_run::table)
         .values(row)
         .returning(durable_schedule_run::id)
-        .get_result::<i64>(connection)
+        .get_result::<ScheduleRunId>(connection)
         .await?)
 }
 
@@ -162,4 +171,22 @@ pub(crate) async fn insert_topic_locks_if_absent(
         .execute(connection)
         .await?;
     Ok(())
+}
+
+/// A serialization failure (40001), deadlock (40P01) or lock timeout (55P03):
+/// the transaction was rolled back and retrying it later is safe.
+/// diesel-async maps only 40001 to a `DatabaseErrorKind` and does not expose
+/// the SQLSTATE, so the other two are matched by the server message (the
+/// server's `lc_messages` must be English, the default).
+pub(crate) fn is_transient_error(error: &DurableError) -> bool {
+    let DurableError::Database(diesel::result::Error::DatabaseError(kind, info)) = error else {
+        return false;
+    };
+    matches!(
+        kind,
+        diesel::result::DatabaseErrorKind::SerializationFailure
+    ) || {
+        let message = info.message();
+        message == "deadlock detected" || message == "canceling statement due to lock timeout"
+    }
 }

@@ -62,6 +62,8 @@ jobs:
           docker logs db
           exit 1
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: trace-check-${{ matrix.backend }}

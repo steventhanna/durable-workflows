@@ -16,7 +16,7 @@ use std::{
 use serde_json::{json, Map, Value};
 
 /// `TRACE_IFACE_VERSION` in `spec/durable.qnt` this generator targets.
-const IFACE_VERSION: i64 = 4;
+const IFACE_VERSION: i64 = 6;
 
 /// Invariants checked after every step.
 const STEP_INVARIANTS: &[&str] = &["safety", "inv_S17_capAtClaim"];
@@ -308,8 +308,6 @@ struct Ctx {
     hb: Interner<i64>,
     /// Heartbeats whose `TW2_Commit` is in the trace: their `TW2_Drop` is void.
     committed_hbs: BTreeSet<i64>,
-    /// Activities (real ids) the model holds with invalid timeout/lease bounds.
-    invalid_bounds: BTreeSet<i64>,
     /// The trace needs `ENABLE_ENV_EDITS` (an external step or an invalid-bounds insert).
     env_edits: bool,
     /// Invariants every step checks.
@@ -356,15 +354,11 @@ fn generate(
             .filter(|record| record["action"] == "TW2_Commit")
             .filter_map(|record| record["params"]["hb"].as_i64())
             .collect(),
-        invalid_bounds: BTreeSet::new(),
         env_edits: false,
         invariants: invariants.to_vec(),
     };
     let mut steps = Vec::new();
     for record in records {
-        if let Some(step) = external_step(&mut ctx, record)? {
-            steps.push(step);
-        }
         if let Some(step) = translate(&mut ctx, record)? {
             steps.push(step);
         }
@@ -511,37 +505,6 @@ fn generate(
     })
 }
 
-/// The environment step an unrecorded external write implies, placed just
-/// before the record that exposes it: a `TW1_Error{invalid_bounds}` naming an
-/// activity the model still holds with valid bounds was preceded by a write the
-/// recorder does not see (the G10 gap test edits the row with raw SQL).
-fn external_step(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
-    let params = &record["params"];
-    if record["action"] != "TW1_Error" || params["reason"] != "invalid_bounds" {
-        return Ok(None);
-    }
-    let seq = record["seq"].as_i64().ok_or("malformed:seq")?;
-    let id = int(params, "activity_id", seq)?;
-    if !ctx.invalid_bounds.insert(id) {
-        return Ok(None);
-    }
-    ctx.env_edits = true;
-    let a = ctx.act.id(id);
-    let mut expect = vec![format!(
-        "lastAction == {}",
-        quote("EnvCorruptActivityBounds")
-    )];
-    expect.extend(ctx.invariants.iter().cloned());
-    expect.push(format!("viewAct(db, {a}).invalidBounds"));
-    Ok(Some(Step {
-        seq,
-        class: "external",
-        label: format!("external EnvCorruptActivityBounds (unrecorded write to activity {id})"),
-        call: format!("EnvCorruptActivityBounds({a})"),
-        expect,
-    }))
-}
-
 /// A recorded external write (an `External` record: one row a trigger
 /// captured outside any traced transaction) as its environment action.
 fn env_step(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Step, Excluded> {
@@ -573,7 +536,7 @@ fn env_step(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Step, Excluded> {
         let view = if row.is_null() {
             "emptyAct".to_string()
         } else {
-            act_row(ctx, real, &row, seq)?
+            act_row(ctx, &row, seq)?
         };
         (
             format!("EnvSetAct({a}, {view})"),
@@ -972,6 +935,12 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
             let a = ctx.act.id(int(params, "activity_id", seq)?);
             let tok = token(ctx, &params["token"]);
             let outcome = text(params, "outcome", seq)?;
+            // A revoked attempt (the row was `cancelling`, N2) settles whatever the
+            // handler returned: its own model action.
+            if outcome == "revoked" {
+                let call = format!("TW3_Revoked({r}, {a}, {tok}, {tnow})");
+                return finish_step(ctx, record, seq, label, call, "TW3_Revoked").map(Some);
+            }
             // availableAt only matters for a retry.
             let (available_at, last) = match outcome {
                 "succeeded" => (tnow, "TW3_Succeeded"),
@@ -994,19 +963,6 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
             let a = ctx.act.id(int(params, "activity_id", seq)?);
             let tok = token(ctx, &params["token"]);
             (format!("{action}({r}, {a}, {tok})"), action)
-        }
-        "TW1_Error" => {
-            let r = runtime(ctx, actor, seq)?;
-            let a = ctx.act.id(int(params, "activity_id", seq)?);
-            match text(params, "reason", seq)? {
-                reason @ ("attempt_cap" | "invalid_bounds") => (
-                    format!("TW1_Error({r}, {a}, {})", quote(reason)),
-                    "TW1_Error",
-                ),
-                // Every runtime has every definition in the model (F3).
-                "missing_definition" => return Err("unmodeled:missing_definition".into()),
-                other => return Err(format!("unsupported:tw1_error_{other}")),
-            }
         }
         "TW2_Send" => {
             let r = runtime(ctx, actor, seq)?;
@@ -1050,16 +1006,29 @@ fn translate(ctx: &mut Ctx, record: &Value) -> Result<Option<Step>, Excluded> {
         other => return Err(format!("unsupported_action:{other}")),
     };
 
+    finish_step(ctx, record, seq, label, call, last).map(Some)
+}
+
+/// The step for `call`: it must end in model action `last`, hold the
+/// invariants, and leave the recorded post-images.
+fn finish_step(
+    ctx: &mut Ctx,
+    record: &Value,
+    seq: i64,
+    label: String,
+    call: String,
+    last: &str,
+) -> Result<Step, Excluded> {
     let mut expect = vec![format!("lastAction == {}", quote(last))];
     expect.extend(ctx.invariants.iter().cloned());
     expect.extend(post_expectations(ctx, record, seq)?);
-    Ok(Some(Step {
+    Ok(Step {
         seq,
         class: classify(record),
         label,
         call,
         expect,
-    }))
+    })
 }
 
 /// The model id of a heartbeat already sent; `None` if its `TW2_Send` is not
@@ -1069,7 +1038,7 @@ fn sent_hb(ctx: &Ctx, params: &Value, seq: i64) -> Result<Option<i64>, Excluded>
     Ok(ctx.hb.ids.get(&hb).copied())
 }
 
-/// `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, claimed)`.
+/// `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, quarantined, claimed)`.
 /// The maps cover every topic; a topic the transaction did not visit gets a
 /// value that cannot constrain (no claims there).
 fn tw1_claim(
@@ -1104,9 +1073,19 @@ fn tw1_claim(
                 .as_bool()
                 .ok_or_else(|| format!("malformed:reconciled:{seq}"))?;
             let available_at = int(row, "available_at", seq)?;
+            // A `cancelling` row whose lease expired settles (N2); absent = a running row.
+            let revoked = row["revoked"].as_bool().unwrap_or(false);
             reconciled.push(format!(
-                "{{ a: {a}, exhausted: {exhausted}, availableAt: {available_at} }}"
+                "{{ a: {a}, exhausted: {exhausted}, availableAt: {available_at}, revoked: {revoked} }}"
             ));
+        }
+    }
+    let mut quarantined = Vec::new();
+    if let Some(rows) = params["quarantined"].as_array() {
+        for row in rows {
+            let a = ctx.act.id(int(row, "activity_id", seq)?);
+            let reason = text(row, "reason", seq)?;
+            quarantined.push(format!("{{ a: {a}, reason: {} }}", quote(reason)));
         }
     }
     let mut local = Vec::new();
@@ -1120,10 +1099,11 @@ fn tw1_claim(
         in_flight.push(format!("{} -> {seen}", quote(topic)));
     }
     Ok(format!(
-        "TW1_Claim({r}, {tnow}, Map({}), [{}], Map({}), [{}])",
+        "TW1_Claim({r}, {tnow}, Map({}), [{}], Map({}), [{}], [{}])",
         local.join(", "),
         reconciled.join(", "),
         in_flight.join(", "),
+        quarantined.join(", "),
         claimed.join(", ")
     ))
 }
@@ -1151,7 +1131,7 @@ fn post_expectations(ctx: &mut Ctx, record: &Value, seq: i64) -> Result<Vec<Stri
             clauses.push(if row.is_null() {
                 format!("viewAct(db, {a}).status == \"none\"")
             } else {
-                format!("viewAct(db, {a}) == {}", act_row(ctx, real, row, seq)?)
+                format!("viewAct(db, {a}) == {}", act_row(ctx, row, seq)?)
             });
         }
     }
@@ -1248,17 +1228,12 @@ fn wf_row(ctx: &mut Ctx, row: &Value, seq: i64) -> Result<String, Excluded> {
 }
 
 /// `ActRow` literal: the §5 abstraction of a recorded activity row.
-fn act_row(ctx: &mut Ctx, id: i64, row: &Value, seq: i64) -> Result<String, Excluded> {
+fn act_row(ctx: &mut Ctx, row: &Value, seq: i64) -> Result<String, Excluded> {
     let wf = ctx.wf.id(int(row, "workflow_id", seq)?);
     let max_attempts = int(row, "max_attempts", seq)?;
     ctx.max_attempts = ctx.max_attempts.max(max_attempts);
     let tok = token(ctx, &row["lease_token"]);
     let invalid = invalid_bounds(row);
-    if invalid {
-        ctx.invalid_bounds.insert(id);
-    } else {
-        ctx.invalid_bounds.remove(&id);
-    }
     Ok(format!(
         "{{ status: {}, wf: {wf}, topic: {}, attemptCount: {}, maxAttempts: {max_attempts}, \
          availableAt: {}, token: {tok}, leaseExp: {}, invalidBounds: {invalid} }}",
@@ -1270,17 +1245,22 @@ fn act_row(ctx: &mut Ctx, id: i64, row: &Value, seq: i64) -> Result<String, Excl
     ))
 }
 
-/// `invalidBounds` of a recorded activity row: the check in
+/// `invalidBounds` of a recorded activity row: the checks in
 /// `claim_locked_candidate` (`timeout_millis <= 0 || lease_duration_millis <=
-/// timeout_millis`); false when the image has no bounds.
+/// timeout_millis`, or a `retry_policy_json` that does not decode as a
+/// `RetryPolicy`); false when the image has no bounds.
 fn invalid_bounds(row: &Value) -> bool {
-    match (
+    let timeout_lease = match (
         opt_int(row, "timeout_millis"),
         opt_int(row, "lease_duration_millis"),
     ) {
         (Some(timeout), Some(lease)) => timeout <= 0 || lease <= timeout,
         _ => false,
-    }
+    };
+    let retry_policy = row["retry_policy_json"]
+        .as_str()
+        .is_some_and(|json| serde_json::from_str::<durable_workflows::RetryPolicy>(json).is_err());
+    timeout_lease || retry_policy
 }
 
 /// `KeyMap`: NULL -> 0, `child:{P}:{C}` -> `autoKey(WfMap[P], C)`, else 1..j.
@@ -1401,4 +1381,108 @@ fn parse_id(id: &str, seq: i64) -> Result<i64, Excluded> {
 
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> Ctx {
+        Ctx {
+            wf: Interner::new(),
+            act: Interner::new(),
+            tok: Interner::new(),
+            rt: Interner::new(),
+            key: Interner::new(),
+            topics: BTreeSet::from(["t".to_string()]),
+            versions: HashMap::new(),
+            max_attempts: 1,
+            seen_activation: 1,
+            max_activation: None,
+            local_slots: 1,
+            max_now: 0,
+            hb: Interner::new(),
+            committed_hbs: BTreeSet::new(),
+            env_edits: false,
+            invariants: Vec::new(),
+        }
+    }
+
+    fn step(ctx: &mut Ctx, record: &Value) -> Step {
+        translate(ctx, record)
+            .expect("translates")
+            .expect("is a step")
+    }
+
+    #[test]
+    fn revoked_finish_is_tw3_revoked() {
+        let mut ctx = ctx();
+        let record = json!({
+            "seq": 7, "action": "TW3_Finish", "actor": "w1", "now": 42,
+            "params": {
+                "activity_id": 11, "attempt": 1, "max_attempts": 3, "token": "tok-a",
+                "outcome": "revoked", "available_at": 42, "workflow_id": 5
+            },
+            "post": {}
+        });
+        let step = step(&mut ctx, &record);
+        assert_eq!(step.call, "TW3_Revoked(1, 1, 1, 42)");
+        assert_eq!(step.expect[0], "lastAction == \"TW3_Revoked\"");
+    }
+
+    #[test]
+    fn revoked_handler_return_keeps_its_outcome() {
+        let mut ctx = ctx();
+        let record = json!({
+            "seq": 6, "action": "HandlerReturn", "actor": "w1",
+            "params": { "activity_id": 11, "attempt": 1, "token": "tok-a", "outcome": "revoked" }
+        });
+        assert_eq!(
+            step(&mut ctx, &record).call,
+            "HandlerReturn(1, 1, 1, \"revoked\")"
+        );
+    }
+
+    #[test]
+    fn reconciled_rows_carry_the_revoked_flag() {
+        let mut ctx = ctx();
+        let record = json!({
+            "seq": 9, "action": "TW1_Claim", "actor": "w2:dispatcher", "now": 50,
+            "params": {
+                "reconciled": [
+                    { "activity_id": 11, "exhausted": false, "workflow_blocked": false,
+                      "available_at": 50, "revoked": true },
+                    { "activity_id": 12, "exhausted": false, "workflow_blocked": false,
+                      "available_at": 51 }
+                ],
+                "claimed": [], "quarantined": [],
+                "local_avail": { "t": 1 }, "in_flight_seen": { "t": 0 }
+            },
+            "post": {}
+        });
+        let call = step(&mut ctx, &record).call;
+        assert!(
+            call.contains("{ a: 1, exhausted: false, availableAt: 50, revoked: true }"),
+            "{call}"
+        );
+        assert!(
+            call.contains("{ a: 2, exhausted: false, availableAt: 51, revoked: false }"),
+            "{call}"
+        );
+    }
+
+    #[test]
+    fn cancelling_row_maps_to_the_model_status() {
+        let mut ctx = ctx();
+        let row = json!({
+            "status": "cancelling", "workflow_id": 5, "topic": "t", "attempt_count": 1,
+            "max_attempts": 2, "available_at": 40, "lease_token": "tok-a",
+            "lease_expires_at": 70, "timeout_millis": 10, "lease_duration_millis": 20
+        });
+        assert_eq!(
+            act_row(&mut ctx, &row, 1).expect("maps"),
+            "{ status: \"cancelling\", wf: 1, topic: \"t\", attemptCount: 1, maxAttempts: 2, \
+             availableAt: 40, token: 1, leaseExp: 70, invalidBounds: false }"
+        );
+    }
 }

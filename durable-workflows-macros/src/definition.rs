@@ -5,6 +5,9 @@ use syn::{
     Path, Result, Token,
 };
 
+// Mirrors `durable_workflows::MAX_RETRY_DELAY_SECS`; this crate cannot depend on it.
+const MAX_RETRY_DELAY_SECS: u64 = (i64::MAX / 2_000) as u64;
+
 enum BackoffMetadata {
     Fixed {
         delay_secs: u64,
@@ -68,6 +71,14 @@ impl Parse for BackoffMetadata {
                         "fixed backoff delay_secs must be greater than zero",
                     ));
                 }
+                if delay_secs > MAX_RETRY_DELAY_SECS {
+                    return Err(Error::new_spanned(
+                        kind,
+                        format!(
+                            "fixed backoff delay_secs cannot exceed {MAX_RETRY_DELAY_SECS} seconds"
+                        ),
+                    ));
+                }
                 Ok(Self::Fixed { delay_secs })
             }
             "exponential" => {
@@ -96,6 +107,14 @@ impl Parse for BackoffMetadata {
                     return Err(Error::new_spanned(
                         &kind,
                         "exponential backoff max_secs must be at least initial_secs",
+                    ));
+                }
+                if max_secs > MAX_RETRY_DELAY_SECS {
+                    return Err(Error::new_spanned(
+                        &kind,
+                        format!(
+                            "exponential backoff max_secs cannot exceed {MAX_RETRY_DELAY_SECS} seconds"
+                        ),
                     ));
                 }
                 if jitter_percent > 100 {
@@ -525,23 +544,29 @@ pub fn derive_activity(input: DeriveInput) -> TokenStream {
             let timeout_secs = metadata.timeout_secs;
             let lease_secs = metadata.lease_secs;
             let retry_policy = match metadata.backoff {
+                // `const { .. }`: the library checks the same bounds again at
+                // compile time (E0080), so the macro's copy cannot drift.
                 BackoffMetadata::Fixed { delay_secs } => quote! {
-                    ::durable_workflows::RetryPolicy::from_validated(
-                        ::durable_workflows::BackoffPolicy::Fixed { delay_secs: #delay_secs }
-                    )
+                    const {
+                        ::durable_workflows::RetryPolicy::from_checked(
+                            ::durable_workflows::BackoffPolicy::Fixed { delay_secs: #delay_secs }
+                        )
+                    }
                 },
                 BackoffMetadata::Exponential {
                     initial_secs,
                     max_secs,
                     jitter_percent,
                 } => quote! {
-                    ::durable_workflows::RetryPolicy::from_validated(
-                        ::durable_workflows::BackoffPolicy::Exponential {
-                            initial_secs: #initial_secs,
-                            max_secs: #max_secs,
-                            jitter_percent: #jitter_percent,
-                        }
-                    )
+                    const {
+                        ::durable_workflows::RetryPolicy::from_checked(
+                            ::durable_workflows::BackoffPolicy::Exponential {
+                                initial_secs: #initial_secs,
+                                max_secs: #max_secs,
+                                jitter_percent: #jitter_percent,
+                            }
+                        )
+                    }
                 },
             };
             quote! {

@@ -1,1 +1,2 @@
-apalache durable_mc   invariant safetyRc     max-steps=3  No violation found   2130s
+apalache durable_mc_d3  invariant safetyRc             max-steps=3  No violation found   257s
+apalache durable_mc_d3  invariant inv_cancelFormsAgree max-steps=3  No violation found   289s

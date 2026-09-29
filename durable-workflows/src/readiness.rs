@@ -4,7 +4,7 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 
 use crate::{
-    persistence::{ActivityStatus, WorkflowStatus},
+    persistence::{ActivityStatus, WaitKind, WorkflowStatus},
     schema::{durable_activity, durable_workflow},
     ActivityRegistry, DefinitionKey, DurableConnection, DurableError, TopicRegistry,
     WorkflowRegistry,
@@ -56,19 +56,13 @@ impl ReadinessReport {
         C: Send + Sync + 'static,
     {
         let required_workflows = durable_workflow::table
-            .filter(durable_workflow::status.ne_all([
-                WorkflowStatus::Succeeded,
-                WorkflowStatus::Failed,
-                WorkflowStatus::Cancelled,
-            ]))
+            .filter(durable_workflow::status.ne_all(WorkflowStatus::TERMINAL))
             .select((durable_workflow::kind, durable_workflow::version))
             .distinct()
             .load::<(String, i32)>(connection)
             .await?;
         let mut required_activities = durable_activity::table
-            .filter(
-                durable_activity::status.eq_any([ActivityStatus::Pending, ActivityStatus::Running]),
-            )
+            .filter(durable_activity::status.eq_any(ActivityStatus::NON_TERMINAL))
             .select((durable_activity::kind, durable_activity::version))
             .distinct()
             .load::<(String, i32)>(connection)
@@ -77,22 +71,21 @@ impl ReadinessReport {
             .inner_join(
                 durable_workflow::table.on(durable_workflow::id
                     .eq(durable_activity::workflow_id)
-                    .and(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))),
+                    .and(
+                        durable_workflow::wait_reference_id
+                            .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+                    )),
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-            .filter(
-                durable_workflow::status.eq_any([WorkflowStatus::Blocked, WorkflowStatus::Paused]),
-            )
-            .filter(durable_workflow::wait_kind.eq("activity"))
+            .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
+            .filter(durable_workflow::wait_kind.eq(WaitKind::Activity))
             .select((durable_activity::kind, durable_activity::version))
             .distinct()
             .load::<(String, i32)>(connection)
             .await?;
         required_activities.extend(recoverable_dead_letters);
         let mut stored_topics = durable_activity::table
-            .filter(
-                durable_activity::status.eq_any([ActivityStatus::Pending, ActivityStatus::Running]),
-            )
+            .filter(durable_activity::status.eq_any(ActivityStatus::NON_TERMINAL))
             .select(durable_activity::topic)
             .distinct()
             .load::<String>(connection)
@@ -101,13 +94,14 @@ impl ReadinessReport {
             .inner_join(
                 durable_workflow::table.on(durable_workflow::id
                     .eq(durable_activity::workflow_id)
-                    .and(durable_workflow::wait_reference_id.eq(durable_activity::id.nullable()))),
+                    .and(
+                        durable_workflow::wait_reference_id
+                            .eq(crate::ids::untyped_id(durable_activity::id).nullable()),
+                    )),
             )
             .filter(durable_activity::status.eq(ActivityStatus::DeadLettered))
-            .filter(
-                durable_workflow::status.eq_any([WorkflowStatus::Blocked, WorkflowStatus::Paused]),
-            )
-            .filter(durable_workflow::wait_kind.eq("activity"))
+            .filter(durable_workflow::status.eq_any(WorkflowStatus::DEAD_LETTER_WAITERS))
+            .filter(durable_workflow::wait_kind.eq(WaitKind::Activity))
             .select(durable_activity::topic)
             .distinct()
             .load::<String>(connection)

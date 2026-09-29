@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{
@@ -120,8 +121,7 @@ impl ActivityHandler for RuntimeActivity {
                     .ok_or_else(|| ActivityError::permanent("test", "missing pool"))?;
                 let activity_id = context
                     .activity_id()
-                    .ok_or_else(|| ActivityError::permanent("test", "missing activity id"))?
-                    .get();
+                    .ok_or_else(|| ActivityError::permanent("test", "missing activity id"))?;
                 let application = context.application();
                 let mut connection = pool
                     .get()
@@ -131,8 +131,10 @@ impl ActivityHandler for RuntimeActivity {
                     .transaction(async move |connection| {
                         diesel::update(durable_activity::table.find(activity_id))
                             .set(
-                                durable_activity::updated_at
-                                    .eq(durable_workflows::persistence::now_millis()),
+                                durable_activity::updated_at.eq(
+                                    durable_workflows::persistence::database_now_millis(connection)
+                                        .await?,
+                                ),
                             )
                             .execute(connection)
                             .await?;
@@ -259,17 +261,16 @@ fn registries() -> (
 }
 
 fn runtime_config() -> RuntimeConfig {
-    RuntimeConfig {
-        idle_delay: Duration::from_millis(5),
-        restart_backoff: Duration::from_millis(10),
-        max_task_restarts: 2,
-        max_workers_per_topic: 1,
-        worker: durable_workflows::WorkerConfig {
-            heartbeat_interval: Duration::from_millis(10),
-            shutdown_grace: Duration::from_millis(100),
-        },
-        ..RuntimeConfig::default()
-    }
+    RuntimeConfig::default()
+        .with_idle_delay(Duration::from_millis(5))
+        .with_restart_backoff(Duration::from_millis(10))
+        .with_max_task_restarts(2)
+        .with_max_workers_per_topic(1)
+        .with_worker(
+            durable_workflows::WorkerConfig::default()
+                .with_heartbeat_interval(Duration::from_millis(10))
+                .with_shutdown_grace(Duration::from_millis(100)),
+        )
 }
 
 fn runtime(
@@ -288,7 +289,7 @@ async fn schedule_activity(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     schedule_activity_payload(
         pool,
         RuntimeActivity::KIND,
@@ -305,7 +306,7 @@ async fn schedule_activity(
 async fn schedule_continuation_activity(
     pool: &durable_workflows::DurablePool,
     behavior: ContinuationBehavior,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let activity = RuntimeContinuationActivity { behavior };
     schedule_activity_payload(
         pool,
@@ -330,15 +331,18 @@ async fn schedule_activity_payload(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let workflow_id = DurableStore::new(pool.clone())
         .start(&RuntimeWorkflow, StartOptions::default())
         .await
         .expect("workflow start")
-        .workflow_id
-        .get();
-    let now = durable_workflows::persistence::now_millis();
+        .workflow_id;
     let mut connection = pool.get().await.expect("test connection");
+    // Claims compare `available_at` with the database clock; a host stamp ahead of it
+    // would hide the row from the first dispatcher sweep.
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
             workflow_id,
@@ -376,14 +380,14 @@ async fn schedule_activity_payload(
     let activity_id = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity id");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -393,9 +397,27 @@ async fn schedule_activity_payload(
     (workflow_id, activity_id)
 }
 
+/// Sets the activity's `available_at` to the database clock plus `delay`.
+async fn set_activity_available_in(
+    pool: &durable_workflows::DurablePool,
+    activity_id: durable_workflows::ActivityId,
+    delay: Duration,
+) {
+    let mut connection = pool.get().await.expect("test connection");
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
+    let delay = i64::try_from(delay.as_millis()).expect("delay fits in millis");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set(durable_activity::available_at.eq(DbMillis::from_database_millis(now.get() + delay)))
+        .execute(&mut connection)
+        .await
+        .expect("activity availability update");
+}
+
 async fn wait_for_activity_status(
     pool: &durable_workflows::DurablePool,
-    activity_id: i64,
+    activity_id: durable_workflows::ActivityId,
     expected: &str,
 ) -> ActivityRow {
     for _ in 0..400 {
@@ -453,10 +475,7 @@ async fn empty_runtime_starts_ready_and_shuts_down_without_detached_tasks() {
             .with_topic_worker_limit(RuntimeTopic::Test.key(), 0)
             .is_err()
     );
-    let invalid_config = RuntimeConfig {
-        timer_poll_interval: Duration::from_secs(61),
-        ..RuntimeConfig::default()
-    };
+    let invalid_config = RuntimeConfig::default().with_timer_poll_interval(Duration::from_secs(61));
     assert!(matches!(
         DurableRuntime::new(
             pool.clone(),
@@ -555,7 +574,7 @@ async fn readiness_fails_before_any_claim_when_a_live_version_is_unregistered() 
 
     let mut connection = pool.get().await.expect("test connection");
     let lease = durable_workflow::table
-        .find(outcome.workflow_id.get())
+        .find(outcome.workflow_id)
         .select((durable_workflow::status, durable_workflow::lease_token))
         .first::<(String, Option<String>)>(&mut connection)
         .await
@@ -633,9 +652,20 @@ async fn bounded_shutdown_leaves_a_lease_for_a_second_runtime_to_recover() {
     );
     let running = wait_for_activity_status(&pool, activity_id, "running").await;
     assert_eq!(running.attempt_count, 1);
+    // The stopped runtime abandoned its claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "first:dispatcher",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire abandoned lease");
@@ -650,7 +680,11 @@ async fn bounded_shutdown_leaves_a_lease_for_a_second_runtime_to_recover() {
     assert_eq!(pending.attempt_count, 1);
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(
+            durable_activity::available_at.eq(DbMillis::from_database_millis(
+                support::db_now_on(&mut connection).await,
+            )),
+        )
         .execute(&mut connection)
         .await
         .expect("make recovered work due");
@@ -704,6 +738,13 @@ async fn activity_dispatcher_restarts_without_waiting_for_blocked_sibling() {
     let context = Arc::new(RuntimeTestContext::default());
     context.mode.store(5, Ordering::SeqCst);
     let (_, blocked_id) = schedule_activity(&pool, 1, 10_000, 11_000).await;
+    // Every fixture is written before the runtime starts: a live coordinator
+    // could claim a workflow between its start and its wait update. The panic
+    // and probe activities are held back until their turn.
+    let (_, panic_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Panic).await;
+    let (_, probe_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Probe).await;
+    set_activity_available_in(&pool, panic_id, Duration::from_secs(3_600)).await;
+    set_activity_available_in(&pool, probe_id, Duration::from_secs(3_600)).await;
     let mut config = runtime_config();
     config.max_workers_per_topic = 2;
     let handle = runtime(pool.clone(), context.clone(), "continuation", config)
@@ -712,9 +753,9 @@ async fn activity_dispatcher_restarts_without_waiting_for_blocked_sibling() {
         .expect("runtime ready");
     context.blocked_started.notified().await;
 
-    let (_, panic_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Panic).await;
+    set_activity_available_in(&pool, panic_id, Duration::ZERO).await;
     context.panic_started.notified().await;
-    let (_, probe_id) = schedule_continuation_activity(&pool, ContinuationBehavior::Probe).await;
+    set_activity_available_in(&pool, probe_id, Duration::ZERO).await;
 
     // A restart may sweep before the probe is inserted, then use the normal
     // one-second dispatcher backoff; leave time for the following database claim.
@@ -771,7 +812,7 @@ async fn readiness_failure_happens_before_any_workflow_claim() {
     ));
     let mut connection = pool.get().await.expect("test connection");
     let status = durable_workflow::table
-        .find(started.workflow_id.get())
+        .find(started.workflow_id)
         .select(durable_workflow::status)
         .first::<String>(&mut connection)
         .await
@@ -799,7 +840,7 @@ async fn cancellation_prevents_new_claims() {
 
     let mut connection = pool.get().await.expect("test connection");
     let status = durable_workflow::table
-        .find(started.workflow_id.get())
+        .find(started.workflow_id)
         .select(durable_workflow::status)
         .first::<String>(&mut connection)
         .await
@@ -884,9 +925,20 @@ async fn bounded_shutdown_stops_heartbeats_and_a_second_runtime_recovers() {
     let still_stopped = wait_for_activity_status(&pool, activity_id, "running").await;
     assert_eq!(still_stopped.lease_expires_at, stopped_expiry);
 
+    // The stopped runtime abandoned its claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "uncooperative:dispatcher",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire abandoned lease");
@@ -901,7 +953,11 @@ async fn bounded_shutdown_stops_heartbeats_and_a_second_runtime_recovers() {
     assert_eq!(pending.attempt_count, 1);
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(
+            durable_activity::available_at.eq(DbMillis::from_database_millis(
+                support::db_now_on(&mut connection).await,
+            )),
+        )
         .execute(&mut connection)
         .await
         .expect("make retry due");
@@ -954,7 +1010,16 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let (workflow_id, activity_id) = schedule_activity(&pool, 2, 40, 100).await;
+    // Each of the two claims must reach its handler (and panic) inside its
+    // lease: `execute_claim` refuses a claim whose local lease deadline has
+    // passed, and lease recovery then consumes the attempt without a panic,
+    // so the restart budget is never exhausted. Under a parallel suite the
+    // first claim reaches its handler 10-100 ms (debug build, more with
+    // `trace-model`) after the lease is stamped, so a 100 ms lease was spent
+    // before the handler ran in about 1 of 12 suite runs. A 500 ms lease leaves
+    // that margin 5x and still expires before the restarted dispatcher's
+    // first backoff sweep (~1 s), so the timeline below is unchanged.
+    let (workflow_id, activity_id) = schedule_activity(&pool, 2, 40, 500).await;
     let panic_context = Arc::new(RuntimeTestContext::default());
     panic_context.mode.store(3, Ordering::SeqCst);
     let mut config = runtime_config();
@@ -965,7 +1030,12 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
         .expect("runtime starts");
     let cancellation = handle.cancellation_token();
     let completion = handle.completion_token();
-    tokio::time::timeout(Duration::from_secs(5), cancellation.cancelled())
+    // The second panic needs the restarted dispatcher to reconcile the expired lease and
+    // then claim the retry (fixed 1 s), and an empty dispatcher sweep backs off 1/2/5/10 s
+    // (INVARIANTS §2.3). The claim lands on the third sweep (~3 s); one missed sweep (a
+    // transient claim error, a row not yet due) moves it to the fourth (~8 s), past the
+    // old 5 s budget. Wait out the whole ladder.
+    tokio::time::timeout(Duration::from_secs(20), cancellation.cancelled())
         .await
         .expect("restart budget is exhausted");
     tokio::time::timeout(Duration::from_secs(5), completion.cancelled())
@@ -977,9 +1047,20 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
         .expect_err("panics are surfaced");
     assert!(shutdown.errors.iter().any(|error| error.panicked));
 
+    // The panicked runtime abandoned its claim (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "panic-runtime:dispatcher",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire panicked lease");

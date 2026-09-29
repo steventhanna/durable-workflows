@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use async_trait::async_trait;
@@ -48,7 +49,9 @@ impl WorkflowHandler for AdminWorkflow {
     }
 }
 
-async fn seed_workflows(pool: &durable_workflows::DurablePool) -> Vec<i64> {
+async fn seed_workflows(
+    pool: &durable_workflows::DurablePool,
+) -> Vec<durable_workflows::WorkflowId> {
     let store = DurableStore::new(pool.clone());
     let mut ids = Vec::new();
     for index in 1..=3 {
@@ -61,14 +64,14 @@ async fn seed_workflows(pool: &durable_workflows::DurablePool) -> Vec<i64> {
             )
             .await
             .expect("workflow starts");
-        ids.push(outcome.workflow_id.get());
+        ids.push(outcome.workflow_id);
     }
     let mut connection = pool.get().await.expect("test connection");
     for id in &ids {
         diesel::update(durable_workflow::table.find(id))
             .set((
-                durable_workflow::created_at.eq(10_000_i64),
-                durable_workflow::updated_at.eq(10_000_i64),
+                durable_workflow::created_at.eq(DbMillis::from_database_millis(10_000_i64)),
+                durable_workflow::updated_at.eq(DbMillis::from_database_millis(10_000_i64)),
             ))
             .execute(&mut connection)
             .await
@@ -85,7 +88,10 @@ async fn seed_workflows(pool: &durable_workflows::DurablePool) -> Vec<i64> {
     ids
 }
 
-async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) -> i64 {
+async fn seed_activity(
+    pool: &durable_workflows::DurablePool,
+    workflow_id: durable_workflows::WorkflowId,
+) -> durable_workflows::ActivityId {
     let mut connection = pool.get().await.expect("test connection");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
@@ -98,7 +104,7 @@ async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) 
             payload_json: r#"{"secret":"activity-customer-secret"}"#.to_string(),
             status: durable_workflows::persistence::ActivityStatus::try_from("dead_lettered")
                 .expect("valid fixture status"),
-            available_at: 11_000,
+            available_at: DbMillis::from_database_millis(11_000),
             max_attempts: 2,
             attempt_count: 1,
             timeout_millis: 1_000,
@@ -114,9 +120,9 @@ async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) 
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: 11_000,
-            updated_at: 12_000,
-            completed_at: Some(12_000),
+            created_at: DbMillis::from_database_millis(11_000),
+            updated_at: DbMillis::from_database_millis(12_000),
+            completed_at: Some(DbMillis::from_database_millis(12_000)),
         })
         .execute(&mut connection)
         .await
@@ -124,7 +130,7 @@ async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) 
     let activity_id = durable_activity::table
         .select(durable_activity::id)
         .order(durable_activity::id.desc())
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity ID");
     diesel::insert_into(durable_activity_attempt::table)
@@ -133,10 +139,10 @@ async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) 
             attempt_number: 1,
             worker_id: "worker-1".to_string(),
             lease_token: "00000000-0000-0000-0000-000000000001".to_string(),
-            started_at: 11_100,
-            heartbeat_at: 11_500,
-            finished_at: Some(12_000),
-            outcome: Some("dead_lettered".to_string()),
+            started_at: DbMillis::from_database_millis(11_100),
+            heartbeat_at: DbMillis::from_database_millis(11_500),
+            finished_at: Some(DbMillis::from_database_millis(12_000)),
+            outcome: Some(durable_workflows::persistence::AttemptOutcome::DeadLettered),
             error_category: Some("provider".to_string()),
             error_message: Some("bounded failure".to_string()),
             provider_result_json: Some(r#"{"secret":"attempt-customer-secret"}"#.to_string()),
@@ -156,7 +162,7 @@ async fn seed_activity(pool: &durable_workflows::DurablePool, workflow_id: i64) 
             total_units: Some(2),
             severity: "info".to_string(),
             metadata_json: Some(r#"{"secret":"progress-metadata"}"#.to_string()),
-            created_at: 11_400,
+            created_at: DbMillis::from_database_millis(11_400),
         })
         .execute(&mut connection)
         .await
@@ -185,7 +191,7 @@ async fn workflow_pages_are_stable_filterable_and_redacted() {
         first
             .items
             .iter()
-            .map(|workflow| workflow.id.get())
+            .map(|workflow| workflow.id)
             .collect::<Vec<_>>(),
         vec![ids[2], ids[1]]
     );
@@ -200,7 +206,7 @@ async fn workflow_pages_are_stable_filterable_and_redacted() {
         .await
         .expect("second page");
     assert_eq!(second.items.len(), 1);
-    assert_eq!(second.items[0].id.get(), ids[0]);
+    assert_eq!(second.items[0].id, ids[0]);
 
     let waiting = service
         .list_workflows(WorkflowListFilter {
@@ -210,7 +216,7 @@ async fn workflow_pages_are_stable_filterable_and_redacted() {
         .await
         .expect("approval filter");
     assert_eq!(waiting.items.len(), 1);
-    assert_eq!(waiting.items[0].id.get(), ids[1]);
+    assert_eq!(waiting.items[0].id, ids[1]);
 
     let detail = service
         .get_workflow(waiting.items[0].id)
@@ -248,10 +254,10 @@ async fn activity_detail_exposes_attempts_progress_and_payload_values() {
             attempt_number: 2,
             worker_id: "worker-2".to_string(),
             lease_token: "00000000-0000-0000-0000-000000000002".to_string(),
-            started_at: 12_100,
-            heartbeat_at: 12_500,
-            finished_at: Some(13_000),
-            outcome: Some("dead_lettered".to_string()),
+            started_at: DbMillis::from_database_millis(12_100),
+            heartbeat_at: DbMillis::from_database_millis(12_500),
+            finished_at: Some(DbMillis::from_database_millis(13_000)),
+            outcome: Some(durable_workflows::persistence::AttemptOutcome::DeadLettered),
             error_category: Some("provider".to_string()),
             error_message: Some("bounded failure".to_string()),
             provider_result_json: None,
@@ -271,7 +277,7 @@ async fn activity_detail_exposes_attempts_progress_and_payload_values() {
             total_units: Some(2),
             severity: "info".to_string(),
             metadata_json: None,
-            created_at: 12_400,
+            created_at: DbMillis::from_database_millis(12_400),
         })
         .execute(&mut connection)
         .await
@@ -280,14 +286,14 @@ async fn activity_detail_exposes_attempts_progress_and_payload_values() {
     let service = AdminQueryService::new(pool.clone());
     let page = service
         .list_activities(ActivityListFilter {
-            workflow_id: Some(durable_workflows::WorkflowId::new(workflow_id).expect("workflow")),
+            workflow_id: Some(workflow_id),
             status: Some("dead_lettered".to_string()),
             ..ActivityListFilter::default()
         })
         .await
         .expect("activities");
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].id.get(), activity_id);
+    assert_eq!(page.items[0].id, activity_id);
     assert_eq!(
         page.items[0].operation_key.as_deref(),
         Some("provider-operation-7")
@@ -396,13 +402,13 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
             prompt_metadata_json: r#"{"secret":"approval-prompt-secret"}"#.to_string(),
             validation_schema_json: r#"{"type":"boolean"}"#.to_string(),
             validation_version: 1,
-            status: "approved".to_string(),
-            requested_at: 20_000,
+            status: durable_workflows::persistence::ApprovalStatus::Resolved,
+            requested_at: DbMillis::from_database_millis(20_000),
             expires_at: None,
             decision_payload_json: Some(r#"{"secret":"approval-decision-secret"}"#.to_string()),
             decided_by: Some(7),
             operator_reason: Some("Reviewed by operations".to_string()),
-            resolved_at: Some(20_100),
+            resolved_at: Some(DbMillis::from_database_millis(20_100)),
         })
         .execute(&mut connection)
         .await
@@ -410,12 +416,12 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
     diesel::update(
         durable_workflow_event::table.filter(durable_workflow_event::workflow_id.eq(workflow_id)),
     )
-    .set(durable_workflow_event::created_at.eq(20_000_i64))
+    .set(durable_workflow_event::created_at.eq(DbMillis::from_database_millis(20_000_i64)))
     .execute(&mut connection)
     .await
     .expect("event timestamp");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::created_at.eq(20_000_i64))
+        .set(durable_activity::created_at.eq(DbMillis::from_database_millis(20_000_i64)))
         .execute(&mut connection)
         .await
         .expect("activity timestamp");
@@ -423,14 +429,14 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
         durable_activity_attempt::table
             .filter(durable_activity_attempt::activity_id.eq(activity_id)),
     )
-    .set(durable_activity_attempt::started_at.eq(20_000_i64))
+    .set(durable_activity_attempt::started_at.eq(DbMillis::from_database_millis(20_000_i64)))
     .execute(&mut connection)
     .await
     .expect("attempt timestamp");
     diesel::update(
         durable_progress_event::table.filter(durable_progress_event::activity_id.eq(activity_id)),
     )
-    .set(durable_progress_event::created_at.eq(20_000_i64))
+    .set(durable_progress_event::created_at.eq(DbMillis::from_database_millis(20_000_i64)))
     .execute(&mut connection)
     .await
     .expect("progress timestamp");
@@ -442,7 +448,7 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
     loop {
         let page = service
             .workflow_timeline(
-                durable_workflows::WorkflowId::new(workflow_id).expect("workflow"),
+                workflow_id,
                 PageRequest {
                     cursor,
                     limit: Some(2),
@@ -464,6 +470,7 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
             TimelineEntry::ActivityAttempt(_) => "activityAttempt",
             TimelineEntry::Progress(_) => "progress",
             TimelineEntry::Approval(_) => "approval",
+            other => panic!("unexpected timeline entry: {other:?}"),
         })
         .collect::<Vec<_>>();
     assert_eq!(

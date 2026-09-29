@@ -1,5 +1,6 @@
 use std::{collections::HashMap, marker::PhantomData, str::FromStr, sync::Arc, time::Duration};
 
+use crate::tx::{self, Tx};
 use async_trait::async_trait;
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -15,12 +16,19 @@ use crate::{
     DurableConnection, DurableError, DurablePool, ScheduleRunId, WorkflowId,
 };
 
+mod cursor;
+
+pub(crate) use cursor::{
+    LocalOccurrence, MaterializedFloor, ScheduleCursor, MANUAL_OCCURRENCE_PREFIX,
+};
+
 const MAX_SCHEDULE_KEY_BYTES: usize = 191;
 const MAX_GAP_SCAN_SECONDS: i64 = 86_400;
 const MAX_CATCH_UP_OCCURRENCES: u32 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
 pub enum MisfirePolicy {
     Skip,
     RunLatest,
@@ -29,6 +37,7 @@ pub enum MisfirePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OverlapPolicy {
     Allow,
     SkipIfActive,
@@ -69,6 +78,7 @@ pub trait ScheduleHandler: DurableSchedule {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalTimeDisposition {
     Exact,
     Gap,
@@ -82,6 +92,12 @@ pub struct ScheduleOccurrence {
     pub scheduled_for: i64,
     pub due_at: i64,
     pub disposition: LocalTimeDisposition,
+}
+
+impl ScheduleOccurrence {
+    pub(crate) fn local(&self) -> LocalOccurrence {
+        LocalOccurrence::new(self.local_datetime)
+    }
 }
 
 #[derive(Clone)]
@@ -101,8 +117,19 @@ impl ScheduleCalendar {
         Ok(Self { schedule, timezone })
     }
 
+    /// The first occurrence strictly after `after` as an instant.
+    ///
+    /// A local time in a repeated (fall-back) hour resolves to its earlier
+    /// pass and fires once. When `after` is in the second pass, the next local
+    /// time can resolve to an earlier pass at or before `after`; that
+    /// occurrence has already had its instant, so it is skipped (G5).
     pub fn next_after(&self, after: DateTime<Utc>) -> Result<ScheduleOccurrence, DurableError> {
-        self.next_after_local(after.with_timezone(&self.timezone).naive_local())
+        let after_millis = after.timestamp_millis();
+        let mut next = self.next_after_local(after.with_timezone(&self.timezone).naive_local())?;
+        while next.scheduled_for <= after_millis {
+            next = self.next_after_local(next.local_datetime)?;
+        }
+        Ok(next)
     }
 
     pub fn next_after_local(
@@ -151,7 +178,7 @@ impl ScheduleCalendar {
     }
 
     fn resolve(&self, local_datetime: NaiveDateTime) -> Result<ScheduleOccurrence, DurableError> {
-        let local_occurrence = local_datetime.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let local_occurrence = LocalOccurrence::new(local_datetime).to_string();
         match self.timezone.from_local_datetime(&local_datetime) {
             LocalResult::Single(instant) => Ok(occurrence(
                 local_datetime,
@@ -225,6 +252,7 @@ pub struct ScheduleDefinitionMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScheduleStateReconcileOutcome {
     Inserted,
     Preserved,
@@ -355,7 +383,7 @@ where
         &self,
         key: &str,
         pool: &DurablePool,
-        deployed_at: i64,
+        deployed_at: crate::DbMillis,
     ) -> Result<ScheduleStateReconcileOutcome, DurableError> {
         let definition = self
             .definitions
@@ -364,65 +392,87 @@ where
                 resource: "schedule definition",
                 identifier: key.to_string(),
             })?;
-        let deployed_at = DateTime::<Utc>::from_timestamp_millis(deployed_at).ok_or_else(|| {
-            DurableError::InvalidDefinition("schedule deployment timestamp is invalid".to_string())
-        })?;
+        let now = deployed_at;
+        let deployed_at =
+            DateTime::<Utc>::from_timestamp_millis(deployed_at.get()).ok_or_else(|| {
+                DurableError::InvalidDefinition(
+                    "schedule deployment timestamp is invalid".to_string(),
+                )
+            })?;
         let next = definition.calendar.next_after(deployed_at)?;
+        let calendar = definition.calendar.clone();
         let metadata = definition.metadata.clone();
-        let now = deployed_at.timestamp_millis();
         let mut connection = pool.get().await?;
-        crate::dialect::transaction(&mut connection, async move |connection| {
-            crate::trace::declare_unmodeled("schedule_state", false);
-            let inserted = crate::dialect::insert_schedule_state_if_absent(
-                connection,
-                NewScheduleStateRow {
-                    schedule_key: metadata.key.clone(),
-                    definition_fingerprint: metadata.fingerprint.clone(),
-                    definition_version: metadata.version,
-                    next_local_occurrence: next.local_occurrence.clone(),
-                    next_occurrence_at: next.due_at,
-                    last_materialized_at: None,
-                    paused_at: None,
-                    paused_by: None,
-                    pause_reason: None,
-                    created_at: now,
-                    updated_at: now,
-                },
-            )
-            .await?;
-            let row = durable_schedule_state::table
-                .find(&metadata.key)
-                .for_update()
-                .select(ScheduleStateRow::as_select())
-                .first::<ScheduleStateRow>(connection)
+        crate::dialect::transaction(
+            &mut connection,
+            async move |Tx {
+                            connection,
+                            scope,
+                            trace,
+                        }| {
+                let trace = trace.declare_unmodeled("schedule_state", false);
+                let inserted = crate::dialect::insert_schedule_state_if_absent(
+                    connection,
+                    NewScheduleStateRow {
+                        schedule_key: metadata.key.clone(),
+                        definition_fingerprint: metadata.fingerprint.clone(),
+                        definition_version: metadata.version,
+                        next_local_occurrence: ScheduleCursor::initial(next.local())
+                            .local()
+                            .to_string(),
+                        next_occurrence_at: crate::DbMillis::from_requested_millis(next.due_at),
+                        last_materialized_at: None,
+                        paused_at: None,
+                        paused_by: None,
+                        pause_reason: None,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                )
                 .await?;
-            if inserted {
-                return Ok(ScheduleStateReconcileOutcome::Inserted);
-            }
-            if row.definition_version > metadata.version {
-                return Ok(ScheduleStateReconcileOutcome::NewerPersisted);
-            }
-            if row.definition_version == metadata.version {
-                if row.definition_fingerprint == metadata.fingerprint {
-                    return Ok(ScheduleStateReconcileOutcome::Preserved);
+                let row = tx::lock_first(
+                    connection,
+                    scope,
+                    durable_schedule_state::table
+                        .find(&metadata.key)
+                        .for_update()
+                        .select(ScheduleStateRow::as_select()),
+                )
+                .await?;
+                if inserted {
+                    return Ok(trace.commit(ScheduleStateReconcileOutcome::Inserted));
                 }
-                return Err(DurableError::Conflict(format!(
-                    "schedule {} v{} metadata changed without a version bump",
-                    metadata.key, metadata.version
-                )));
-            }
-            diesel::update(durable_schedule_state::table.find(&metadata.key))
-                .set((
-                    durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
-                    durable_schedule_state::definition_version.eq(metadata.version),
-                    durable_schedule_state::next_local_occurrence.eq(&next.local_occurrence),
-                    durable_schedule_state::next_occurrence_at.eq(next.due_at),
-                    durable_schedule_state::updated_at.eq(now),
-                ))
-                .execute(connection)
-                .await?;
-            Ok(ScheduleStateReconcileOutcome::Upgraded)
-        })
+                if row.definition_version > metadata.version {
+                    return Ok(trace.commit(ScheduleStateReconcileOutcome::NewerPersisted));
+                }
+                if row.definition_version == metadata.version {
+                    if row.definition_fingerprint == metadata.fingerprint {
+                        return Ok(trace.commit(ScheduleStateReconcileOutcome::Preserved));
+                    }
+                    return Err(DurableError::Conflict(format!(
+                        "schedule {} v{} metadata changed without a version bump",
+                        metadata.key, metadata.version
+                    )));
+                }
+                // The upgrade drops the unmaterialized span before `now` (intended)
+                // and never targets an occurrence with a run row (S27, G5).
+                let floor = MaterializedFloor::load(connection, row.as_ref()).await?;
+                let (cursor, target) = ScheduleCursor::upgrade(&calendar, deployed_at, floor)?;
+                diesel::update(durable_schedule_state::table.find(&metadata.key))
+                    .set((
+                        durable_schedule_state::definition_fingerprint.eq(&metadata.fingerprint),
+                        durable_schedule_state::definition_version.eq(metadata.version),
+                        durable_schedule_state::next_local_occurrence
+                            .eq(cursor.local().to_string()),
+                        durable_schedule_state::next_occurrence_at
+                            .eq(crate::DbMillis::from_requested_millis(target.due_at)),
+                        durable_schedule_state::updated_at.eq(now),
+                    ))
+                    .execute(connection)
+                    .await?;
+                Ok(trace.commit(ScheduleStateReconcileOutcome::Upgraded))
+            },
+        )
         .await
     }
 }

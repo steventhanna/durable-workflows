@@ -1,0 +1,15 @@
+error[E0560]: struct `StartOptions` has no field named `restarted_from_workflow_id`
+ --> tests/ui/fail/start_options_restart_field_private.rs:8:9
+  |
+8 |         restarted_from_workflow_id: Some(source),
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^ `StartOptions` does not have this field
+  |
+  = note: available fields are: `available_at`, `schedule_run_id`
+
+error[E0560]: struct `StartOptions` has no field named `root_workflow_id`
+ --> tests/ui/fail/start_options_restart_field_private.rs:9:9
+  |
+9 |         root_workflow_id: Some(source),
+  |         ^^^^^^^^^^^^^^^^ `StartOptions` does not have this field
+  |
+  = note: available fields are: `available_at`, `schedule_run_id`

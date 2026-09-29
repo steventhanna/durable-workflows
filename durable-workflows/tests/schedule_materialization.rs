@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -74,10 +75,7 @@ macro_rules! schedule {
                 Ok(DurableStore::start_with_conn(
                     connection,
                     &ScheduledWorkflow,
-                    StartOptions {
-                        schedule_run_id: Some(schedule_run_id),
-                        ..StartOptions::default()
-                    },
+                    StartOptions::default().with_schedule_run_id(schedule_run_id),
                 )
                 .await?
                 .workflow_id)
@@ -180,10 +178,7 @@ macro_rules! successful_handler {
                 Ok(DurableStore::start_with_conn(
                     connection,
                     &ScheduledWorkflow,
-                    StartOptions {
-                        schedule_run_id: Some(schedule_run_id),
-                        ..StartOptions::default()
-                    },
+                    StartOptions::default().with_schedule_run_id(schedule_run_id),
                 )
                 .await?
                 .workflow_id)
@@ -247,7 +242,11 @@ async fn run_latest_records_backlog_starts_one_and_is_multi_instance_exactly_onc
     let registry = registry();
     let deployed_at = at(2026, 1, 1, 0);
     registry
-        .reconcile_state(LatestSchedule::KEY, &pool, deployed_at)
+        .reconcile_state(
+            LatestSchedule::KEY,
+            &pool,
+            DbMillis::from_database_millis(deployed_at),
+        )
         .await
         .expect("state");
     let first = Arc::new(ScheduleMaterializer::new(
@@ -262,8 +261,8 @@ async fn run_latest_records_backlog_starts_one_and_is_multi_instance_exactly_onc
     ));
     let now = at(2026, 1, 3, 9);
     let (left, right) = tokio::join!(
-        first.materialize_schedule(LatestSchedule::KEY, now),
-        second.materialize_schedule(LatestSchedule::KEY, now),
+        first.materialize_schedule(LatestSchedule::KEY, DbMillis::from_database_millis(now)),
+        second.materialize_schedule(LatestSchedule::KEY, DbMillis::from_database_millis(now)),
     );
     let outcomes = [left.expect("left"), right.expect("right")];
     assert_eq!(
@@ -289,13 +288,15 @@ async fn run_latest_records_backlog_starts_one_and_is_multi_instance_exactly_onc
     let workflow_schedule_run = durable_workflow::table
         .filter(durable_workflow::schedule_run_id.eq(Some(started.id)))
         .select(durable_workflow::schedule_run_id)
-        .first::<Option<i64>>(&mut pool.get().await.expect("connection"))
+        .first::<Option<durable_workflows::ScheduleRunId>>(
+            &mut pool.get().await.expect("connection"),
+        )
         .await
         .expect("scheduled workflow");
     assert_eq!(workflow_schedule_run, Some(started.id));
     let schedule_state = state(&pool, LatestSchedule::KEY).await;
     assert_eq!(schedule_state.next_local_occurrence, "2026-01-04T08:00:00");
-    assert!(schedule_state.next_occurrence_at > now);
+    assert!(schedule_state.next_occurrence_at.get() > now);
 }
 
 #[tokio::test]
@@ -306,12 +307,19 @@ async fn failed_start_rolls_back_run_history_and_cadence_for_retry() {
     let registry = registry();
     let deployed_at = at(2026, 1, 1, 0);
     registry
-        .reconcile_state(FailingSchedule::KEY, &pool, deployed_at)
+        .reconcile_state(
+            FailingSchedule::KEY,
+            &pool,
+            DbMillis::from_database_millis(deployed_at),
+        )
         .await
         .expect("state");
     let before = state(&pool, FailingSchedule::KEY).await;
     let error = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry)
-        .materialize_schedule(FailingSchedule::KEY, at(2026, 1, 1, 9))
+        .materialize_schedule(
+            FailingSchedule::KEY,
+            DbMillis::from_database_millis(at(2026, 1, 1, 9)),
+        )
         .await
         .expect_err("start fails");
     assert!(matches!(error, DurableError::InvalidState(_)));
@@ -330,14 +338,14 @@ async fn skip_and_catch_up_apply_grace_and_bounded_chronological_starts() {
     let deployed_at = at(2026, 1, 1, 0);
     for key in [SkipSchedule::KEY, CatchUpSchedule::KEY] {
         registry
-            .reconcile_state(key, &pool, deployed_at)
+            .reconcile_state(key, &pool, DbMillis::from_database_millis(deployed_at))
             .await
             .expect("state");
     }
     let materializer = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry);
     let now = at(2026, 1, 3, 8) + 60_000;
     let skip = materializer
-        .materialize_schedule(SkipSchedule::KEY, now)
+        .materialize_schedule(SkipSchedule::KEY, DbMillis::from_database_millis(now))
         .await
         .expect("skip policy");
     assert_eq!((skip.started, skip.skipped, skip.coalesced), (1, 2, 0));
@@ -351,7 +359,7 @@ async fn skip_and_catch_up_apply_grace_and_bounded_chronological_starts() {
     );
 
     let catch_up = materializer
-        .materialize_schedule(CatchUpSchedule::KEY, now)
+        .materialize_schedule(CatchUpSchedule::KEY, DbMillis::from_database_millis(now))
         .await
         .expect("catch-up policy");
     assert_eq!(
@@ -375,22 +383,33 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
     };
     let registry = registry();
     registry
-        .reconcile_state(GapSchedule::KEY, &pool, at(2026, 3, 8, 0))
+        .reconcile_state(
+            GapSchedule::KEY,
+            &pool,
+            DbMillis::from_database_millis(at(2026, 3, 8, 0)),
+        )
         .await
         .expect("gap state");
     let materializer = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry.clone());
     let gap = materializer
-        .materialize_schedule(GapSchedule::KEY, at(2026, 3, 8, 10))
+        .materialize_schedule(
+            GapSchedule::KEY,
+            DbMillis::from_database_millis(at(2026, 3, 8, 10)),
+        )
         .await
         .expect("gap history");
     assert_eq!((gap.started, gap.skipped), (0, 1));
     let gap_runs = runs(&pool, GapSchedule::KEY).await;
-    assert_eq!(gap_runs[0].status, "skipped");
+    assert_eq!(gap_runs[0].status.as_str(), "skipped");
     assert_eq!(gap_runs[0].reason.as_deref(), Some("dst_gap"));
 
     let scan_start = at(2026, 1, 1, 0);
     registry
-        .reconcile_state(ScanBoundSchedule::KEY, &pool, scan_start)
+        .reconcile_state(
+            ScanBoundSchedule::KEY,
+            &pool,
+            DbMillis::from_database_millis(scan_start),
+        )
         .await
         .expect("scan state");
     let before = state(&pool, ScanBoundSchedule::KEY).await;
@@ -408,7 +427,10 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
         .expect("pause");
     assert!(
         materializer
-            .materialize_schedule(ScanBoundSchedule::KEY, beyond_bound)
+            .materialize_schedule(
+                ScanBoundSchedule::KEY,
+                DbMillis::from_database_millis(beyond_bound)
+            )
             .await
             .expect("paused tick")
             .paused
@@ -425,7 +447,10 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
         .expect("resume");
 
     let first = materializer
-        .materialize_schedule(ScanBoundSchedule::KEY, beyond_bound)
+        .materialize_schedule(
+            ScanBoundSchedule::KEY,
+            DbMillis::from_database_millis(beyond_bound),
+        )
         .await
         .expect("first recovery chunk");
     assert_eq!(
@@ -434,10 +459,13 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
     );
     let after = state(&pool, ScanBoundSchedule::KEY).await;
     assert!(after.next_local_occurrence > before.next_local_occurrence);
-    assert_eq!(after.next_occurrence_at, beyond_bound);
+    assert_eq!(after.next_occurrence_at.get(), beyond_bound);
     assert_eq!(runs(&pool, ScanBoundSchedule::KEY).await.len(), 10_000);
     let second = materializer
-        .materialize_schedule(ScanBoundSchedule::KEY, beyond_bound)
+        .materialize_schedule(
+            ScanBoundSchedule::KEY,
+            DbMillis::from_database_millis(beyond_bound),
+        )
         .await
         .expect("finish recovery");
     assert_eq!((second.inspected, second.started), (1, 1));
@@ -445,10 +473,14 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
         state(&pool, ScanBoundSchedule::KEY)
             .await
             .next_occurrence_at
+            .get()
             > beyond_bound
     );
     let repeated = materializer
-        .materialize_schedule(ScanBoundSchedule::KEY, beyond_bound)
+        .materialize_schedule(
+            ScanBoundSchedule::KEY,
+            DbMillis::from_database_millis(beyond_bound),
+        )
         .await
         .expect("idempotent retry");
     assert_eq!((repeated.inspected, repeated.started), (0, 0));
@@ -462,13 +494,20 @@ async fn failed_recovery_chunk_keeps_prior_progress_and_rolls_back_its_own_curso
     let registry = registry();
     let start = at(2026, 1, 1, 0);
     registry
-        .reconcile_state(FailingRecoverySchedule::KEY, &pool, start)
+        .reconcile_state(
+            FailingRecoverySchedule::KEY,
+            &pool,
+            DbMillis::from_database_millis(start),
+        )
         .await
         .expect("state");
     let materializer = ScheduleMaterializer::new(pool.clone(), Arc::new(()), registry);
     let now = start + 10_001 * 60_000;
     let first = materializer
-        .materialize_schedule(FailingRecoverySchedule::KEY, now)
+        .materialize_schedule(
+            FailingRecoverySchedule::KEY,
+            DbMillis::from_database_millis(now),
+        )
         .await
         .expect("safe prefix");
     assert_eq!(first.coalesced, 10_000);
@@ -476,7 +515,10 @@ async fn failed_recovery_chunk_keeps_prior_progress_and_rolls_back_its_own_curso
     for _ in 0..2 {
         assert!(matches!(
             materializer
-                .materialize_schedule(FailingRecoverySchedule::KEY, now)
+                .materialize_schedule(
+                    FailingRecoverySchedule::KEY,
+                    DbMillis::from_database_millis(now)
+                )
                 .await,
             Err(DurableError::InvalidState(_))
         ));

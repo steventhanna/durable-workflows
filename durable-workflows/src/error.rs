@@ -2,6 +2,7 @@ use crate::DefinitionKey;
 use crate::MAX_ERROR_REASON_BYTES;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DurableError {
     #[error("database error: {0}")]
     Database(#[from] diesel::result::Error),
@@ -82,6 +83,17 @@ pub enum DurableError {
     },
 }
 
+impl DurableError {
+    /// Whether the database aborted the transaction for a reason that a retry
+    /// of the whole transaction can clear: a deadlock, a serialization failure
+    /// or a lock wait timeout. A cancel that cascades to owned children locks
+    /// parent before child, so it can deadlock with a child that finishes at
+    /// the same moment (INVARIANTS §2.8); retry it when this holds.
+    pub fn is_transient(&self) -> bool {
+        crate::dialect::is_transient_error(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{category}: {message}")]
 pub struct WorkflowError {
@@ -99,6 +111,7 @@ impl WorkflowError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ActivityError {
     #[error("retryable activity error {category}: {message}")]
     Retryable { category: String, message: String },
@@ -149,4 +162,46 @@ pub(crate) fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     }
     value.truncate(boundary);
     value
+}
+
+/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking").
+#[cfg(kani)]
+mod verification {
+    use super::truncate_utf8;
+
+    /// Bytes in the symbolic input: room for a 4-byte char that starts at
+    /// any of the first 4 offsets, so every cut position inside a char of
+    /// every width is covered.
+    const MAX_BYTES: usize = 8;
+
+    /// For any UTF-8 text of up to `MAX_BYTES` bytes and any byte limit,
+    /// the result is a prefix of the text that fits the limit and no longer
+    /// char-boundary prefix fits: every offset between its end and the
+    /// limit is inside a char. The unwind bound 10 covers the UTF-8 check
+    /// and the byte copies and comparisons over at most 8 bytes (the
+    /// boundary search steps back at most 3 bytes, since a char is at most
+    /// 4 bytes).
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn truncate_utf8_keeps_the_longest_fitting_prefix() {
+        let bytes: [u8; MAX_BYTES] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_BYTES);
+        let Ok(text) = std::str::from_utf8(&bytes[..len]) else {
+            return;
+        };
+        let max_bytes: usize = kani::any();
+
+        let truncated = truncate_utf8(text.to_owned(), max_bytes);
+
+        assert!(text.as_bytes().starts_with(truncated.as_bytes()));
+        if text.len() <= max_bytes {
+            assert!(truncated.len() == text.len());
+        } else {
+            assert!(truncated.len() <= max_bytes);
+            let longer: usize = kani::any();
+            kani::assume(truncated.len() < longer && longer <= max_bytes);
+            assert!(!text.is_char_boundary(longer));
+        }
+    }
 }

@@ -1,5 +1,6 @@
 mod support;
 
+use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -67,10 +68,7 @@ impl ScheduleHandler for HealthySchedule {
         Ok(DurableStore::start_with_conn(
             connection,
             &TemporalRuntimeWorkflow,
-            StartOptions {
-                schedule_run_id: Some(schedule_run_id),
-                ..StartOptions::default()
-            },
+            StartOptions::default().with_schedule_run_id(schedule_run_id),
         )
         .await?
         .workflow_id)
@@ -115,12 +113,13 @@ async fn start_workflow(pool: &durable_workflows::DurablePool) -> WorkflowId {
 
 async fn seed_timer(pool: &durable_workflows::DurablePool, now: i64) -> WorkflowId {
     let workflow_id = start_workflow(pool).await;
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
             durable_workflow::wait_reference_id.eq(Some(1_i64)),
-            durable_workflow::available_at.eq(now.saturating_sub(1)),
+            durable_workflow::available_at
+                .eq(DbMillis::from_database_millis(now.saturating_sub(1))),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -135,16 +134,16 @@ async fn seed_expired_approval(pool: &durable_workflows::DurablePool, now: i64) 
     let mut connection = pool.get().await.expect("approval connection");
     diesel::insert_into(durable_approval::table)
         .values(NewApprovalRow {
-            workflow_id: workflow_id.get(),
+            workflow_id,
             command_sequence: 1,
             kind: TemporalRuntimeWorkflow::KIND.to_string(),
             version: TemporalRuntimeWorkflow::VERSION,
             prompt_metadata_json: r#"{"prompt":"safe"}"#.to_string(),
             validation_schema_json: "{}".to_string(),
             validation_version: 1,
-            status: "pending".to_string(),
-            requested_at: now.saturating_sub(1_000),
-            expires_at: Some(now.saturating_sub(1)),
+            status: durable_workflows::persistence::ApprovalStatus::Pending,
+            requested_at: DbMillis::from_database_millis(now.saturating_sub(1_000)),
+            expires_at: Some(DbMillis::from_database_millis(now.saturating_sub(1))),
             decision_payload_json: None,
             decided_by: None,
             operator_reason: None,
@@ -154,16 +153,16 @@ async fn seed_expired_approval(pool: &durable_workflows::DurablePool, now: i64) 
         .await
         .expect("approval insert");
     let approval_id = durable_approval::table
-        .filter(durable_approval::workflow_id.eq(workflow_id.get()))
+        .filter(durable_approval::workflow_id.eq(workflow_id))
         .select(durable_approval::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ApprovalId>(&mut connection)
         .await
         .expect("approval id");
-    diesel::update(durable_workflow::table.find(workflow_id.get()))
+    diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_approval"),
             durable_workflow::wait_kind.eq(Some("approval".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(approval_id)),
+            durable_workflow::wait_reference_id.eq(Some(approval_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -179,7 +178,7 @@ async fn event_count(
     event_type: &str,
 ) -> i64 {
     durable_workflow_event::table
-        .filter(durable_workflow_event::workflow_id.eq(workflow_id.get()))
+        .filter(durable_workflow_event::workflow_id.eq(workflow_id))
         .filter(durable_workflow_event::event_type.eq(event_type))
         .count()
         .get_result(&mut pool.get().await.expect("event connection"))
@@ -201,7 +200,7 @@ async fn runtime_supervises_temporal_sources_isolates_schedules_and_stops_cleanl
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let now = durable_workflows::persistence::now_millis();
+    let now = support::db_now(&pool).await;
     let timer = seed_timer(&pool, now).await;
     let approval = seed_expired_approval(&pool, now).await;
 
@@ -215,7 +214,11 @@ async fn runtime_supervises_temporal_sources_isolates_schedules_and_stops_cleanl
     let schedules = Arc::new(schedules);
     for key in [HealthySchedule::KEY, FailingSchedule::KEY] {
         schedules
-            .reconcile_state(key, &pool, now.saturating_sub(3_000))
+            .reconcile_state(
+                key,
+                &pool,
+                DbMillis::from_database_millis(now.saturating_sub(3_000)),
+            )
             .await
             .expect("schedule state");
     }
@@ -232,13 +235,11 @@ async fn runtime_supervises_temporal_sources_isolates_schedules_and_stops_cleanl
         Arc::new(ActivityRegistry::new()),
         Arc::new(TopicRegistry::new()),
         "temporal-runtime-test",
-        RuntimeConfig {
-            idle_delay: Duration::from_millis(5),
-            timer_poll_interval: Duration::from_millis(5),
-            approval_expiry_poll_interval: Duration::from_millis(5),
-            schedule_poll_interval: Duration::from_millis(10),
-            ..RuntimeConfig::default()
-        },
+        RuntimeConfig::default()
+            .with_idle_delay(Duration::from_millis(5))
+            .with_timer_poll_interval(Duration::from_millis(5))
+            .with_approval_expiry_poll_interval(Duration::from_millis(5))
+            .with_schedule_poll_interval(Duration::from_millis(10)),
     )
     .expect("runtime definition")
     .with_schedules(schedules);

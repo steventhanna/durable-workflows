@@ -2,6 +2,7 @@ use diesel::ExpressionMethods;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 
 use super::{TransactionCallback, WorkflowInsert};
+use crate::tx::{CommandParent, Committed, Locked, Tx};
 use crate::{
     persistence::{
         NewActivityRow, NewApprovalRow, NewScheduleRunRow, NewScheduleStateRow, NewTopicLockRow,
@@ -11,16 +12,11 @@ use crate::{
         durable_activity, durable_approval, durable_schedule_run, durable_schedule_state,
         durable_topic_lock, durable_workflow,
     },
-    DurableConnection, DurableError,
+    ActivityId, ApprovalId, DurableConnection, DurableError, ScheduleRunId, WorkflowId,
 };
 
 diesel::define_sql_function! {
     fn last_insert_id() -> diesel::sql_types::Bigint;
-}
-
-diesel::define_sql_function! {
-    #[sql_name = "LAST_INSERT_ID"]
-    fn set_last_insert_id(value: diesel::sql_types::Bigint) -> diesel::sql_types::Bigint;
 }
 
 /// Library-owned transaction, pinned to READ COMMITTED.
@@ -33,8 +29,8 @@ pub(crate) async fn transaction<'a, 'conn, R, E, F>(
     callback: F,
 ) -> Result<R, E>
 where
-    for<'r> F: AsyncFnOnce(&'r mut DurableConnection) -> Result<R, E>
-        + TransactionCallback<&'r mut DurableConnection, Result<R, E>, Fut: Send>
+    for<'r> F: AsyncFnOnce(Tx<'r>) -> Result<Committed<R>, E>
+        + TransactionCallback<Tx<'r>, Result<Committed<R>, E>, Fut: Send>
         + Send
         + 'a,
     E: From<diesel::result::Error> + Send + 'a,
@@ -45,7 +41,7 @@ where
         .batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .await?;
     connection
-        .transaction(async move |connection| crate::trace::scoped(connection, callback).await)
+        .transaction(async move |connection| crate::tx::enter(connection, callback).await)
         .await
 }
 
@@ -73,14 +69,18 @@ pub(crate) async fn insert_workflow(
         .values(row)
         .on_conflict(diesel::dsl::DuplicatedKeys)
         .do_update()
-        .set(durable_workflow::id.eq(durable_workflow::id + set_last_insert_id(0_i64)))
+        .set(
+            durable_workflow::id.eq(diesel::dsl::sql::<crate::ids::sql_types::WorkflowId>(
+                "`id` + LAST_INSERT_ID(0)",
+            )),
+        )
         .execute(connection)
         .await?;
     let last_id = diesel::select(last_insert_id())
         .get_result::<i64>(connection)
         .await?;
     if last_id > 0 {
-        return Ok(WorkflowInsert::Inserted(last_id));
+        return Ok(WorkflowInsert::Inserted(WorkflowId::new(last_id)?));
     }
     if has_deduplication_key {
         return Ok(WorkflowInsert::DeduplicationConflict);
@@ -89,7 +89,7 @@ pub(crate) async fn insert_workflow(
     Err(restart_conflict(restarted_from_workflow_id))
 }
 
-fn restart_conflict(restarted_from_workflow_id: Option<i64>) -> DurableError {
+fn restart_conflict(restarted_from_workflow_id: Option<WorkflowId>) -> DurableError {
     match restarted_from_workflow_id {
         Some(id) => DurableError::Conflict(format!("workflow {id} already has a successor")),
         None => DurableError::Conflict(
@@ -98,37 +98,45 @@ fn restart_conflict(restarted_from_workflow_id: Option<i64>) -> DurableError {
     }
 }
 
-pub(crate) async fn insert_activity(
+/// Takes the locked parent workflow, so the insert cannot run before the
+/// fence lock (N4): a stale claim then gets `FencedWrite`, not a duplicate key.
+pub(crate) async fn insert_activity<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
+    parent: Locked<'tx, &P>,
     row: NewActivityRow,
-) -> Result<i64, DurableError> {
+) -> Result<ActivityId, DurableError> {
+    debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     diesel::insert_into(durable_activity::table)
         .values(row)
         .execute(connection)
         .await?;
-    connection_last_insert_id(connection).await
+    ActivityId::new(connection_last_insert_id(connection).await?)
 }
 
-pub(crate) async fn insert_approval(
+/// Takes the locked parent workflow, so the insert cannot run before the
+/// fence lock (N4): a stale claim then gets `FencedWrite`, not a duplicate key.
+pub(crate) async fn insert_approval<'tx, P: CommandParent + Sync>(
     connection: &mut DurableConnection,
+    parent: Locked<'tx, &P>,
     row: NewApprovalRow,
-) -> Result<i64, DurableError> {
+) -> Result<ApprovalId, DurableError> {
+    debug_assert_eq!(parent.row().workflow_id(), row.workflow_id);
     diesel::insert_into(durable_approval::table)
         .values(row)
         .execute(connection)
         .await?;
-    connection_last_insert_id(connection).await
+    ApprovalId::new(connection_last_insert_id(connection).await?)
 }
 
 pub(crate) async fn insert_schedule_run(
     connection: &mut DurableConnection,
     row: NewScheduleRunRow,
-) -> Result<i64, DurableError> {
+) -> Result<ScheduleRunId, DurableError> {
     diesel::insert_into(durable_schedule_run::table)
         .values(row)
         .execute(connection)
         .await?;
-    connection_last_insert_id(connection).await
+    ScheduleRunId::new(connection_last_insert_id(connection).await?)
 }
 
 /// Returns whether exactly this row was inserted; an existing row is never
@@ -161,4 +169,22 @@ async fn connection_last_insert_id(
     Ok(diesel::select(last_insert_id())
         .get_result::<i64>(connection)
         .await?)
+}
+
+/// A deadlock (1213) or lock wait timeout (1205): the transaction was rolled
+/// back and retrying it later is safe. diesel-async maps neither code to a
+/// `DatabaseErrorKind` and keeps only the server message, so the message is
+/// matched (the server's `lc_messages` must be English, the default).
+pub(crate) fn is_transient_error(error: &DurableError) -> bool {
+    let DurableError::Database(diesel::result::Error::DatabaseError(kind, info)) = error else {
+        return false;
+    };
+    matches!(
+        kind,
+        diesel::result::DatabaseErrorKind::SerializationFailure
+    ) || {
+        let message = info.message();
+        message.starts_with("Deadlock found when trying to get lock")
+            || message.starts_with("Lock wait timeout exceeded")
+    }
 }

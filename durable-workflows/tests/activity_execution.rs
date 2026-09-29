@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{
@@ -118,6 +119,7 @@ impl ActivityHandler for TestActivity {
                     {
                         ProgressReportOutcome::Persisted { .. } => persisted += 1,
                         ProgressReportOutcome::LimitReached => {}
+                        other => panic!("unexpected progress outcome: {other:?}"),
                     }
                 }
                 Ok(serde_json::json!(persisted))
@@ -252,10 +254,9 @@ fn worker(
         pool,
         context,
         worker_id,
-        WorkerConfig {
-            heartbeat_interval: Duration::from_millis(20),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_millis(20))
+            .with_shutdown_grace(Duration::from_secs(1)),
     )
 }
 
@@ -290,15 +291,18 @@ async fn schedule_activity(
     max_attempts: i32,
     timeout_millis: i64,
     lease_duration_millis: i64,
-) -> (i64, i64) {
+) -> (durable_workflows::WorkflowId, durable_workflows::ActivityId) {
     let workflow_id = DurableStore::new(pool.clone())
         .start(&HostWorkflow, StartOptions::default())
         .await
         .expect("workflow start")
-        .workflow_id
-        .get();
-    let now = durable_workflows::persistence::now_millis();
+        .workflow_id;
     let mut connection = pool.get().await.expect("test connection");
+    // Claims compare `available_at` with the database clock; a host stamp ahead of it
+    // would hide the row from the first claim.
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::insert_into(durable_activity::table)
         .values(NewActivityRow {
             workflow_id,
@@ -336,14 +340,14 @@ async fn schedule_activity(
     let activity_id = durable_activity::table
         .filter(durable_activity::workflow_id.eq(workflow_id))
         .select(durable_activity::id)
-        .first::<i64>(&mut connection)
+        .first::<durable_workflows::ActivityId>(&mut connection)
         .await
         .expect("activity id");
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("waiting_activity"),
             durable_workflow::wait_kind.eq(Some("activity".to_string())),
-            durable_workflow::wait_reference_id.eq(Some(activity_id)),
+            durable_workflow::wait_reference_id.eq(Some(activity_id.get())),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -438,10 +442,7 @@ async fn two_workers_claim_distinct_rows_up_to_the_global_topic_limit() {
     let (left, right) = tokio::join!(first.claim_one("other"), second.claim_one("other"));
     let left = left.expect("first claim").expect("first activity");
     let right = right.expect("second claim").expect("second activity");
-    assert_ne!(
-        left.activity_id().expect("first id"),
-        right.activity_id().expect("second id")
-    );
+    assert_ne!(left.activity_id(), right.activity_id());
     assert!(third
         .claim_one("other")
         .await
@@ -486,7 +487,7 @@ async fn old_worker_skips_activity_versions_it_cannot_execute() {
         .await
         .expect("old claim")
         .expect("locally executable activity");
-    assert_eq!(claim.activity_id().expect("claimed activity").get(), v1_id);
+    assert_eq!(claim.activity_id(), v1_id);
 
     let mut connection = pool.get().await.expect("connection");
     let untouched = durable_activity::table
@@ -524,12 +525,23 @@ async fn persisted_topic_cap_rejects_incompatible_worker_definition() {
     support::drop_durable_tables(&mut connection).await;
 }
 
+// The one place a test reads the host wall clock: it proves the claim path
+// ignores it by putting the database clock a day ahead of it.
+fn host_wall_clock_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_millis()
+        .try_into()
+        .expect("millis fit in i64")
+}
+
 #[tokio::test]
 async fn activity_claim_eligibility_uses_database_time_when_process_clock_differs() {
     let Some(pool) = support::fresh_pool_with_max_size(1).await else {
         return;
     };
-    let process_now = durable_workflows::persistence::now_millis();
+    let process_now = host_wall_clock_millis();
     let database_seconds = process_now / 1_000 + 86_400;
     let database_now = database_seconds * 1_000;
     let mut connection = pool.get().await.expect("clock connection");
@@ -538,10 +550,10 @@ async fn activity_claim_eligibility_uses_database_time_when_process_clock_differ
 
     let (_, activity_id) = schedule_activity(&pool, "external", 3, 5_000, 10_000).await;
     let available_at = database_now - 1_000;
-    assert!(available_at > durable_workflows::persistence::now_millis());
+    assert!(available_at > host_wall_clock_millis());
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(available_at))
+        .set(durable_activity::available_at.eq(DbMillis::from_database_millis(available_at)))
         .execute(&mut connection)
         .await
         .expect("schedule by database time");
@@ -556,10 +568,7 @@ async fn activity_claim_eligibility_uses_database_time_when_process_clock_differ
     .await
     .expect("claim with database clock")
     .expect("database-due activity");
-    assert_eq!(
-        claimed.activity_id().expect("activity id").get(),
-        activity_id
-    );
+    assert_eq!(claimed.activity_id(), activity_id);
 
     let mut connection = pool.get().await.expect("test connection");
     support::drop_durable_tables(&mut connection).await;
@@ -578,11 +587,7 @@ async fn success_finishes_attempt_and_wakes_workflow_with_typed_event() {
     );
 
     assert_eq!(
-        worker
-            .run_one("external")
-            .await
-            .expect("execution")
-            .map(|id| id.get()),
+        worker.run_one("external").await.expect("execution"),
         Some(activity_id)
     );
 
@@ -617,7 +622,10 @@ async fn success_finishes_attempt_and_wakes_workflow_with_typed_event() {
 
     assert_eq!(activity.status.as_str(), "succeeded");
     assert_eq!(activity.provider_result_json.as_deref(), Some("42"));
-    assert_eq!(attempt.outcome.as_deref(), Some("succeeded"));
+    assert_eq!(
+        attempt.outcome.map(|outcome| outcome.as_str()),
+        Some("succeeded")
+    );
     assert_eq!(workflow.status.as_str(), "ready");
     assert_eq!(workflow.wait_reference_id, None);
     assert!(matches!(
@@ -644,8 +652,7 @@ async fn maximum_activity_output_fits_the_durable_workflow_event() {
         worker
             .run_one("external")
             .await
-            .expect("maximum bounded output commits")
-            .map(|id| id.get()),
+            .expect("maximum bounded output commits"),
         Some(activity_id)
     );
 
@@ -673,7 +680,7 @@ async fn retryable_failure_reschedules_with_backoff_and_consumes_attempt() {
     let context = Arc::new(TestContext::default());
     context.mode.store(1, Ordering::SeqCst);
     let worker = worker(pool.clone(), context, "retry-worker");
-    let before = durable_workflows::persistence::now_millis();
+    let before = support::db_now(&pool).await;
 
     worker.run_one("external").await.expect("retry execution");
 
@@ -686,7 +693,7 @@ async fn retryable_failure_reschedules_with_backoff_and_consumes_attempt() {
         .expect("activity");
     assert_eq!(row.status.as_str(), "pending");
     assert_eq!(row.attempt_count, 1);
-    assert!(row.available_at >= before + 900);
+    assert!(row.available_at.get() >= before + 900);
     assert_eq!(row.last_error_category.as_deref(), Some("provider_busy"));
     let retry_history = durable_workflow_event::table
         .filter(durable_workflow_event::workflow_id.eq(workflow_id))
@@ -779,15 +786,33 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .await
         .expect("claim")
         .expect("work");
+    // The first claim is abandoned: the trace records that no handler holds
+    // it (the model's `Crash`).
+    #[cfg(feature = "trace-model")]
+    durable_workflows::trace::record_local(
+        &pool,
+        "expired-one",
+        durable_workflows::trace::Action::new("Crash", serde_json::json!({})),
+    )
+    .await;
     let mut connection = pool.get().await.expect("test connection");
+    let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire lease");
     drop(connection);
 
-    let recovery_started = durable_workflows::persistence::now_millis();
+    // Reconciliation stamps the retry with the database clock; measure from it too.
+    let recovery_started = {
+        let mut connection = pool.get().await.expect("test connection");
+        durable_workflows::persistence::database_now_millis(&mut connection)
+            .await
+            .expect("database clock")
+    };
     assert!(second
         .claim_one("external")
         .await
@@ -797,13 +822,16 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
     let (status, available_at) = durable_activity::table
         .find(activity_id)
         .select((durable_activity::status, durable_activity::available_at))
-        .first::<(String, i64)>(&mut connection)
+        .first::<(String, DbMillis)>(&mut connection)
         .await
         .expect("reconciled activity");
     assert_eq!(status, "pending");
-    assert!(available_at >= recovery_started + 900);
+    assert!(available_at.get() >= recovery_started.get() + 900);
+    let now = durable_workflows::persistence::database_now_millis(&mut connection)
+        .await
+        .expect("database clock");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(durable_workflows::persistence::now_millis()))
+        .set(durable_activity::available_at.eq(now))
         .execute(&mut connection)
         .await
         .expect("make recovered activity due");
@@ -814,7 +842,7 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
         .await
         .expect("reclaim")
         .expect("work");
-    assert_eq!(reclaimed.activity_id().expect("id").get(), activity_id);
+    assert_eq!(reclaimed.activity_id(), activity_id);
     assert_eq!(reclaimed.attempt_number().expect("attempt"), 2);
 
     let mut connection = pool.get().await.expect("test connection");
@@ -996,10 +1024,9 @@ async fn stale_lease_cannot_emit_progress_or_commit_a_result() {
         pool.clone(),
         context.clone(),
         "stale-progress-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(2),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(2))
+            .with_shutdown_grace(Duration::from_secs(1)),
     ));
     let (_, activity_id) = schedule_activity(&pool, "external", 3, 5_000, 10_000).await;
     let executing = worker.clone();
@@ -1220,7 +1247,7 @@ async fn heartbeat_updates_are_atomic_when_the_attempt_fence_is_stale() {
     let original_expiry = durable_activity::table
         .find(activity_id)
         .select(durable_activity::lease_expires_at)
-        .first::<Option<i64>>(&mut connection)
+        .first::<Option<DbMillis>>(&mut connection)
         .await
         .expect("lease expiry");
     diesel::update(durable_activity_attempt::table.find((activity_id, 1)))
@@ -1239,7 +1266,7 @@ async fn heartbeat_updates_are_atomic_when_the_attempt_fence_is_stale() {
     let final_expiry = durable_activity::table
         .find(activity_id)
         .select(durable_activity::lease_expires_at)
-        .first::<Option<i64>>(&mut connection)
+        .first::<Option<DbMillis>>(&mut connection)
         .await
         .expect("lease expiry after failed heartbeat");
     assert_eq!(final_expiry, original_expiry);
@@ -1258,10 +1285,9 @@ async fn stale_completion_is_rejected_after_the_lease_changes() {
         pool.clone(),
         context,
         "stale-result-worker",
-        WorkerConfig {
-            heartbeat_interval: Duration::from_secs(5),
-            shutdown_grace: Duration::from_secs(1),
-        },
+        WorkerConfig::default()
+            .with_heartbeat_interval(Duration::from_secs(5))
+            .with_shutdown_grace(Duration::from_secs(1)),
     ));
     let running_worker = worker.clone();
     let execution = tokio::spawn(async move { running_worker.run_one("external").await });
@@ -1363,7 +1389,7 @@ async fn single_and_batch_claims_share_the_attempt_and_lease_contract() {
                 .expect("single claim")
                 .expect("activity")
         };
-        assert_eq!(claim.activity_id().expect("id").get(), activity_id);
+        assert_eq!(claim.activity_id(), activity_id);
         assert_eq!(claim.attempt_number().expect("attempt number"), 1);
         let mut connection = pool.get().await.expect("connection");
         let row = durable_activity::table
@@ -1385,7 +1411,10 @@ async fn single_and_batch_claims_share_the_attempt_and_lease_contract() {
         assert_eq!(attempt.lease_token, claim.lease_token());
         assert_eq!(attempt.worker_id, "contract-worker");
         assert_eq!(attempt.attempt_number, 1);
-        assert_eq!(row.lease_expires_at, Some(attempt.started_at + 120_000));
+        assert_eq!(
+            row.lease_expires_at.map(DbMillis::get),
+            Some(attempt.started_at.get() + 120_000)
+        );
         assert_eq!(attempt.heartbeat_at, attempt.started_at);
         assert!(attempt.finished_at.is_none());
     }
