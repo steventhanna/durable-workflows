@@ -789,7 +789,7 @@ async fn oversized_input_or_initial_state_creates_no_rows() {
 }
 
 #[tokio::test]
-async fn second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_usable() {
+async fn second_admin_restart_conflicts_and_a_later_caller_transaction_commits() {
     use std::sync::Arc;
 
     use diesel::{ExpressionMethods, QueryDsl};
@@ -885,5 +885,99 @@ async fn second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_
         ]
     );
 
+    support::drop_durable_tables(&mut connection).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn restart_key_conflict_leaves_the_same_caller_transaction_usable() {
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::RunQueryDsl;
+    use durable_workflows::{schema::durable_workflow, DurableError, DurableStore};
+
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let mut connection = pool.get().await.expect("caller connection");
+    let options = StartOptions::default().with_deduplication_key("recoverable-key");
+    let source = DurableStore::start_with_conn(
+        &mut connection,
+        &StartWorkflow { value: 1 },
+        options.clone(),
+    )
+    .await
+    .expect("source starts");
+    diesel::update(durable_workflow::table.find(source.workflow_id))
+        .set(durable_workflow::status.eq("failed"))
+        .execute(&mut connection)
+        .await
+        .expect("source is failed");
+
+    let competing_pool = pool.clone();
+    let unrelated_id = connection
+        .build_transaction()
+        .repeatable_read()
+        .run(async move |transaction| {
+            let source_count = durable_workflow::table
+                .count()
+                .get_result::<i64>(transaction)
+                .await
+                .expect("establish caller snapshot");
+            assert_eq!(source_count, 1);
+
+            let mut competitor = competing_pool.get().await.expect("competitor connection");
+            let successor = DurableStore::start_or_restart_recoverable_with_conn(
+                &mut competitor,
+                &StartWorkflow { value: 2 },
+                options.clone(),
+            )
+            .await
+            .expect("competitor starts the successor");
+            assert!(successor.inserted);
+            drop(competitor);
+
+            match DurableStore::start_or_restart_recoverable_with_conn(
+                transaction,
+                &StartWorkflow { value: 3 },
+                options,
+            )
+            .await
+            {
+                Err(DurableError::Conflict(message)) => assert!(
+                    message.contains("already has a successor"),
+                    "unexpected conflict message: {message}"
+                ),
+                other => panic!("expected a restart-key conflict, got {other:?}"),
+            }
+
+            let unrelated = DurableStore::start_with_conn(
+                transaction,
+                &OtherStartWorkflow { value: 4 },
+                StartOptions::default(),
+            )
+            .await
+            .expect("same caller transaction stays usable");
+            assert!(unrelated.inserted);
+            Ok::<_, DurableError>(unrelated.workflow_id)
+        })
+        .await
+        .expect("caller transaction commits");
+
+    let count = durable_workflow::table
+        .count()
+        .get_result::<i64>(&mut connection)
+        .await
+        .expect("committed workflow count");
+    assert_eq!(count, 3);
+    assert_ne!(unrelated_id, source.workflow_id);
+    assert_eq!(
+        durable_workflow::table
+            .find(unrelated_id)
+            .count()
+            .get_result::<i64>(&mut connection)
+            .await
+            .expect("unrelated workflow count"),
+        1
+    );
     support::drop_durable_tables(&mut connection).await;
 }

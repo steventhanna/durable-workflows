@@ -246,7 +246,9 @@ Compared with the production-internal version it was extracted from:
   merge topics whose names differ only in case or accents.
 - A start that collides on the restart key (`uq_durable_workflow_restart`)
   returns `DurableError::Conflict` and leaves the caller's transaction
-  usable (it returned `InvalidState`).
+  usable (it returned `InvalidState`). A PostgreSQL repeatable-read test now
+  proves that unrelated work commits in the same caller transaction after
+  this conflict.
 - Cancelling a workflow cancels every generation of the child workflows it
   owns (the child and its recovery or restart successors), and theirs, in
   the same transaction (G11): `DurableStore::cancel_with_conn`,

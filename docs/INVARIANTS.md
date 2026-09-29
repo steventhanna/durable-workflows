@@ -835,9 +835,11 @@ library pins for every T-W1; it reproduces only under REPEATABLE READ.
 most one row per `restartedFromWorkflowId` (M:34; admin pre-check
 `src/admin/control.rs` `AdminControlService::restart`). A second admin restart of a source returns
 `Conflict` (test
-`second_restart_of_a_source_conflicts_and_leaves_the_caller_transaction_usable`);
-a restart-key collision inside `insert_prepared` also returns `Conflict` and
-leaves the caller's transaction usable. Only the engine sets a restart
+`second_admin_restart_conflicts_and_a_later_caller_transaction_commits`);
+a restart-key collision through `start_or_restart_recoverable_with_conn`
+also returns `Conflict` and leaves the same caller transaction usable
+(`restart_key_conflict_leaves_the_same_caller_transaction_usable`, PostgreSQL
+repeatable read). Only the engine sets a restart
 source: `StartOptions::restarted_from_workflow_id` and `root_workflow_id` are
 crate-private (N3 fixed), and T-X2 and T-A5 restart only a terminal,
 `blocked` or (T-A5) `paused` source, cancelling a non-terminal one in the

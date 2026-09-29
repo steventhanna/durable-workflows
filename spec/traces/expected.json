@@ -15,7 +15,7 @@
     "pass": 116,
     "violation_confirmed": 0,
     "excluded": {
-      "deferred_commit": 1,
+      "deferred_commit": 2,
       "empty": 5,
       "external_invariant:inv_S11_openAttempt": 6,
       "external_invariant:inv_S15_actWfCoupling,inv_S5_delivery,inv_S7_waitCoupling": 1,
