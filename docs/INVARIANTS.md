@@ -145,7 +145,8 @@ M:138) hang off the attempt (`src/progress.rs` `ProgressReporter::report`).
 
 ### 1.4 Approval (`durable_approval`, M:142-164)
 
-Statuses: `pending`, `resolved`, `expired`, `cancelled` (plain strings). Unique
+Statuses: `pending`, `resolved`, `expired`, `cancelled` are represented by
+`persistence::ApprovalStatus` (persisted text unchanged). Unique
 `(workflowId, commandSequence)` (M:159).
 
 | from | to | actor | code |
@@ -209,7 +210,7 @@ successor's terminal transaction then delivers the outcome (G2 fixed).
 | change | actor | code |
 |---|---|---|
 | insert (cursor = first occurrence after `now`) | runtime spawn / materializer tick | `src/schedule.rs` `ScheduleRegistry::reconcile_state` |
-| upgrade (new version; cursor reset to first occurrence after `now`) | runtime spawn / materializer tick | `src/schedule.rs` `ScheduleRegistry::reconcile_state` |
+| upgrade (new version; cursor set after `now` and the last materialized occurrence) | runtime spawn / materializer tick | `src/schedule.rs` `ScheduleRegistry::reconcile_state`, `ScheduleCursor::upgrade` (S27) |
 | cursor advance | materializer | `src/runtime/schedule_materializer.rs` `ScheduleMaterializer::materialize_schedule` |
 | pause / resume | admin | `src/admin/control.rs` `AdminControlService::set_schedule_paused` |
 
@@ -516,8 +517,10 @@ retried next tick.
 **T-S1 reconcile state** (`src/schedule.rs` `ScheduleRegistry::reconcile_state`): `INSERT IGNORE` a
 state row with cursor `next_after(now)`; lock it `FOR UPDATE`; persisted
 version greater → `NewerPersisted` (T-S2 returns Conflict); equal version with
-different fingerprint → Conflict; smaller → overwrite version, fingerprint,
-and reset the cursor to `next_after(now)` (`Upgraded`). `Inserted`/`Upgraded`
+different fingerprint → Conflict; smaller → overwrite version and fingerprint,
+and set the cursor to the first new-calendar occurrence strictly after `now`
+as an instant and strictly after the last materialized local occurrence
+(`ScheduleCursor::upgrade`, S27, `Upgraded`). `Inserted`/`Upgraded`
 end the tick.
 
 **T-S2 materialize** (`ScheduleMaterializer::materialize_schedule`), one transaction: lock state `FOR UPDATE`;
@@ -537,8 +540,9 @@ old cursor, version, and fingerprint (`ScheduleMaterializer::materialize_schedul
   (`ON DUPLICATE KEY UPDATE id = id + LAST_INSERT_ID(0)`,
   `src/dialect/mysql.rs` `insert_workflow`) plus reload `FOR UPDATE` on a
   dedup conflict; a restart-key collision returns `Conflict`; `started`
-  event. Options with both a dedup key and a restart source are rejected
-  (`InvalidDefinition`). Can run inside a caller transaction
+  event. A start's private `StartLineage` holds either a dedup key or a
+  restart source, so a start with both has no value. Can run inside a caller
+  transaction
   (`start_with_conn`).
 - **T-X2 start_or_restart_recoverable**: lock the row with
   `(kind, dedupKey)` `FOR UPDATE`; follow its `restartedFromWorkflowId` chain,
@@ -628,8 +632,9 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
 - `RunActivity`/`WaitForApproval` commit: workflow (fence lock) → INSERT new
   row (new rows are invisible to others, so no cycle).
 - Child terminal: child → every waiting parent (locking scan on
-  `waitKind, waitReferenceId, status`; there is no index on
-  `waitReferenceId`, so the scan can lock many rows; UNCLEAR how many).
+  `waitKind, waitReferenceId, status` through `idx_durable_workflow_wait`,
+  whose columns are `wait_kind, wait_reference_id, status`; the scan targets
+  rows that wait on this child).
 - `RunChild` commit attaching to an existing child: child → parent, the same
   order as the previous line (G9, fixed; it was parent → child).
 - Cancel cascade (T-X3, T-A4, T-A5, T-X2 of a blocked row; G11): parent → each owned child (siblings
@@ -1391,7 +1396,7 @@ pattern applies to any transaction whose first consistent read happens before
 it locks the workflow it appends to.
 
 **G5. A schedule upgrade during a DST fall-back hour can re-target an
-already-materialized occurrence.** T-S1 `Upgraded` resets the cursor to
+already-materialized occurrence.** Before the fix, T-S1 `Upgraded` reset the cursor to
 `next_after(now)` computed on naive local time (`src/schedule.rs` `ScheduleCalendar::next_after`, `next_after_local`,
 `ScheduleRegistry::reconcile_state`). If `now` is in the second pass of a repeated hour, the next
 local occurrence (e.g. `01:30`) may already have a run row from the first

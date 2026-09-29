@@ -81,7 +81,7 @@ State (`INVARIANTS.md` §7.3, reduced):
   topic-lock holder, and each runtime's in-flight T-W1 (`tw1`: phase, sampled
   `now`, remaining topics, candidate set, `wanted`, locked rows, buffered own
   writes, claims made so far).
-- `ghost`: history variables, and `usedTokens` (every UUID generated).
+- `ghost`: history variables, including the last issued tokens and task errors.
 - `now`: DB time, advanced by `Tick`.
 
 Actions, one per committed transaction (T-W1: one per statement group):
@@ -163,8 +163,10 @@ concurrent insert falls back to `DeduplicationConflict` and a locking reload).
   strong fairness of `TW1_ReconcileRow`).
 - `StartOptions.root_workflow_id` and `available_at` on T-X1; admin restart
   and retry (T-A5, T-A6), progress events (T-W4), timers, approvals,
-  schedules. The supervisor restart budget is modeled per runtime and task
-  (`coordErrors`, `dispErrors` against `MAX_TASK_RESTARTS`), not its backoff.
+  schedules. The coordinator restart budget is modeled with `coordErrors`
+  against `MAX_TASK_RESTARTS`; only `LC1_NoEvent` increments it, and S5
+  excludes that error on invariant-preserving paths. Dispatcher errors have
+  no modeled action.
 - Pause sizing: a pause bump needs `maxAttempts + 1 <= MAX_ATTEMPTS` (the
   attempt map's domain); `step` inserts activities with `MAX_ATTEMPTS - 1` or
   `MAX_ATTEMPTS` attempts so a pause can happen.
@@ -185,6 +187,8 @@ order. After each call `lastAction` names the branch taken (for example
 
 Changes in v6 (from v5):
 
+- The internal `dispErrors` ghost field is removed because no model action
+  increments it. This changes no recorded action or view.
 - The recorded activity image (post-images and trigger-captured `External`
   rows) carries `retry_policy_json`. `durable-trace gen` sets a row's
   `invalidBounds` also when that text does not decode as a `RetryPolicy`
@@ -212,6 +216,9 @@ Changes in v5 (from v4):
   `durable-trace gen` no longer inserts an `EnvCorruptActivityBounds(a)`
   before a `TW1_Error`; the raw-SQL bounds edit reaches the model as its
   trigger-captured `EnvSetAct`. New witness `wit_quarantined`.
+- Removed `ghost.opRevoked` and `ghost.opTaskErrors`; operator fence misses
+  leave `coordErrors` at zero, which is what
+  `inv_G1_noSelfCancelFromOperator` checks.
 - `missing_definition` is a skip (`Ok(None)`), not a record; it stays
   unmodeled (F3).
 - N1 fixed: `TX2_RecoverableStart`'s `latest` is the newest generation of
@@ -492,7 +499,7 @@ in-flight simulation T-W1, which block the action):
 
 ### Directed scenarios (`quint test`)
 
-All 56 pass (`durable_tests` 49, `durable_tests_rr` 2, `durable_tests_drift` 1, `durable_tests_env` 4).
+All 65 pass (`durable_tests` 58, `durable_tests_rr` 2, `durable_tests_drift` 1, `durable_tests_env` 4).
 
 | Test | Module | Shows |
 |---|---|---|

@@ -60,7 +60,7 @@ impl DurableActivity for LeasedCleanupActivity {
     const VERSION: i32 = 1;
     const MAX_ATTEMPTS: u32 = 3;
     const TIMEOUT: Duration = Duration::from_millis(60);
-    const LEASE_DURATION: Duration = Duration::from_millis(180);
+    const LEASE_DURATION: Duration = Duration::from_millis(500);
 
     fn topic() -> Self::Topic {
         CaptureTopic
@@ -122,16 +122,15 @@ fn leased_cleanup_worker(
     .expect("worker")
 }
 
-// Budgets: a 180ms lease renewed every 20ms, and a 250ms wait that outlasts
-// one lease, so a reclaim is refused only because renewals continue. Only a
-// host too loaded to run a 20ms heartbeat within 180ms fails this (seen only
-// alongside check.sh; not reproduced under a parallel full suite run).
+// Budgets: a 500ms lease renewed every 20ms, and a 650ms wait that outlasts
+// one lease, so a reclaim is refused only because renewals continue. The
+// lease leaves room for claim-to-handler delay under a parallel suite.
 #[tokio::test]
 async fn timeout_cleanup_renews_lease_until_handler_finishes_before_allowing_retry() {
     let Some(pool) = support::fresh_pool().await else {
         return;
     };
-    let (_, activity_id) = schedule_activity(&pool, "capture", 3, 60, 180).await;
+    let (_, activity_id) = schedule_activity(&pool, "capture", 3, 60, 500).await;
     let mut connection = pool.get().await.expect("connection");
     diesel::update(durable_activity::table.find(activity_id))
         .set((
@@ -150,7 +149,7 @@ async fn timeout_cleanup_renews_lease_until_handler_finishes_before_allowing_ret
     tokio::time::timeout(Duration::from_secs(2), context.cleanup_started.notified())
         .await
         .expect("timeout starts cleanup");
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(650)).await;
     assert!(!AtomicBool::load(&context.cleaned, Ordering::SeqCst));
 
     let replacement = leased_cleanup_worker(

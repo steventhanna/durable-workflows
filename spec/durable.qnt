@@ -170,8 +170,8 @@ module durable {
     noEventError: bool,
     revivedExpiredLease: bool, nextHb: int,
     lastIssuedWf: int -> int, lastIssuedAct: int -> int, taskErrors: int -> int,
-    // restart budget per task (supervisor.rs: cumulative per TaskSpec, in process memory)
-    coordErrors: int -> int, dispErrors: int -> int
+    // Coordinator restart budget; dispatcher errors have no modeled action.
+    coordErrors: int -> int
   }
 
   //--------------------------------------------------------------- variables
@@ -546,9 +546,9 @@ module durable {
     }
   }
 
-  // the supervisor cancels the whole runtime once a task's restart count exceeds MAX_TASK_RESTARTS
+  // A coordinator error beyond the restart budget stops this modeled runtime.
   pure def stoppedRt(g: Ghost, r: int): bool =
-    g.coordErrors.get(r) > MAX_TASK_RESTARTS or g.dispErrors.get(r) > MAX_TASK_RESTARTS
+    g.coordErrors.get(r) > MAX_TASK_RESTARTS
   pure def coordError(g: Ghost, r: int): Ghost =
     g.with("taskErrors", g.taskErrors.setBy(r, x => x + 1)).with("coordErrors", g.coordErrors.setBy(r, x => x + 1))
 
@@ -1231,7 +1231,7 @@ module durable {
                    .with("execs", proc.execs.filter(e => e.rt != r))
                    .with("tw1", proc.tw1.set(r, idleTw1))
                    .with("topicHolder", if (proc.topicHolder == r) 0 else proc.topicHolder),
-           ghost.with("coordErrors", ghost.coordErrors.set(r, 0)).with("dispErrors", ghost.dispErrors.set(r, 0)), "Crash"),
+           ghost.with("coordErrors", ghost.coordErrors.set(r, 0)), "Crash"),
   }
 
   // external write (raw SQL, as the G10 gap test does): activity a's timeout/lease bounds
@@ -1296,7 +1296,7 @@ module durable {
       noEventError: false, revivedExpiredLease: false,
       nextHb: 1,
       lastIssuedWf: WF_IDS.mapBy(w => 0), lastIssuedAct: ACT_IDS.mapBy(a => 0), taskErrors: RUNTIMES.mapBy(r => 0),
-      coordErrors: RUNTIMES.mapBy(r => 0), dispErrors: RUNTIMES.mapBy(r => 0),
+      coordErrors: RUNTIMES.mapBy(r => 0),
     },
     prevWf' = WF_IDS.mapBy(w => "none"),
     prevAct' = ACT_IDS.mapBy(a => "none"),

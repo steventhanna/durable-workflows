@@ -27,8 +27,11 @@ model's invariants hold after each step.
   (29 sites). Outermost-capable exceptions: `DurableStore::cancel_with_conn`
   (`store.rs`), `start_with_conn`,
   `start_or_restart_recoverable_with_conn`,
-  `start_prepared_with_conn`; through `start` /
-  `start_or_restart_recoverable` they are savepoints.
+  `start_prepared_with_conn`. The pool-level `start` and
+  `start_or_restart_recoverable` methods open their own
+  `dialect::transaction` with a `tx::Trace`. The `_with_conn` methods use
+  `tx::caller_transaction`, which uses a savepoint only inside a caller
+  transaction.
 - Fences return `DurableError::FencedWrite` and roll back
   (`coordinator.rs` `ensure_fenced`, `activity_worker.rs` `ensure_fenced`); the coordinator
   propagates them (`coordinator.rs` `WorkflowCoordinator::activate_claim_inner`, G1).
@@ -224,7 +227,7 @@ checks `availableAt >= tnow`.
 | `coordinator.rs` `commit_on_connection`, `commit_wait_transition` | `TC2_Commit` | `TC2_Continue` / `TC2_Complete` / `TC2_RunActivity(…, aNew, topic, maxAttempts, availableAt, tnow)` / `TC2_RunChild(…, key, existing, cNew, tnow)` | variant, new ids, child key; SleepUntil / WaitForApproval → `Unmodeled` |
 | `coordinator.rs` `WorkflowCoordinator::record_activation_failure` | `TC3_ActivationFailure` | `TC3_ActivationFailure(r, w, tok, attempt, maxActivation, availableAt, tnow)` | |
 | `coordinator.rs` `WorkflowCoordinator::activate_claim_inner` on `FencedWrite` | `CoordFenceMiss` (local) | `CoordFenceMiss(r, w, tok)` | |
-| `activity_worker.rs` `claim_one` / `claim_batch` | `TW1_Claim` | `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, claimed)` | per-topic `in_flight`, reconciled list, claims; error (G10) → `TW1_Error` (local) |
+| `activity_worker.rs` `claim_one` / `claim_batch` | `TW1_Claim` | `TW1_Claim(r, tnow, localAvail, reconciled, inFlightSeen, quarantined, claimed)` | per-topic `in_flight`, reconciled and quarantined lists, claims; invalid rows are quarantined (v5+) |
 | `activity_worker.rs` outcome dispatch / timeout | `HandlerReturn` (local) | `HandlerReturn(r, a, tok, outcome)` | |
 | heartbeat failure past `lease_deadline` | `LocalDeadline` (local) | `LocalDeadline(r, a, tok)` | |
 | `heartbeat_once` | `TW2_Send` (local) + `TW2_Commit` | `TW2_Send(r, a, tok, hb)`, `TW2_Commit(hb, sample, leaseExp)` | fence miss → `TW2_FenceMiss`; dropped future → `TW2_Drop` |
@@ -234,7 +237,7 @@ checks `availableAt >= tnow`.
 
 ## 7. Requirements on the Quint model interface
 
-Pinned by `pure val TRACE_IFACE_VERSION = 1`; the generator refuses other
+Pinned by `pure val TRACE_IFACE_VERSION = 6`; the generator refuses other
 versions. Documented in `spec/README.md` "Trace-checking interface".
 
 1. Every choice is a parameter; `nondet` only in `step`.
@@ -250,13 +253,14 @@ versions. Documented in `spec/README.md` "Trace-checking interface".
 7. `kind: str` free; versions unmodeled.
 8. Explicit local actions: `CoordFenceMiss`, `TW3_FenceMiss`,
    `TW2_FenceMiss`, `TW2_Drop`, `LocalDeadline`, `HandlerReturn`,
-   `LC1_NoEvent`, `Crash`, `TW1_Error`.
+   `LC1_NoEvent`, `Crash`. Invalid activity rows appear in the
+   `quarantined` list on `TW1_Claim` (v5+).
 9. Views: `viewWf`, `viewAct`, `viewAtt`, `deliverable`.
 10. Instance constants sized per trace.
 11. Stable invariant names: `safety`, `inv_S17_capAtClaim`,
     `inv_S24_parentWakes`, `inv_G11_cancelReachesChildren`,
-    `inv_N1_tx2OwnLineage`, `inv_S13_topicConcurrency`,
-    `inv_G10_noAttemptCapError`.
+    `inv_G11_cancelReachesGenerations`, `inv_G8_noAncestorWait`,
+    `inv_S13_topicConcurrency`.
 
 ## 8. Replay
 
