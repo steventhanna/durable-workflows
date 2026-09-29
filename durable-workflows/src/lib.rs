@@ -67,7 +67,13 @@ pub use async_trait;
 pub use clock::DbMillis;
 pub use error::{ActivityError, DurableError, WorkflowError};
 pub use flow::{DurableFlow, FlowJournal, JournalEntry, WfCtx, WfError};
-pub use ids::{sql_types, ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
+pub use ids::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
+
+/// SQL types for typed IDs and database timestamps.
+pub mod sql_types {
+    pub use crate::clock::sql_types::DbMillis;
+    pub use crate::ids::sql_types::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
+}
 pub use policy::{
     deterministic_jitter_percentile, BackoffPolicy, RetryPolicy, MAX_RETRY_DELAY_SECS,
 };

@@ -292,8 +292,9 @@ where
                     .order((
                         durable_activity::available_at.asc(),
                         diesel::dsl::case_when(
-                            durable_activity::available_at
-                                .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
+                            durable_activity::available_at.eq(DbMillis::from_database_millis(
+                                crate::transition::CONTINUATION_READY_AT_MILLIS,
+                            )),
                             crate::ids::untyped_id(durable_activity::workflow_id),
                         )
                         .otherwise(crate::ids::untyped_id(durable_activity::id))
@@ -456,8 +457,9 @@ where
                         .order((
                             durable_activity::available_at.asc(),
                             diesel::dsl::case_when(
-                                durable_activity::available_at
-                                    .eq(crate::transition::CONTINUATION_READY_AT_MILLIS),
+                                durable_activity::available_at.eq(DbMillis::from_database_millis(
+                                    crate::transition::CONTINUATION_READY_AT_MILLIS,
+                                )),
                                 crate::ids::untyped_id(durable_activity::workflow_id),
                             )
                             .otherwise(crate::ids::untyped_id(durable_activity::id))
@@ -635,8 +637,8 @@ where
                 attempt_number,
                 worker_id: worker_id.to_string(),
                 lease_token: lease_token.clone(),
-                started_at: now.get(),
-                heartbeat_at: now.get(),
+                started_at: now,
+                heartbeat_at: now,
                 finished_at: None,
                 outcome: None,
                 error_category: None,
@@ -651,7 +653,7 @@ where
         row.attempt_count = attempt_number;
         row.lease_token = Some(lease_token.clone());
         row.lease_owner = Some(worker_id.to_string());
-        row.lease_expires_at = Some(lease_expires_at.get());
+        row.lease_expires_at = Some(lease_expires_at);
         let lease_deadline =
             lease_deadline_from_sample(lease_sample_started, row.lease_duration_millis)?;
         Ok(Some(ActivityClaim {
@@ -1594,7 +1596,7 @@ async fn settle_revoked(
     let (settled_status, available_at) = if workflow_status.is_terminal() {
         (ActivityStatus::Cancelled, row.available_at)
     } else {
-        (ActivityStatus::Pending, now.get())
+        (ActivityStatus::Pending, now)
     };
     let changed = diesel::update(
         durable_activity::table
@@ -1623,7 +1625,9 @@ async fn settle_revoked(
     .await?;
     crate::trace::touch_act(row.id);
     crate::trace::touch_att(row.id, row.attempt_count);
-    Ok(SettledRevoke { available_at })
+    Ok(SettledRevoke {
+        available_at: available_at.get(),
+    })
 }
 
 /// Dead-letters a pending row the claim cannot run (G10) and blocks its
@@ -1694,7 +1698,7 @@ async fn append_activity_history(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason,
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await
@@ -1944,7 +1948,7 @@ async fn wake_workflow(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await?;
@@ -2001,7 +2005,7 @@ async fn block_workflow(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: Some(message.to_string()),
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await

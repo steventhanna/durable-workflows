@@ -1,12 +1,12 @@
-error[E0369]: cannot add `{integer}` to `DbMillis`
+error[E0369]: cannot add `{integer}` to `durable_workflows::DbMillis`
  --> tests/ui/fail/db_millis_add_operator.rs:8:22
   |
 8 |     let _later = now + 1;
   |                  --- ^ - {integer}
   |                  |
-  |                  DbMillis
+  |                  durable_workflows::DbMillis
   |
-note: the foreign item type `DbMillis` doesn't implement `Add<{integer}>`
+note: the foreign item type `durable_workflows::DbMillis` doesn't implement `Add<{integer}>`
  --> src/clock.rs
   |
   | pub struct DbMillis(i64);

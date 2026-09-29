@@ -5,6 +5,8 @@
 //! the reason, so the suite stays green; a passing test refutes its gap and
 //! stays as a regression test.
 
+use durable_workflows::DbMillis;
+
 mod support;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -1325,7 +1327,7 @@ async fn g11_cascade_revokes_a_running_child_activity() {
             durable_activity_attempt::outcome,
             durable_activity_attempt::finished_at,
         ))
-        .first::<(Option<String>, Option<i64>)>(&mut connection)
+        .first::<(Option<String>, Option<DbMillis>)>(&mut connection)
         .await
         .expect("attempt row");
     assert_eq!(outcome.as_deref(), Some("operator_cancelled"));
@@ -1527,7 +1529,9 @@ where
         .saturating_minus_millis(1)
         .get();
     diesel::update(durable_workflow::table.find(workflow_id))
-        .set(durable_workflow::lease_expires_at.eq(Some(expired_at)))
+        .set(
+            durable_workflow::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("claim lease expires");
@@ -2087,7 +2091,7 @@ async fn g10_lease_recovery_requeues_invalid_retry_policy_for_quarantine() {
     diesel::update(durable_activity::table.find(activity(bad_activity)))
         .set((
             durable_activity::retry_policy_json.eq(r#"{"backoff":{"Fixed":{"delay_secs":0}}}"#),
-            durable_activity::lease_expires_at.eq(Some(expired_at)),
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
         ))
         .execute(&mut connection)
         .await
@@ -2864,7 +2868,7 @@ async fn n2_attempt(
             durable_activity_attempt::outcome,
             durable_activity_attempt::finished_at,
         ))
-        .first::<(Option<String>, Option<i64>)>(&mut connection)
+        .first::<(Option<String>, Option<DbMillis>)>(&mut connection)
         .await
         .expect("attempt row");
     (outcome, finished_at.is_some())
@@ -3014,7 +3018,7 @@ async fn n2_crash_while_cancelling_settles_by_lease_reconciliation() {
     )
     .await;
     diesel::update(durable_activity::table.find(a1))
-        .set(durable_activity::lease_expires_at.eq(Some(1_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(1_i64))))
         .execute(&mut connection)
         .await
         .expect("expire a1's lease");

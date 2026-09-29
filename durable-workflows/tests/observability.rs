@@ -171,7 +171,8 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
             durable_workflow::lease_owner.eq(Some("worker-secret".to_string())),
             durable_workflow::lease_token
                 .eq(Some("00000000-0000-0000-0000-000000000999".to_string())),
-            durable_workflow::lease_expires_at.eq(Some(now - 120_000)),
+            durable_workflow::lease_expires_at
+                .eq(Some(DbMillis::from_database_millis(now - 120_000))),
         ))
         .execute(&mut connection)
         .await
@@ -181,7 +182,7 @@ async fn health_scan_classifies_bounded_identifier_only_alerts_and_redacts_paylo
             durable_workflow::status.eq("failed"),
             durable_workflow::error_category.eq(Some("activation".to_string())),
             durable_workflow::error_message.eq(Some("customer-secret-error".to_string())),
-            durable_workflow::completed_at.eq(Some(now - 1)),
+            durable_workflow::completed_at.eq(Some(DbMillis::from_database_millis(now - 1))),
         ))
         .execute(&mut connection)
         .await
@@ -487,7 +488,7 @@ fn activity_row(
         payload_json: r#"{"customer":"customer-secret-activity"}"#.to_string(),
         status: durable_workflows::persistence::ActivityStatus::try_from(status)
             .expect("valid fixture status"),
-        available_at: 0,
+        available_at: DbMillis::from_database_millis(0),
         max_attempts: 1,
         attempt_count: 1,
         timeout_millis: 1_000,
@@ -503,11 +504,15 @@ fn activity_row(
         lease_owner: (status == "running").then(|| "worker-secret".to_string()),
         lease_token: (status == "running")
             .then(|| "00000000-0000-0000-0000-000000000998".to_string()),
-        lease_expires_at: (status == "running").then_some(lease_expires_at),
+        lease_expires_at: (status == "running")
+            .then_some(lease_expires_at)
+            .map(DbMillis::from_database_millis),
         root_activity_id: None,
         replaces_activity_id: None,
-        created_at: 1,
-        updated_at: 1,
-        completed_at: (status == "dead_lettered").then_some(lease_expires_at),
+        created_at: DbMillis::from_database_millis(1),
+        updated_at: DbMillis::from_database_millis(1),
+        completed_at: (status == "dead_lettered")
+            .then_some(lease_expires_at)
+            .map(DbMillis::from_database_millis),
     }
 }

@@ -52,9 +52,7 @@ pub(crate) async fn insert_started<'tx>(
                     actor_type: Some("system".to_string()),
                     actor_id: None,
                     reason: None,
-                    created_at: crate::persistence::database_now_millis(connection)
-                        .await?
-                        .get(),
+                    created_at: crate::persistence::database_now_millis(connection).await?,
                 })
                 .execute(connection)
                 .await?;
@@ -236,7 +234,7 @@ async fn wake_loaded_parent_on_child_terminal(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await?;

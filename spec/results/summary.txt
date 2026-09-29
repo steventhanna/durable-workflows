@@ -1,27 +1,53 @@
+mode full
 typecheck ok
     ok g7ClosedUnderRcTest passed 1 test(s)
     ok g7RcHeartbeatBlockedTest passed 1 test(s)
+    ok reconcileLockSkipKeepsSlotTest passed 1 test(s)
+    ok reconcileLockSkipLaterSweepTest passed 1 test(s)
+    ok unconfirmedRenewalStillFinishesTest passed 1 test(s)
     ok tw1ReplayDetectsCapTest passed 1 test(s)
     ok reconcileReplayDelayTest passed 1 test(s)
     ok reconcileReplayEarlyRejectedTest passed 1 test(s)
-    ok n2CancelFreesSlotTest passed 1 test(s)
-    ok g2StrandedParentTest passed 1 test(s)
+    ok n2CancelKeepsSlotTest passed 1 test(s)
+    ok n2CancelNoSecondClaimTest passed 1 test(s)
+    ok n2RevokeThenSettleTest passed 1 test(s)
+    ok n2RevokedFinishNotAppliedTest passed 1 test(s)
+    ok n2RevokedFinishNoFenceMissTest passed 1 test(s)
+    ok n2ReconcileSettlesCancellingTest passed 1 test(s)
+    ok g2ReattachTest passed 1 test(s)
+    ok d4AttachNewestTest passed 1 test(s)
+    ok d4AttachKeyedRowRejectedTest passed 1 test(s)
+    ok g8SelfKeyRejectedTest passed 1 test(s)
+    ok g8SelfKeyActivationFailureTest passed 1 test(s)
+    ok g8GrandparentKeyRejectedTest passed 1 test(s)
+    ok g8LineageParentKeyRejectedTest passed 1 test(s)
+    ok g8LineageActivationFailureTest passed 1 test(s)
     ok n1WrongLineageTest passed 1 test(s)
+    ok n1SiblingNotSupersededTest passed 1 test(s)
     ok g11CancelTest passed 1 test(s)
+    ok g11GrandchildTest passed 1 test(s)
+    ok g11SuccessorTest passed 1 test(s)
+    ok g11Tx2SupersedeCascadeTest passed 1 test(s)
+    ok g11DomainKeyedChildTest passed 1 test(s)
     ok staleCoordinatorTest passed 1 test(s)
     ok activitySuccessTest passed 1 test(s)
     ok startSemanticsTest passed 1 test(s)
     ok startBothKeysRejectedTest passed 1 test(s)
     ok n3LiveSourceTest passed 1 test(s)
-    ok tx2ConflictTest passed 1 test(s)
+    ok tx2ReturnsNewestGenerationTest passed 1 test(s)
     ok pauseResumeTest passed 1 test(s)
     ok pauseTwiceRejectedTest passed 1 test(s)
     ok resumeNotPausedRejectedTest passed 1 test(s)
-    ok g1SelfCancelTest passed 1 test(s)
-    ok g1StoppedRuntimeClaimsNothingTest passed 1 test(s)
-    ok g1AppCancelNotOperatorTest passed 1 test(s)
-    ok n2PauseFreesSlotTest passed 1 test(s)
+    ok g1NoSelfCancelTest passed 1 test(s)
+    ok g1RuntimeStillClaimsTest passed 1 test(s)
+    ok g1AppCancelFenceMissTest passed 1 test(s)
+    ok n2PauseKeepsSlotTest passed 1 test(s)
+    ok n2PauseNoSecondClaimTest passed 1 test(s)
+    ok n2PauseResumeWaitsForSettleTest passed 1 test(s)
     ok pausedActivityNotClaimedTest passed 1 test(s)
+    ok pausedSettledActivityNotClaimedTest passed 1 test(s)
+    ok n2ReconcileReplaySettlesTest passed 1 test(s)
+    ok n2ReconcileReplayNotRevokedRejectedTest passed 1 test(s)
     ok pausedParentWokenTest passed 1 test(s)
     ok pausedParentResumesWaitingTest passed 1 test(s)
     ok g11AdminCancelTest passed 1 test(s)
@@ -30,18 +56,43 @@ typecheck ok
     ok continuationPriorityNowRejectedTest passed 1 test(s)
     ok noPriorityEarlyRejectedTest passed 1 test(s)
     ok n1ReturnLatestTest passed 1 test(s)
+    ok n1ReturnSiblingRejectedTest passed 1 test(s)
     ok n1ReturnOwnRowTest passed 1 test(s)
-  32 passing (4608ms)
+  58 passing (10831ms)
     ok g7CapExceededTest passed 1 test(s)
     ok g7NeedsSnapshotTest passed 1 test(s)
-  2 passing (316ms)
+  2 passing (388ms)
     ok driftTwoHandlersTest passed 1 test(s)
-  1 passing (163ms)
+  1 passing (204ms)
     ok g10InvalidBoundsTest passed 1 test(s)
     ok g10InvalidRowNotClaimedTest passed 1 test(s)
     ok g10WrongReasonTest passed 1 test(s)
     ok g10ReplayTest passed 1 test(s)
-  4 passing (585ms)
-durable_mc         safety                           expect=hold      got=No violation found   trace_len=41  (140945ms at 142 traces/second) 144s
-durable_mc         safetyRc                         expect=hold      got=No violation found   trace_len=41  (191030ms at 105 traces/second) 194s
-durable_mc         inv_S24_exceptTX2                expect=hold      got=No violation found   trace_len=41  (105104ms at 190 traces/second) 108s
+  4 passing (751ms)
+ok   durable_mc         safety                   expect=hold    got=No_violation_found samples=20000  steps=40 trace_len=41  (164630ms at 121 traces/second) 168s
+ok   durable_mc         safetyRc                 expect=hold    got=No_violation_found samples=20000  steps=40 trace_len=41  (167591ms at 119 traces/second) 171s
+ok   durable_mc_act     safetyRc                 expect=hold    got=No_violation_found samples=20000  steps=40 trace_len=41  (154972ms at 129 traces/second) 158s
+ok   durable_mc_env     safety                   expect=hold    got=No_violation_found samples=20000  steps=40 trace_len=41  (307570ms at 65 traces/second) 311s
+ok   durable_mc_rr      safety                   expect=hold    got=No_violation_found samples=20000  steps=40 trace_len=41  (184407ms at 108 traces/second) 187s
+ok   durable_mc         inv_cancelFormsAgree     expect=hold    got=No_violation_found samples=20000  steps=40 trace_len=41  (203883ms at 98 traces/second) 208s
+ok   durable_mc_env     wit_quarantined          expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=15  (14337ms at 81 traces/second) 17s
+ok   durable_mc         wit_S3_concurrentStep    expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=11  (43224ms at 30 traces/second) 46s
+ok   durable_mc         wit_childSucceeded       expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=9   (5660ms at 173 traces/second) 9s
+ok   durable_mc         wit_coordFenceMiss       expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=7   (396ms at 101 traces/second) 3s
+ok   durable_mc         wit_tw1Interleaved       expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=5   (186ms at 91 traces/second) 4s
+ok   durable_mc         wit_pausedActivity       expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=12  (5267ms at 28 traces/second) 8s
+ok   durable_mc_act     wit_reconciled           expect=violate got=Found_an_issue     samples=20000  steps=40 trace_len=19  (35312ms at 68 traces/second) 38s
+ok   durable_mc_act     wit_blocked              expect=violate got=Found_an_issue     samples=100000 steps=40 trace_len=19  (134377ms at 82 traces/second) 138s
+ok   durable_mc_act     wit_activitySucceeded    expect=violate got=Found_an_issue     samples=250000 steps=40 trace_len=32  (410433ms at 109 traces/second) 413s
+MISS durable_mc_rr      inv_S17_capAlways        expect=seek    got=No_violation_found samples=20000  steps=40 trace_len=41  (196680ms at 102 traces/second) 200s
+MISS durable_mc_act_rr  inv_S17_capAlways        expect=seek    got=No_violation_found samples=20000  steps=40 trace_len=41  (165538ms at 121 traces/second) 169s
+MISS durable_mc_act_rr  inv_S17_capAtClaim       expect=seek    got=No_violation_found samples=20000  steps=40 trace_len=41  (149276ms at 134 traces/second) 153s
+MISS durable_mc_drift   inv_S13_oneHandler       expect=seek    got=No_violation_found samples=20000  steps=40 trace_len=41  (118235ms at 169 traces/second) 121s
+MISS durable_mc         wit_revivedLease         expect=seek    got=No_violation_found samples=20000  steps=40 trace_len=41  (97829ms at 204 traces/second) 101s
+
+Not reached or failed:
+MISS  durable_mc_rr inv_S17_capAlways: not reached in 20000 samples x 40 steps (evidence: g7CapExceededTest)
+MISS  durable_mc_act_rr inv_S17_capAlways: not reached in 20000 samples x 40 steps (evidence: g7CapExceededTest)
+MISS  durable_mc_act_rr inv_S17_capAtClaim: not reached in 20000 samples x 40 steps (evidence: g7CapExceededTest)
+MISS  durable_mc_drift inv_S13_oneHandler: not reached in 20000 samples x 40 steps (evidence: driftTwoHandlersTest)
+MISS  durable_mc wit_revivedLease: not reached in 20000 samples x 40 steps (evidence: g7ClosedUnderRcTest)

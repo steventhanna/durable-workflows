@@ -144,7 +144,7 @@ impl ProgressReporter {
                         total_units: event.total_units,
                         severity: event.severity.as_str().to_string(),
                         metadata_json: event.metadata_json,
-                        created_at: persistence::database_now_millis(connection).await?.get(),
+                        created_at: persistence::database_now_millis(connection).await?,
                     })
                     .execute(connection)
                     .await?;

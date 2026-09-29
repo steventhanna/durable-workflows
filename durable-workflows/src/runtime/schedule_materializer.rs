@@ -161,7 +161,7 @@ where
                 let cursor = ScheduleCursor::load(&schedule_key, &state.next_local_occurrence)?;
                 let mut occurrence = calendar.occurrence_at_local(cursor.local().datetime())?;
                 if occurrence.local_occurrence != state.next_local_occurrence
-                    || occurrence.due_at != state.next_occurrence_at
+                    || occurrence.due_at != state.next_occurrence_at.get()
                 {
                     return Err(DurableError::InvalidState(format!(
                         "schedule {schedule_key} persisted local and UTC occurrences disagree"
@@ -210,7 +210,8 @@ where
                 )
                 .set((
                     durable_schedule_state::next_local_occurrence.eq(cursor.local().to_string()),
-                    durable_schedule_state::next_occurrence_at.eq(occurrence.due_at),
+                    durable_schedule_state::next_occurrence_at
+                        .eq(DbMillis::from_requested_millis(occurrence.due_at)),
                     durable_schedule_state::last_materialized_at.eq(Some(now)),
                     durable_schedule_state::updated_at.eq(now),
                 ))
@@ -361,13 +362,13 @@ where
                 .values(NewScheduleRunRow {
                     schedule_key: target.schedule_key.to_string(),
                     local_occurrence: occurrence.local_occurrence,
-                    scheduled_for: occurrence.scheduled_for,
-                    materialized_at: target.now.get(),
+                    scheduled_for: DbMillis::from_requested_millis(occurrence.scheduled_for),
+                    materialized_at: target.now,
                     status: ScheduleRunStatus::Queued,
                     reason: Some("overlap_queue_one".to_string()),
                     actor_id: None,
                     workflow_id: None,
-                    created_at: target.now.get(),
+                    created_at: target.now,
                 })
                 .execute(connection)
                 .await?;
@@ -389,13 +390,13 @@ where
         NewScheduleRunRow {
             schedule_key: target.schedule_key.to_string(),
             local_occurrence: occurrence.local_occurrence,
-            scheduled_for: occurrence.scheduled_for,
-            materialized_at: target.now.get(),
+            scheduled_for: DbMillis::from_requested_millis(occurrence.scheduled_for),
+            materialized_at: target.now,
             status,
             reason,
             actor_id: None,
             workflow_id: None,
-            created_at: target.now.get(),
+            created_at: target.now,
         },
     )
     .await?;
@@ -494,7 +495,7 @@ where
             context,
             connection,
             schedule_run_id,
-            run.scheduled_for,
+            run.scheduled_for.get(),
         )
         .await?;
     let changed = diesel::update(

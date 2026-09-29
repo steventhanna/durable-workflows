@@ -230,7 +230,7 @@ async fn queue_one_promotes_once_after_the_active_workflow_finishes() {
     diesel::update(durable_workflow::table.find(active_workflow_id))
         .set((
             durable_workflow::status.eq("succeeded"),
-            durable_workflow::completed_at.eq(Some(at_minute(3))),
+            durable_workflow::completed_at.eq(Some(DbMillis::from_database_millis(at_minute(3)))),
         ))
         .execute(&mut connection)
         .await
@@ -273,7 +273,7 @@ async fn complete_workflow(
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("succeeded"),
-            durable_workflow::completed_at.eq(Some(at_minute(1))),
+            durable_workflow::completed_at.eq(Some(DbMillis::from_database_millis(at_minute(1)))),
         ))
         .execute(&mut connection)
         .await

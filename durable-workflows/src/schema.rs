@@ -1,6 +1,6 @@
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::*;
 
     durable_workflow (id) {
         id -> WorkflowId,
@@ -15,13 +15,13 @@ diesel::table! {
         error_message -> Nullable<Text>,
         wait_kind -> Nullable<Text>,
         wait_reference_id -> Nullable<Bigint>,
-        available_at -> Bigint,
+        available_at -> DbMillis,
         activation_attempts -> Integer,
         max_activation_attempts -> Integer,
         consecutive_continuations -> Integer,
         lease_owner -> Nullable<Text>,
         lease_token -> Nullable<Text>,
-        lease_expires_at -> Nullable<Bigint>,
+        lease_expires_at -> Nullable<DbMillis>,
         deduplication_key -> Nullable<Text>,
         schedule_run_id -> Nullable<ScheduleRunId>,
         root_workflow_id -> Nullable<WorkflowId>,
@@ -30,15 +30,15 @@ diesel::table! {
         parent_command_sequence -> Nullable<Integer>,
         command_sequence -> Integer,
         delivered_event_sequence -> Integer,
-        created_at -> Bigint,
-        updated_at -> Bigint,
-        completed_at -> Nullable<Bigint>,
+        created_at -> DbMillis,
+        updated_at -> DbMillis,
+        completed_at -> Nullable<DbMillis>,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::*;
 
     durable_workflow_event (id) {
         id -> Bigint,
@@ -50,13 +50,13 @@ diesel::table! {
         actor_type -> Nullable<Text>,
         actor_id -> Nullable<Text>,
         reason -> Nullable<Text>,
-        created_at -> Bigint,
+        created_at -> DbMillis,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::*;
 
     durable_activity (id) {
         id -> ActivityId,
@@ -68,7 +68,7 @@ diesel::table! {
         topic -> Text,
         payload_json -> Text,
         status -> Text,
-        available_at -> Bigint,
+        available_at -> DbMillis,
         max_attempts -> Integer,
         attempt_count -> Integer,
         timeout_millis -> Bigint,
@@ -80,27 +80,27 @@ diesel::table! {
         last_error_message -> Nullable<Text>,
         lease_owner -> Nullable<Text>,
         lease_token -> Nullable<Text>,
-        lease_expires_at -> Nullable<Bigint>,
+        lease_expires_at -> Nullable<DbMillis>,
         root_activity_id -> Nullable<ActivityId>,
         replaces_activity_id -> Nullable<ActivityId>,
-        created_at -> Bigint,
-        updated_at -> Bigint,
-        completed_at -> Nullable<Bigint>,
+        created_at -> DbMillis,
+        updated_at -> DbMillis,
+        completed_at -> Nullable<DbMillis>,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::*;
 
     durable_activity_attempt (activity_id, attempt_number) {
         activity_id -> ActivityId,
         attempt_number -> Integer,
         worker_id -> Text,
         lease_token -> Text,
-        started_at -> Bigint,
-        heartbeat_at -> Bigint,
-        finished_at -> Nullable<Bigint>,
+        started_at -> DbMillis,
+        heartbeat_at -> DbMillis,
+        finished_at -> Nullable<DbMillis>,
         outcome -> Nullable<Text>,
         error_category -> Nullable<Text>,
         error_message -> Nullable<Text>,
@@ -110,7 +110,7 @@ diesel::table! {
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::*;
 
     durable_progress_event (activity_id, attempt_number, sequence) {
         activity_id -> ActivityId,
@@ -123,13 +123,13 @@ diesel::table! {
         total_units -> Nullable<Bigint>,
         severity -> Text,
         metadata_json -> Nullable<Text>,
-        created_at -> Bigint,
+        created_at -> DbMillis,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::*;
 
     durable_approval (id) {
         id -> ApprovalId,
@@ -141,54 +141,60 @@ diesel::table! {
         validation_schema_json -> Text,
         validation_version -> Integer,
         status -> Text,
-        requested_at -> Bigint,
-        expires_at -> Nullable<Bigint>,
+        requested_at -> DbMillis,
+        expires_at -> Nullable<DbMillis>,
         decision_payload_json -> Nullable<Text>,
         decided_by -> Nullable<Integer>,
         operator_reason -> Nullable<Text>,
-        resolved_at -> Nullable<Bigint>,
-    }
-}
-
-diesel::table! {
-    durable_schedule_state (schedule_key) {
-        schedule_key -> Text,
-        definition_fingerprint -> Text,
-        definition_version -> Integer,
-        next_local_occurrence -> Text,
-        next_occurrence_at -> Bigint,
-        last_materialized_at -> Nullable<Bigint>,
-        paused_at -> Nullable<Bigint>,
-        paused_by -> Nullable<Integer>,
-        pause_reason -> Nullable<Text>,
-        created_at -> Bigint,
-        updated_at -> Bigint,
+        resolved_at -> Nullable<DbMillis>,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
-    use crate::ids::sql_types::*;
+    use crate::sql_types::DbMillis;
+
+    durable_schedule_state (schedule_key) {
+        schedule_key -> Text,
+        definition_fingerprint -> Text,
+        definition_version -> Integer,
+        next_local_occurrence -> Text,
+        next_occurrence_at -> DbMillis,
+        last_materialized_at -> Nullable<DbMillis>,
+        paused_at -> Nullable<DbMillis>,
+        paused_by -> Nullable<Integer>,
+        pause_reason -> Nullable<Text>,
+        created_at -> DbMillis,
+        updated_at -> DbMillis,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use crate::sql_types::*;
 
     durable_schedule_run (id) {
         id -> ScheduleRunId,
         schedule_key -> Text,
         local_occurrence -> Text,
-        scheduled_for -> Bigint,
-        materialized_at -> Bigint,
+        scheduled_for -> DbMillis,
+        materialized_at -> DbMillis,
         status -> Text,
         reason -> Nullable<Text>,
         actor_id -> Nullable<Integer>,
         workflow_id -> Nullable<WorkflowId>,
-        created_at -> Bigint,
+        created_at -> DbMillis,
     }
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use crate::sql_types::DbMillis;
+
     durable_topic_lock (topic) {
         topic -> Text,
         max_concurrency -> Integer,
-        updated_at -> Bigint,
+        updated_at -> DbMillis,
     }
 }
 

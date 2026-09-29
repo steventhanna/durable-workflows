@@ -300,8 +300,8 @@ async fn reconcile_in_the_second_pass_of_a_fall_back_hour_yields_a_cursor_after_
     );
     let state = persisted_state(&pool).await;
     assert_eq!(state.next_local_occurrence, "2026-11-02T01:30:00");
-    assert_eq!(state.next_occurrence_at, utc(11, 2, 8, 30));
-    assert!(state.next_occurrence_at > second_pass);
+    assert_eq!(state.next_occurrence_at.get(), utc(11, 2, 8, 30));
+    assert!(state.next_occurrence_at.get() > second_pass);
 
     let mut connection = pool.get().await.expect("test connection");
     support::drop_durable_tables(&mut connection).await;
@@ -350,7 +350,7 @@ async fn upgrade_in_the_second_pass_does_not_retarget_the_materialized_occurrenc
     let upgraded = persisted_state(&pool).await;
     assert_eq!(upgraded.definition_version, 2);
     assert_eq!(upgraded.next_local_occurrence, "2026-11-02T01:30:00");
-    assert!(upgraded.next_occurrence_at > second_pass);
+    assert!(upgraded.next_occurrence_at.get() > second_pass);
 
     let next_day = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v2)
         .materialize_schedule(
@@ -412,7 +412,7 @@ async fn upgrade_to_an_earlier_slot_runs_it_today() {
     );
     let upgraded = persisted_state(&pool).await;
     assert_eq!(upgraded.next_local_occurrence, "2026-01-11T07:00:00");
-    assert_eq!(upgraded.next_occurrence_at, utc(1, 11, 14, 0));
+    assert_eq!(upgraded.next_occurrence_at.get(), utc(1, 11, 14, 0));
 
     let today = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v2)
         .materialize_schedule(
@@ -467,7 +467,7 @@ async fn upgrade_to_a_western_timezone_does_not_retarget_a_materialized_occurren
     );
     let upgraded = persisted_state(&pool).await;
     assert_eq!(upgraded.next_local_occurrence, "2026-01-11T04:00:00");
-    assert!(upgraded.next_occurrence_at > now);
+    assert!(upgraded.next_occurrence_at.get() > now);
 
     let utc_tick = ScheduleMaterializer::new(pool.clone(), Arc::new(()), v2)
         .materialize_schedule(UtcV2::KEY, DbMillis::from_database_millis(utc(1, 11, 4, 1)))

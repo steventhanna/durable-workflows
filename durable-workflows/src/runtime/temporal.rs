@@ -127,7 +127,7 @@ impl ApprovalExpiryMaterializer {
                 if approval.status != ApprovalStatus::Pending
                     || approval
                         .expires_at
-                        .is_none_or(|expires_at| expires_at > now.get())
+                        .is_none_or(|expires_at| expires_at > now)
                 {
                     return Ok(trace.unchanged(None));
                 }
@@ -233,7 +233,7 @@ async fn append_delivery_event(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await

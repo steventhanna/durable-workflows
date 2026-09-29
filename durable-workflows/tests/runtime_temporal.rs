@@ -118,7 +118,8 @@ async fn seed_timer(pool: &durable_workflows::DurablePool, now: i64) -> Workflow
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
             durable_workflow::wait_reference_id.eq(Some(1_i64)),
-            durable_workflow::available_at.eq(now.saturating_sub(1)),
+            durable_workflow::available_at
+                .eq(DbMillis::from_database_millis(now.saturating_sub(1))),
             durable_workflow::command_sequence.eq(1),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -141,8 +142,8 @@ async fn seed_expired_approval(pool: &durable_workflows::DurablePool, now: i64) 
             validation_schema_json: "{}".to_string(),
             validation_version: 1,
             status: durable_workflows::persistence::ApprovalStatus::Pending,
-            requested_at: now.saturating_sub(1_000),
-            expires_at: Some(now.saturating_sub(1)),
+            requested_at: DbMillis::from_database_millis(now.saturating_sub(1_000)),
+            expires_at: Some(DbMillis::from_database_millis(now.saturating_sub(1))),
             decision_payload_json: None,
             decided_by: None,
             operator_reason: None,

@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use async_trait::async_trait;
@@ -145,7 +146,7 @@ async fn schedule_activity(
                 .expect("payload"),
             status: durable_workflows::persistence::ActivityStatus::try_from("pending")
                 .expect("valid fixture status"),
-            available_at: now,
+            available_at: DbMillis::from_database_millis(now),
             max_attempts,
             attempt_count: 0,
             timeout_millis,
@@ -161,8 +162,8 @@ async fn schedule_activity(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: DbMillis::from_database_millis(now),
+            updated_at: DbMillis::from_database_millis(now),
             completed_at: None,
         })
         .execute(&mut connection)
@@ -371,7 +372,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
     .await;
     let mut connection = pool.get().await.expect("connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(1_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(1_i64))))
         .execute(&mut connection)
         .await
         .expect("expire lease");

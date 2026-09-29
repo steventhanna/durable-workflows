@@ -296,7 +296,7 @@ async fn run_latest_records_backlog_starts_one_and_is_multi_instance_exactly_onc
     assert_eq!(workflow_schedule_run, Some(started.id));
     let schedule_state = state(&pool, LatestSchedule::KEY).await;
     assert_eq!(schedule_state.next_local_occurrence, "2026-01-04T08:00:00");
-    assert!(schedule_state.next_occurrence_at > now);
+    assert!(schedule_state.next_occurrence_at.get() > now);
 }
 
 #[tokio::test]
@@ -459,7 +459,7 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
     );
     let after = state(&pool, ScanBoundSchedule::KEY).await;
     assert!(after.next_local_occurrence > before.next_local_occurrence);
-    assert_eq!(after.next_occurrence_at, beyond_bound);
+    assert_eq!(after.next_occurrence_at.get(), beyond_bound);
     assert_eq!(runs(&pool, ScanBoundSchedule::KEY).await.len(), 10_000);
     let second = materializer
         .materialize_schedule(
@@ -473,6 +473,7 @@ async fn dst_gap_is_recorded_and_over_bound_backlog_recovers_atomically() {
         state(&pool, ScanBoundSchedule::KEY)
             .await
             .next_occurrence_at
+            .get()
             > beyond_bound
     );
     let repeated = materializer

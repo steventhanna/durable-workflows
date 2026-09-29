@@ -392,6 +392,7 @@ where
                 resource: "schedule definition",
                 identifier: key.to_string(),
             })?;
+        let now = deployed_at;
         let deployed_at =
             DateTime::<Utc>::from_timestamp_millis(deployed_at.get()).ok_or_else(|| {
                 DurableError::InvalidDefinition(
@@ -401,7 +402,6 @@ where
         let next = definition.calendar.next_after(deployed_at)?;
         let calendar = definition.calendar.clone();
         let metadata = definition.metadata.clone();
-        let now = deployed_at.timestamp_millis();
         let mut connection = pool.get().await?;
         crate::dialect::transaction(
             &mut connection,
@@ -420,7 +420,7 @@ where
                         next_local_occurrence: ScheduleCursor::initial(next.local())
                             .local()
                             .to_string(),
-                        next_occurrence_at: next.due_at,
+                        next_occurrence_at: crate::DbMillis::from_requested_millis(next.due_at),
                         last_materialized_at: None,
                         paused_at: None,
                         paused_by: None,
@@ -464,7 +464,8 @@ where
                         durable_schedule_state::definition_version.eq(metadata.version),
                         durable_schedule_state::next_local_occurrence
                             .eq(cursor.local().to_string()),
-                        durable_schedule_state::next_occurrence_at.eq(target.due_at),
+                        durable_schedule_state::next_occurrence_at
+                            .eq(crate::DbMillis::from_requested_millis(target.due_at)),
                         durable_schedule_state::updated_at.eq(now),
                     ))
                     .execute(connection)

@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
@@ -22,10 +23,10 @@ async fn persisted_workflow_row_rejects_unknown_status() {
             durable_workflow::input_json.eq("null"),
             durable_workflow::state_json.eq("null"),
             durable_workflow::status.eq("unknown_workflow_status"),
-            durable_workflow::available_at.eq(0_i64),
+            durable_workflow::available_at.eq(DbMillis::from_database_millis(0_i64)),
             durable_workflow::max_activation_attempts.eq(1),
-            durable_workflow::created_at.eq(0_i64),
-            durable_workflow::updated_at.eq(0_i64),
+            durable_workflow::created_at.eq(DbMillis::from_database_millis(0_i64)),
+            durable_workflow::updated_at.eq(DbMillis::from_database_millis(0_i64)),
         ))
         .execute(&mut connection)
         .await
@@ -59,10 +60,10 @@ async fn persisted_activity_row_rejects_unknown_status() {
             durable_workflow::input_json.eq("null"),
             durable_workflow::state_json.eq("null"),
             durable_workflow::status.eq("ready"),
-            durable_workflow::available_at.eq(0_i64),
+            durable_workflow::available_at.eq(DbMillis::from_database_millis(0_i64)),
             durable_workflow::max_activation_attempts.eq(1),
-            durable_workflow::created_at.eq(0_i64),
-            durable_workflow::updated_at.eq(0_i64),
+            durable_workflow::created_at.eq(DbMillis::from_database_millis(0_i64)),
+            durable_workflow::updated_at.eq(DbMillis::from_database_millis(0_i64)),
         ))
         .execute(&mut connection)
         .await
@@ -78,13 +79,13 @@ async fn persisted_activity_row_rejects_unknown_status() {
             durable_activity::topic.eq("status_test"),
             durable_activity::payload_json.eq("null"),
             durable_activity::status.eq("unknown_activity_status"),
-            durable_activity::available_at.eq(0_i64),
+            durable_activity::available_at.eq(DbMillis::from_database_millis(0_i64)),
             durable_activity::max_attempts.eq(1),
             durable_activity::timeout_millis.eq(1_i64),
             durable_activity::lease_duration_millis.eq(1_i64),
             durable_activity::retry_policy_json.eq("{}"),
-            durable_activity::created_at.eq(0_i64),
-            durable_activity::updated_at.eq(0_i64),
+            durable_activity::created_at.eq(DbMillis::from_database_millis(0_i64)),
+            durable_activity::updated_at.eq(DbMillis::from_database_millis(0_i64)),
         ))
         .execute(&mut connection)
         .await
@@ -117,10 +118,10 @@ async fn persisted_statuses_preserve_database_and_json_spellings() {
             durable_workflow::input_json.eq("null"),
             durable_workflow::state_json.eq("null"),
             durable_workflow::status.eq("ready"),
-            durable_workflow::available_at.eq(0_i64),
+            durable_workflow::available_at.eq(DbMillis::from_database_millis(0_i64)),
             durable_workflow::max_activation_attempts.eq(1),
-            durable_workflow::created_at.eq(0_i64),
-            durable_workflow::updated_at.eq(0_i64),
+            durable_workflow::created_at.eq(DbMillis::from_database_millis(0_i64)),
+            durable_workflow::updated_at.eq(DbMillis::from_database_millis(0_i64)),
         ))
         .execute(&mut connection)
         .await
@@ -136,13 +137,13 @@ async fn persisted_statuses_preserve_database_and_json_spellings() {
             durable_activity::topic.eq("status_test"),
             durable_activity::payload_json.eq("null"),
             durable_activity::status.eq("pending"),
-            durable_activity::available_at.eq(0_i64),
+            durable_activity::available_at.eq(DbMillis::from_database_millis(0_i64)),
             durable_activity::max_attempts.eq(1),
             durable_activity::timeout_millis.eq(1_i64),
             durable_activity::lease_duration_millis.eq(1_i64),
             durable_activity::retry_policy_json.eq("{}"),
-            durable_activity::created_at.eq(0_i64),
-            durable_activity::updated_at.eq(0_i64),
+            durable_activity::created_at.eq(DbMillis::from_database_millis(0_i64)),
+            durable_activity::updated_at.eq(DbMillis::from_database_millis(0_i64)),
         ))
         .execute(&mut connection)
         .await

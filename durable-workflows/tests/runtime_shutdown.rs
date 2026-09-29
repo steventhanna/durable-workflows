@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{
@@ -353,7 +354,7 @@ async fn schedule_activity_payload(
             payload_json,
             status: durable_workflows::persistence::ActivityStatus::try_from("pending")
                 .expect("valid fixture status"),
-            available_at: now.get(),
+            available_at: now,
             max_attempts,
             attempt_count: 0,
             timeout_millis,
@@ -369,8 +370,8 @@ async fn schedule_activity_payload(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now.get(),
-            updated_at: now.get(),
+            created_at: now,
+            updated_at: now,
             completed_at: None,
         })
         .execute(&mut connection)
@@ -408,7 +409,7 @@ async fn set_activity_available_in(
         .expect("database clock");
     let delay = i64::try_from(delay.as_millis()).expect("delay fits in millis");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(now.get() + delay))
+        .set(durable_activity::available_at.eq(DbMillis::from_database_millis(now.get() + delay)))
         .execute(&mut connection)
         .await
         .expect("activity availability update");
@@ -662,7 +663,9 @@ async fn bounded_shutdown_leaves_a_lease_for_a_second_runtime_to_recover() {
     let mut connection = pool.get().await.expect("test connection");
     let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire abandoned lease");
@@ -677,7 +680,11 @@ async fn bounded_shutdown_leaves_a_lease_for_a_second_runtime_to_recover() {
     assert_eq!(pending.attempt_count, 1);
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(support::db_now_on(&mut connection).await))
+        .set(
+            durable_activity::available_at.eq(DbMillis::from_database_millis(
+                support::db_now_on(&mut connection).await,
+            )),
+        )
         .execute(&mut connection)
         .await
         .expect("make recovered work due");
@@ -929,7 +936,9 @@ async fn bounded_shutdown_stops_heartbeats_and_a_second_runtime_recovers() {
     let mut connection = pool.get().await.expect("test connection");
     let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire abandoned lease");
@@ -944,7 +953,11 @@ async fn bounded_shutdown_stops_heartbeats_and_a_second_runtime_recovers() {
     assert_eq!(pending.attempt_count, 1);
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(support::db_now_on(&mut connection).await))
+        .set(
+            durable_activity::available_at.eq(DbMillis::from_database_millis(
+                support::db_now_on(&mut connection).await,
+            )),
+        )
         .execute(&mut connection)
         .await
         .expect("make retry due");
@@ -1045,7 +1058,9 @@ async fn panicking_worker_is_reported_restarted_and_recovered_to_dead_letter() {
     let mut connection = pool.get().await.expect("test connection");
     let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire panicked lease");

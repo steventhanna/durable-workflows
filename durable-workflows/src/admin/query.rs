@@ -13,7 +13,7 @@ use crate::{
         durable_activity, durable_activity_attempt, durable_approval, durable_progress_event,
         durable_workflow, durable_workflow_event,
     },
-    ActivityId, ApprovalId, DurableError, DurablePool, ScheduleRunId, WorkflowId,
+    ActivityId, ApprovalId, DbMillis, DurableError, DurablePool, ScheduleRunId, WorkflowId,
 };
 
 // Postgres returns int4 and MySQL returns BIGINT; declare the narrower type and
@@ -43,9 +43,9 @@ struct WorkflowProjection {
     result_bytes: Option<i64>,
     error_category: Option<String>,
     error_message: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-    completed_at: Option<i64>,
+    created_at: DbMillis,
+    updated_at: DbMillis,
+    completed_at: Option<DbMillis>,
 }
 
 #[derive(diesel::Queryable)]
@@ -63,9 +63,9 @@ struct WorkflowDetailProjection {
     result_json: Option<String>,
     error_category: Option<String>,
     error_message: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-    completed_at: Option<i64>,
+    created_at: DbMillis,
+    updated_at: DbMillis,
+    completed_at: Option<DbMillis>,
 }
 
 #[derive(diesel::Queryable)]
@@ -86,10 +86,10 @@ struct ActivityProjection {
     provider_result_bytes: Option<i64>,
     last_error_category: Option<String>,
     last_error_message: Option<String>,
-    available_at: i64,
-    created_at: i64,
-    updated_at: i64,
-    completed_at: Option<i64>,
+    available_at: DbMillis,
+    created_at: DbMillis,
+    updated_at: DbMillis,
+    completed_at: Option<DbMillis>,
 }
 
 #[derive(diesel::Queryable)]
@@ -110,10 +110,10 @@ struct ActivityDetailProjection {
     provider_result_json: Option<String>,
     last_error_category: Option<String>,
     last_error_message: Option<String>,
-    available_at: i64,
-    created_at: i64,
-    updated_at: i64,
-    completed_at: Option<i64>,
+    available_at: DbMillis,
+    created_at: DbMillis,
+    updated_at: DbMillis,
+    completed_at: Option<DbMillis>,
 }
 
 #[derive(diesel::Queryable)]
@@ -121,9 +121,9 @@ struct AttemptProjection {
     activity_id: ActivityId,
     attempt_number: i32,
     worker_id: String,
-    started_at: i64,
-    heartbeat_at: i64,
-    finished_at: Option<i64>,
+    started_at: DbMillis,
+    heartbeat_at: DbMillis,
+    finished_at: Option<DbMillis>,
     outcome: Option<AttemptOutcome>,
     error_category: Option<String>,
     error_message: Option<String>,
@@ -135,9 +135,9 @@ struct AttemptDetailProjection {
     activity_id: ActivityId,
     attempt_number: i32,
     worker_id: String,
-    started_at: i64,
-    heartbeat_at: i64,
-    finished_at: Option<i64>,
+    started_at: DbMillis,
+    heartbeat_at: DbMillis,
+    finished_at: Option<DbMillis>,
     outcome: Option<AttemptOutcome>,
     error_category: Option<String>,
     error_message: Option<String>,
@@ -154,9 +154,9 @@ struct ApprovalProjection {
     decision_bytes: Option<i64>,
     decided_by: Option<i32>,
     operator_reason: Option<String>,
-    requested_at: i64,
-    expires_at: Option<i64>,
-    resolved_at: Option<i64>,
+    requested_at: DbMillis,
+    expires_at: Option<DbMillis>,
+    resolved_at: Option<DbMillis>,
 }
 
 struct TimelineEnvelope {
@@ -281,15 +281,16 @@ macro_rules! apply_numeric_timeline_cursor {
         let mut query = $query;
         let source_rank: u8 = $rank;
         if let Some(cursor) = $cursor {
+            let timestamp = DbMillis::from_database_millis(cursor.timestamp);
             query = if source_rank < cursor.rank {
-                query.filter($time.gt(cursor.timestamp))
+                query.filter($time.gt(timestamp))
             } else if source_rank > cursor.rank {
-                query.filter($time.ge(cursor.timestamp))
+                query.filter($time.ge(timestamp))
             } else {
                 query.filter(
                     $time
-                        .gt(cursor.timestamp)
-                        .or($time.eq(cursor.timestamp).and($id.gt(cursor.id))),
+                        .gt(timestamp)
+                        .or($time.eq(timestamp).and($id.gt(cursor.id))),
                 )
             };
         }
@@ -301,28 +302,27 @@ macro_rules! apply_attempt_timeline_cursor {
     ($query:expr, $cursor:expr) => {{
         let mut query = $query;
         if let Some(cursor) = $cursor {
+            let timestamp = DbMillis::from_database_millis(cursor.timestamp);
             query = if 2 < cursor.rank {
-                query.filter(durable_activity_attempt::started_at.gt(cursor.timestamp))
+                query.filter(durable_activity_attempt::started_at.gt(timestamp))
             } else if 2 > cursor.rank {
-                query.filter(durable_activity_attempt::started_at.ge(cursor.timestamp))
+                query.filter(durable_activity_attempt::started_at.ge(timestamp))
             } else {
                 query.filter(
-                    durable_activity_attempt::started_at
-                        .gt(cursor.timestamp)
-                        .or(durable_activity_attempt::started_at
-                            .eq(cursor.timestamp)
-                            .and(
-                                crate::ids::untyped_id(durable_activity_attempt::activity_id)
-                                    .gt(cursor.id)
-                                    .or(crate::ids::untyped_id(
-                                        durable_activity_attempt::activity_id,
-                                    )
-                                    .eq(cursor.id)
-                                    .and(
-                                        durable_activity_attempt::attempt_number
-                                            .gt(cursor.attempt_number),
-                                    )),
-                            )),
+                    durable_activity_attempt::started_at.gt(timestamp).or(
+                        durable_activity_attempt::started_at.eq(timestamp).and(
+                            crate::ids::untyped_id(durable_activity_attempt::activity_id)
+                                .gt(cursor.id)
+                                .or(
+                                    crate::ids::untyped_id(durable_activity_attempt::activity_id)
+                                        .eq(cursor.id)
+                                        .and(
+                                            durable_activity_attempt::attempt_number
+                                                .gt(cursor.attempt_number),
+                                        ),
+                                ),
+                        ),
+                    ),
                 )
             };
         }
@@ -334,14 +334,15 @@ macro_rules! apply_progress_timeline_cursor {
     ($query:expr, $cursor:expr) => {{
         let mut query = $query;
         if let Some(cursor) = $cursor {
+            let timestamp = DbMillis::from_database_millis(cursor.timestamp);
             query = if 3 < cursor.rank {
-                query.filter(durable_progress_event::created_at.gt(cursor.timestamp))
+                query.filter(durable_progress_event::created_at.gt(timestamp))
             } else if 3 > cursor.rank {
-                query.filter(durable_progress_event::created_at.ge(cursor.timestamp))
+                query.filter(durable_progress_event::created_at.ge(timestamp))
             } else {
                 query.filter(
-                    durable_progress_event::created_at.gt(cursor.timestamp).or(
-                        durable_progress_event::created_at.eq(cursor.timestamp).and(
+                    durable_progress_event::created_at.gt(timestamp).or(
+                        durable_progress_event::created_at.eq(timestamp).and(
                             crate::ids::untyped_id(durable_progress_event::activity_id)
                                 .gt(cursor.id)
                                 .or(crate::ids::untyped_id(durable_progress_event::activity_id)
@@ -404,10 +405,14 @@ impl AdminQueryService {
             query = query.filter(durable_workflow::root_workflow_id.eq(root_workflow_id));
         }
         if let Some(created_after) = filter.created_after {
-            query = query.filter(durable_workflow::created_at.ge(created_after));
+            query = query.filter(
+                durable_workflow::created_at.ge(DbMillis::from_requested_millis(created_after)),
+            );
         }
         if let Some(created_before) = filter.created_before {
-            query = query.filter(durable_workflow::created_at.lt(created_before));
+            query = query.filter(
+                durable_workflow::created_at.lt(DbMillis::from_requested_millis(created_before)),
+            );
         }
         // Filter on wait_kind so paused approval waits remain visible; status
         // alone excludes paused rows that still hold a pending approval.
@@ -421,6 +426,7 @@ impl AdminQueryService {
             );
         }
         if let Some((timestamp, id)) = cursor {
+            let timestamp = DbMillis::from_database_millis(timestamp);
             query = query.filter(
                 durable_workflow::created_at
                     .lt(timestamp)
@@ -486,12 +492,17 @@ impl AdminQueryService {
             query = query.filter(durable_activity::status.eq(status));
         }
         if let Some(created_after) = filter.created_after {
-            query = query.filter(durable_activity::created_at.ge(created_after));
+            query = query.filter(
+                durable_activity::created_at.ge(DbMillis::from_requested_millis(created_after)),
+            );
         }
         if let Some(created_before) = filter.created_before {
-            query = query.filter(durable_activity::created_at.lt(created_before));
+            query = query.filter(
+                durable_activity::created_at.lt(DbMillis::from_requested_millis(created_before)),
+            );
         }
         if let Some((timestamp, id)) = cursor {
+            let timestamp = DbMillis::from_database_millis(timestamp);
             query = query.filter(
                 durable_activity::created_at
                     .lt(timestamp)
@@ -653,7 +664,7 @@ impl AdminQueryService {
                 Option<i64>,
                 Option<i64>,
                 String,
-                i64,
+                DbMillis,
             )>(&mut connection)
             .await?;
         let progress_have_more = progress.len() > progress_limit as usize;
@@ -747,19 +758,19 @@ impl AdminQueryService {
                 Option<String>,
                 Option<String>,
                 Option<String>,
-                i64,
+                DbMillis,
             )>(&mut connection)
             .await?
         {
             timeline.push(TimelineEnvelope {
-                occurred_at: created_at,
+                occurred_at: created_at.get(),
                 tie_breaker: timeline_key(0, &[id]),
                 entry: TimelineEntry::WorkflowEvent {
                     event_type,
                     actor_type,
                     actor_id,
                     reason,
-                    occurred_at: created_at,
+                    occurred_at: created_at.get(),
                 },
             });
         }
@@ -784,7 +795,7 @@ impl AdminQueryService {
             .load::<ActivityProjection>(&mut connection)
             .await?
         {
-            let occurred_at = row.created_at;
+            let occurred_at = row.created_at.get();
             let id = row.id;
             timeline.push(TimelineEnvelope {
                 occurred_at,
@@ -824,7 +835,7 @@ impl AdminQueryService {
             .load::<AttemptProjection>(&mut connection)
             .await?
         {
-            let occurred_at = row.started_at;
+            let occurred_at = row.started_at.get();
             let tie_breaker =
                 timeline_key(2, &[row.activity_id.get(), i64::from(row.attempt_number)]);
             timeline.push(TimelineEnvelope {
@@ -870,11 +881,11 @@ impl AdminQueryService {
                 Option<i64>,
                 Option<i64>,
                 String,
-                i64,
+                DbMillis,
             )>(&mut connection)
             .await?
         {
-            let occurred_at = row.8;
+            let occurred_at = row.8.get();
             let tie_breaker = timeline_key(3, &[row.0.get(), i64::from(row.1), i64::from(row.2)]);
             timeline.push(TimelineEnvelope {
                 occurred_at,
@@ -916,7 +927,7 @@ impl AdminQueryService {
             .load::<ApprovalProjection>(&mut connection)
             .await?
         {
-            let occurred_at = row.requested_at;
+            let occurred_at = row.requested_at.get();
             let id = row.id;
             timeline.push(TimelineEnvelope {
                 occurred_at,
@@ -967,7 +978,7 @@ fn page_workflows(
                 encode_cursor(
                     "workflows",
                     &CursorPosition {
-                        timestamp: row.created_at,
+                        timestamp: row.created_at.get(),
                         tie_breaker: row.id.to_string(),
                     },
                 )
@@ -999,7 +1010,7 @@ fn page_activities(
                 encode_cursor(
                     "activities",
                     &CursorPosition {
-                        timestamp: row.created_at,
+                        timestamp: row.created_at.get(),
                         tie_breaker: row.id.to_string(),
                     },
                 )
@@ -1032,9 +1043,9 @@ fn workflow_summary(row: WorkflowProjection) -> Result<WorkflowSummary, DurableE
         result: optional_json_summary(row.result_bytes)?,
         error_category: row.error_category,
         error_message: row.error_message,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        completed_at: row.completed_at,
+        created_at: row.created_at.get(),
+        updated_at: row.updated_at.get(),
+        completed_at: row.completed_at.map(DbMillis::get),
     })
 }
 
@@ -1053,9 +1064,9 @@ fn workflow_detail_summary(row: WorkflowDetailProjection) -> Result<WorkflowSumm
         result: JsonFieldSummary::from_optional_json(row.result_json.as_deref())?,
         error_category: row.error_category,
         error_message: row.error_message,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        completed_at: row.completed_at,
+        created_at: row.created_at.get(),
+        updated_at: row.updated_at.get(),
+        completed_at: row.completed_at.map(DbMillis::get),
     })
 }
 
@@ -1077,14 +1088,16 @@ fn activity_summary(row: ActivityProjection) -> Result<ActivitySummary, DurableE
         provider_result: optional_json_summary(row.provider_result_bytes)?,
         error_category: row.last_error_category,
         error_message: row.last_error_message,
-        available_at: if row.available_at == crate::transition::CONTINUATION_READY_AT_MILLIS {
-            row.created_at
-        } else {
-            row.available_at
-        },
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        completed_at: row.completed_at,
+        available_at:
+            if row.available_at.get() == crate::transition::CONTINUATION_READY_AT_MILLIS {
+                row.created_at
+            } else {
+                row.available_at
+            }
+            .get(),
+        created_at: row.created_at.get(),
+        updated_at: row.updated_at.get(),
+        completed_at: row.completed_at.map(DbMillis::get),
     })
 }
 
@@ -1106,14 +1119,16 @@ fn activity_detail_summary(row: ActivityDetailProjection) -> Result<ActivitySumm
         provider_result: JsonFieldSummary::from_optional_json(row.provider_result_json.as_deref())?,
         error_category: row.last_error_category,
         error_message: row.last_error_message,
-        available_at: if row.available_at == crate::transition::CONTINUATION_READY_AT_MILLIS {
-            row.created_at
-        } else {
-            row.available_at
-        },
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        completed_at: row.completed_at,
+        available_at:
+            if row.available_at.get() == crate::transition::CONTINUATION_READY_AT_MILLIS {
+                row.created_at
+            } else {
+                row.available_at
+            }
+            .get(),
+        created_at: row.created_at.get(),
+        updated_at: row.updated_at.get(),
+        completed_at: row.completed_at.map(DbMillis::get),
     })
 }
 
@@ -1122,9 +1137,9 @@ fn attempt_summary(row: AttemptProjection) -> Result<ActivityAttemptSummary, Dur
         activity_id: row.activity_id,
         attempt_number: row.attempt_number,
         worker_id: row.worker_id,
-        started_at: row.started_at,
-        heartbeat_at: row.heartbeat_at,
-        finished_at: row.finished_at,
+        started_at: row.started_at.get(),
+        heartbeat_at: row.heartbeat_at.get(),
+        finished_at: row.finished_at.map(DbMillis::get),
         outcome: row.outcome.map(|outcome| outcome.to_string()),
         error_category: row.error_category,
         error_message: row.error_message,
@@ -1139,9 +1154,9 @@ fn attempt_detail_summary(
         activity_id: row.activity_id,
         attempt_number: row.attempt_number,
         worker_id: row.worker_id,
-        started_at: row.started_at,
-        heartbeat_at: row.heartbeat_at,
-        finished_at: row.finished_at,
+        started_at: row.started_at.get(),
+        heartbeat_at: row.heartbeat_at.get(),
+        finished_at: row.finished_at.map(DbMillis::get),
         outcome: row.outcome.map(|outcome| outcome.to_string()),
         error_category: row.error_category,
         error_message: row.error_message,
@@ -1159,9 +1174,9 @@ fn approval_summary(row: ApprovalProjection) -> Result<ApprovalSummary, DurableE
         decision: optional_json_summary(row.decision_bytes)?,
         decided_by: row.decided_by,
         operator_reason: row.operator_reason,
-        requested_at: row.requested_at,
-        expires_at: row.expires_at,
-        resolved_at: row.resolved_at,
+        requested_at: row.requested_at.get(),
+        expires_at: row.expires_at.map(DbMillis::get),
+        resolved_at: row.resolved_at.map(DbMillis::get),
     })
 }
 
@@ -1175,7 +1190,7 @@ fn progress_summary(
         Option<i64>,
         Option<i64>,
         String,
-        i64,
+        DbMillis,
     ),
 ) -> Result<ProgressSummary, DurableError> {
     Ok(ProgressSummary {
@@ -1187,7 +1202,7 @@ fn progress_summary(
         completed_units: row.5,
         total_units: row.6,
         severity: row.7,
-        created_at: row.8,
+        created_at: row.8.get(),
     })
 }
 

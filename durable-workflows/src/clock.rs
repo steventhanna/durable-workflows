@@ -26,27 +26,59 @@
 use std::fmt;
 use std::time::Duration;
 
+use diesel::deserialize::{self, FromSql, FromSqlRow};
 use diesel::expression::AsExpression;
 use diesel::serialize::{self, Output, ToSql};
 use diesel::sql_types::BigInt;
 
 use crate::{Db, DurableError};
 
+/// The SQL type of persisted database timestamps. Storage stays `BIGINT`.
+pub mod sql_types {
+    #[derive(
+        Debug, Clone, Copy, Default, diesel::sql_types::SqlType, diesel::query_builder::QueryId,
+    )]
+    #[diesel(postgres_type(oid = 20, array_oid = 1016))]
+    #[diesel(mysql_type(name = "LongLong"))]
+    pub struct DbMillis;
+
+    impl diesel::sql_types::SqlOrd for DbMillis {}
+}
+
 /// Epoch milliseconds on the database clock.
 ///
 /// Values come from [`crate::persistence::database_now_millis`], from a
 /// named method on another `DbMillis`, or from
 /// [`DbMillis::from_database_millis`] for a value the caller read from a
-/// timestamp column. There is no `From<i64>`, no `Default` and no arithmetic
-/// operator, so a host-clock value never becomes one by accident.
+/// timestamp column. Public APIs that take an absolute time convert it at
+/// their storage boundary. Those requested times do not replace a database
+/// clock sample for due or lease checks. There is no `From<i64>`, no `Default`
+/// and no arithmetic operator, so a host-clock value never becomes one by
+/// accident.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, AsExpression, serde::Serialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    AsExpression,
+    FromSqlRow,
+    serde::Serialize,
 )]
-#[diesel(sql_type = BigInt)]
+#[diesel(sql_type = sql_types::DbMillis)]
 #[serde(transparent)]
 pub struct DbMillis(i64);
 
 impl DbMillis {
+    /// Convert a caller's or schedule's requested absolute time at the storage
+    /// boundary. This value is a target, not a sampled database clock time.
+    pub(crate) const fn from_requested_millis(millis: i64) -> Self {
+        Self(millis)
+    }
+
     /// A value read from a database timestamp column (or a test fixture for
     /// one). Never pass a host wall-clock stamp: that is the mix this type
     /// exists to prevent.
@@ -105,7 +137,16 @@ impl fmt::Display for DbMillis {
     }
 }
 
-impl ToSql<BigInt, Db> for DbMillis {
+impl FromSql<sql_types::DbMillis, Db> for DbMillis {
+    fn from_sql(
+        bytes: <Db as diesel::backend::Backend>::RawValue<'_>,
+    ) -> deserialize::Result<Self> {
+        let value = <i64 as FromSql<BigInt, Db>>::from_sql(bytes)?;
+        Ok(Self(value))
+    }
+}
+
+impl ToSql<sql_types::DbMillis, Db> for DbMillis {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Db>) -> serialize::Result {
         <i64 as ToSql<BigInt, Db>>::to_sql(&self.0, out)
     }

@@ -479,7 +479,7 @@ where
                             durable_workflow::lease_expires_at.assume_not_null(),
                             durable_workflow::id,
                         ))
-                        .load::<(i64, WorkflowId)>(connection)
+                        .load::<(DbMillis, WorkflowId)>(connection)
                         .await?;
                     let Some(last_candidate) = page.last().copied() else {
                         break None;
@@ -498,7 +498,7 @@ where
                             if candidate.status == WorkflowStatus::Running
                                 && candidate
                                     .lease_expires_at
-                                    .is_some_and(|expiry| expiry <= now.get())
+                                    .is_some_and(|expiry| expiry <= now)
                             {
                                 break 'expired Some(candidate);
                             }
@@ -522,7 +522,7 @@ where
                         durable_workflow::available_at.eq(now),
                         durable_workflow::lease_owner.eq(None::<String>),
                         durable_workflow::lease_token.eq(None::<String>),
-                        durable_workflow::lease_expires_at.eq(None::<i64>),
+                        durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                         durable_workflow::updated_at.eq(now),
                     ))
                     .execute(connection)
@@ -601,7 +601,7 @@ where
                 let max_activation = row.max_activation_attempts.min(configured_max_activation);
                 row.status = WorkflowStatus::Running;
                 row.lease_token = Some(lease_token.clone());
-                row.lease_expires_at = Some(lease_expires_at.get());
+                row.lease_expires_at = Some(lease_expires_at);
                 Ok(commit_workflow_claim(
                     trace,
                     recovered,
@@ -729,7 +729,7 @@ where
                     durable_workflow::error_message.eq(Some(error.message.clone())),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                     durable_workflow::completed_at.eq(exhausted.then_some(now)),
                 ))
@@ -822,7 +822,7 @@ async fn commit_on_connection<'tx>(
                     durable_workflow::error_message.eq(None::<String>),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                 ))
                 .execute(connection)
@@ -852,7 +852,7 @@ async fn commit_on_connection<'tx>(
                     actor_type: Some("system".to_string()),
                     actor_id: None,
                     reason: None,
-                    created_at: now.get(),
+                    created_at: now,
                 },
             )
             .await?;
@@ -874,7 +874,7 @@ async fn commit_on_connection<'tx>(
                     durable_workflow::error_message.eq(None::<String>),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                     durable_workflow::completed_at.eq(Some(now)),
                 ),
@@ -993,7 +993,8 @@ async fn commit_wait_transition<'tx>(
                             )
                         })?,
                     }),
-                    durable_workflow::available_at.eq(wake_at_millis),
+                    durable_workflow::available_at
+                        .eq(DbMillis::from_requested_millis(wake_at_millis)),
                     durable_workflow::command_sequence.eq(command),
                     durable_workflow::delivered_event_sequence.eq(delivered),
                     durable_workflow::consecutive_continuations.eq(0),
@@ -1002,7 +1003,7 @@ async fn commit_wait_transition<'tx>(
                     durable_workflow::error_message.eq(None::<String>),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                 ))
                 .execute(connection)
@@ -1030,8 +1031,8 @@ async fn commit_wait_transition<'tx>(
                     validation_schema_json: "{}".to_string(),
                     validation_version: 1,
                     status: ApprovalStatus::Pending,
-                    requested_at: now.get(),
-                    expires_at: expires_at_millis,
+                    requested_at: now,
+                    expires_at: expires_at_millis.map(DbMillis::from_requested_millis),
                     decision_payload_json: None,
                     decided_by: None,
                     operator_reason: None,
@@ -1053,7 +1054,7 @@ async fn commit_wait_transition<'tx>(
                     durable_workflow::error_message.eq(None::<String>),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                 ))
                 .execute(connection)
@@ -1096,9 +1097,9 @@ async fn commit_activity<'tx>(
     use crate::persistence::{ActivityStatus, NewActivityRow};
 
     let available_at = if activity.has_continuation_priority() {
-        crate::transition::CONTINUATION_READY_AT_MILLIS
+        DbMillis::from_database_millis(crate::transition::CONTINUATION_READY_AT_MILLIS)
     } else {
-        now.get()
+        now
     };
     let fence = lock_fence(connection, scope, claim).await?;
     let activity_id = crate::dialect::insert_activity(
@@ -1132,8 +1133,8 @@ async fn commit_activity<'tx>(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now.get(),
-            updated_at: now.get(),
+            created_at: now,
+            updated_at: now,
             completed_at: None,
         },
     )
@@ -1152,7 +1153,7 @@ async fn commit_activity<'tx>(
             durable_workflow::error_message.eq(None::<String>),
             durable_workflow::lease_owner.eq(None::<String>),
             durable_workflow::lease_token.eq(None::<String>),
-            durable_workflow::lease_expires_at.eq(None::<i64>),
+            durable_workflow::lease_expires_at.eq(None::<DbMillis>),
             durable_workflow::updated_at.eq(now),
         ))
         .execute(connection)
@@ -1321,7 +1322,7 @@ async fn set_child_wait(
             durable_workflow::error_message.eq(None::<String>),
             durable_workflow::lease_owner.eq(None::<String>),
             durable_workflow::lease_token.eq(None::<String>),
-            durable_workflow::lease_expires_at.eq(None::<i64>),
+            durable_workflow::lease_expires_at.eq(None::<DbMillis>),
             durable_workflow::updated_at.eq(now),
         ))
         .execute(connection)
@@ -1383,7 +1384,7 @@ async fn append_history(
             actor_type: Some("system".to_string()),
             actor_id: None,
             reason: None,
-            created_at: created_at.get(),
+            created_at,
         },
     )
     .await

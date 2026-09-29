@@ -53,7 +53,9 @@ system can make the violation fail to compile. In order of preference:
    `ids::untyped_id`), a clock-domain newtype (`persistence::database_now_millis`
    returns a `DbMillis`, and every function that takes the current time
    takes one, so passing a raw `i64` or a host stamp is E0308:
-   `db_millis_raw_i64_argument`; it has no `+`, only named duration methods
+   `db_millis_raw_i64_argument`; each timestamp column has a distinct
+   SQL type, so a raw `i64` comparison is E0277:
+   `timestamp_column_raw_i64`; it has no `+`, only named duration methods
    such as `plus(Duration) -> Result`: `db_millis_add_operator`), a
    typestate (a transaction callback's `tx::Trace` starts `Undeclared`,
    `declare` makes it `Declared`, and the callback must return the
@@ -135,7 +137,9 @@ type system cannot express the rule.
   sleeps. Keep the two in different types: a database time crossing a
   function boundary is a `DbMillis` (`src/clock.rs`), never an `i64`; build
   one from a raw value only with `DbMillis::from_database_millis` on a value
-  read from a timestamp column.
+  read from a timestamp column. Declare every persisted timestamp column as
+  `sql_types::DbMillis` in `schema.rs`; keep duration and count columns as
+  `BigInt`.
 - Ids crossing a function boundary use the id newtypes in `src/ids.rs`, not
   `i64`. A new id column in `schema.rs` uses its id's SQL type, not
   `BigInt`; the id's `FromSql` checks positivity through `Id::new`, so a

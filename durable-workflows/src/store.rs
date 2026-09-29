@@ -494,7 +494,7 @@ impl DurableStore {
                 durable_workflow::status.eq(WorkflowStatus::Cancelled),
                 durable_workflow::lease_owner.eq(None::<String>),
                 durable_workflow::lease_token.eq(None::<String>),
-                durable_workflow::lease_expires_at.eq(None::<i64>),
+                durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                 durable_workflow::updated_at.eq(now),
                 durable_workflow::completed_at.eq(Some(now)),
             ))
@@ -515,7 +515,7 @@ impl DurableStore {
                     actor_type: Some("system".to_string()),
                     actor_id: None,
                     reason: Some(SUPERSEDED_BY_RECOVERY.to_string()),
-                    created_at: now.get(),
+                    created_at: now,
                 },
             )
             .await?;
@@ -672,9 +672,9 @@ impl DurableStore {
             error_message: None,
             wait_kind: None,
             wait_reference_id: None,
-            available_at: options
-                .available_at
-                .map_or(now.get(), |available_at| available_at.timestamp_millis()),
+            available_at: options.available_at.map_or(now, |available_at| {
+                DbMillis::from_requested_millis(available_at.timestamp_millis())
+            }),
             activation_attempts: 0,
             max_activation_attempts: DEFAULT_MAX_ACTIVATION_ATTEMPTS,
             consecutive_continuations: 0,
@@ -689,8 +689,8 @@ impl DurableStore {
             parent_command_sequence: None,
             command_sequence: 0,
             delivered_event_sequence: 0,
-            created_at: now.get(),
-            updated_at: now.get(),
+            created_at: now,
+            updated_at: now,
             completed_at: None,
         };
 
@@ -787,7 +787,7 @@ impl DurableStore {
             error_message: None,
             wait_kind: None,
             wait_reference_id: None,
-            available_at: now.get(),
+            available_at: now,
             activation_attempts: 0,
             max_activation_attempts: DEFAULT_MAX_ACTIVATION_ATTEMPTS,
             consecutive_continuations: 0,
@@ -802,8 +802,8 @@ impl DurableStore {
             parent_command_sequence: Some(parent_command_sequence),
             command_sequence: 0,
             delivered_event_sequence: 0,
-            created_at: now.get(),
-            updated_at: now.get(),
+            created_at: now,
+            updated_at: now,
             completed_at: None,
         };
         persistence::insert_started(connection, scope, row).await
@@ -938,7 +938,7 @@ async fn hand_waiting_parents_to_successor<'tx>(
                     superseded.id,
                     successor.get()
                 )),
-                created_at: now.get(),
+                created_at: now,
             },
         )
         .await?;
@@ -1091,7 +1091,7 @@ async fn cancel_one_workflow<'tx>(
         persistence::WaitColumns::cleared(),
         durable_workflow::lease_owner.eq(None::<String>),
         durable_workflow::lease_token.eq(None::<String>),
-        durable_workflow::lease_expires_at.eq(None::<i64>),
+        durable_workflow::lease_expires_at.eq(None::<DbMillis>),
         durable_workflow::updated_at.eq(now),
         durable_workflow::completed_at.eq(Some(now)),
     ))
@@ -1117,7 +1117,7 @@ async fn cancel_one_workflow<'tx>(
             ),
             actor_id: operator_id.map(str::to_string),
             reason: Some(reason.to_string()),
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await?;

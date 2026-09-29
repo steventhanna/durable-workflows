@@ -3,7 +3,7 @@ use super::{
 };
 use diesel::{AsChangeset, Insertable, Queryable, Selectable};
 
-use crate::{ActivityId, ApprovalId, ScheduleRunId, WorkflowId};
+use crate::{ActivityId, ApprovalId, DbMillis, ScheduleRunId, WorkflowId};
 
 use crate::schema::{
     durable_activity, durable_activity_attempt, durable_approval, durable_progress_event,
@@ -27,13 +27,13 @@ pub struct WorkflowRow {
     pub error_message: Option<String>,
     pub wait_kind: Option<WaitKind>,
     pub wait_reference_id: Option<i64>,
-    pub available_at: i64,
+    pub available_at: DbMillis,
     pub activation_attempts: i32,
     pub max_activation_attempts: i32,
     pub consecutive_continuations: i32,
     pub lease_owner: Option<String>,
     pub lease_token: Option<String>,
-    pub lease_expires_at: Option<i64>,
+    pub lease_expires_at: Option<DbMillis>,
     pub deduplication_key: Option<String>,
     pub schedule_run_id: Option<ScheduleRunId>,
     pub root_workflow_id: Option<WorkflowId>,
@@ -42,9 +42,9 @@ pub struct WorkflowRow {
     pub parent_command_sequence: Option<i32>,
     pub command_sequence: i32,
     pub delivered_event_sequence: i32,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub completed_at: Option<i64>,
+    pub created_at: DbMillis,
+    pub updated_at: DbMillis,
+    pub completed_at: Option<DbMillis>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -60,7 +60,7 @@ pub struct WorkflowEventRow {
     pub actor_type: Option<String>,
     pub actor_id: Option<String>,
     pub reason: Option<String>,
-    pub created_at: i64,
+    pub created_at: DbMillis,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -76,7 +76,7 @@ pub struct ActivityRow {
     pub topic: String,
     pub payload_json: String,
     pub status: ActivityStatus,
-    pub available_at: i64,
+    pub available_at: DbMillis,
     pub max_attempts: i32,
     pub attempt_count: i32,
     pub timeout_millis: i64,
@@ -88,12 +88,12 @@ pub struct ActivityRow {
     pub last_error_message: Option<String>,
     pub lease_owner: Option<String>,
     pub lease_token: Option<String>,
-    pub lease_expires_at: Option<i64>,
+    pub lease_expires_at: Option<DbMillis>,
     pub root_activity_id: Option<ActivityId>,
     pub replaces_activity_id: Option<ActivityId>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub completed_at: Option<i64>,
+    pub created_at: DbMillis,
+    pub updated_at: DbMillis,
+    pub completed_at: Option<DbMillis>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -104,9 +104,9 @@ pub struct ActivityAttemptRow {
     pub attempt_number: i32,
     pub worker_id: String,
     pub lease_token: String,
-    pub started_at: i64,
-    pub heartbeat_at: i64,
-    pub finished_at: Option<i64>,
+    pub started_at: DbMillis,
+    pub heartbeat_at: DbMillis,
+    pub finished_at: Option<DbMillis>,
     pub outcome: Option<AttemptOutcome>,
     pub error_category: Option<String>,
     pub error_message: Option<String>,
@@ -127,7 +127,7 @@ pub struct ProgressEventRow {
     pub total_units: Option<i64>,
     pub severity: String,
     pub metadata_json: Option<String>,
-    pub created_at: i64,
+    pub created_at: DbMillis,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -143,12 +143,12 @@ pub struct ApprovalRow {
     pub validation_schema_json: String,
     pub validation_version: i32,
     pub status: ApprovalStatus,
-    pub requested_at: i64,
-    pub expires_at: Option<i64>,
+    pub requested_at: DbMillis,
+    pub expires_at: Option<DbMillis>,
     pub decision_payload_json: Option<String>,
     pub decided_by: Option<i32>,
     pub operator_reason: Option<String>,
-    pub resolved_at: Option<i64>,
+    pub resolved_at: Option<DbMillis>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -159,13 +159,13 @@ pub struct ScheduleStateRow {
     pub definition_fingerprint: String,
     pub definition_version: i32,
     pub next_local_occurrence: String,
-    pub next_occurrence_at: i64,
-    pub last_materialized_at: Option<i64>,
-    pub paused_at: Option<i64>,
+    pub next_occurrence_at: DbMillis,
+    pub last_materialized_at: Option<DbMillis>,
+    pub paused_at: Option<DbMillis>,
     pub paused_by: Option<i32>,
     pub pause_reason: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: DbMillis,
+    pub updated_at: DbMillis,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -175,13 +175,13 @@ pub struct ScheduleRunRow {
     pub id: ScheduleRunId,
     pub schedule_key: String,
     pub local_occurrence: String,
-    pub scheduled_for: i64,
-    pub materialized_at: i64,
+    pub scheduled_for: DbMillis,
+    pub materialized_at: DbMillis,
     pub status: ScheduleRunStatus,
     pub reason: Option<String>,
     pub actor_id: Option<i32>,
     pub workflow_id: Option<WorkflowId>,
-    pub created_at: i64,
+    pub created_at: DbMillis,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -190,7 +190,7 @@ pub struct ScheduleRunRow {
 pub struct TopicLockRow {
     pub topic: String,
     pub max_concurrency: i32,
-    pub updated_at: i64,
+    pub updated_at: DbMillis,
 }
 
 #[derive(Debug, Insertable)]
@@ -207,13 +207,13 @@ pub struct NewWorkflowRow {
     pub error_message: Option<String>,
     pub wait_kind: Option<WaitKind>,
     pub wait_reference_id: Option<i64>,
-    pub available_at: i64,
+    pub available_at: DbMillis,
     pub activation_attempts: i32,
     pub max_activation_attempts: i32,
     pub consecutive_continuations: i32,
     pub lease_owner: Option<String>,
     pub lease_token: Option<String>,
-    pub lease_expires_at: Option<i64>,
+    pub lease_expires_at: Option<DbMillis>,
     pub deduplication_key: Option<String>,
     pub schedule_run_id: Option<ScheduleRunId>,
     pub root_workflow_id: Option<WorkflowId>,
@@ -222,9 +222,9 @@ pub struct NewWorkflowRow {
     pub parent_command_sequence: Option<i32>,
     pub command_sequence: i32,
     pub delivered_event_sequence: i32,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub completed_at: Option<i64>,
+    pub created_at: DbMillis,
+    pub updated_at: DbMillis,
+    pub completed_at: Option<DbMillis>,
 }
 
 #[derive(Debug, Insertable)]
@@ -238,7 +238,7 @@ pub struct NewWorkflowEventRow {
     pub actor_type: Option<String>,
     pub actor_id: Option<String>,
     pub reason: Option<String>,
-    pub created_at: i64,
+    pub created_at: DbMillis,
 }
 
 #[derive(Debug, Insertable)]
@@ -252,7 +252,7 @@ pub struct NewActivityRow {
     pub topic: String,
     pub payload_json: String,
     pub status: ActivityStatus,
-    pub available_at: i64,
+    pub available_at: DbMillis,
     pub max_attempts: i32,
     pub attempt_count: i32,
     pub timeout_millis: i64,
@@ -264,12 +264,12 @@ pub struct NewActivityRow {
     pub last_error_message: Option<String>,
     pub lease_owner: Option<String>,
     pub lease_token: Option<String>,
-    pub lease_expires_at: Option<i64>,
+    pub lease_expires_at: Option<DbMillis>,
     pub root_activity_id: Option<ActivityId>,
     pub replaces_activity_id: Option<ActivityId>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub completed_at: Option<i64>,
+    pub created_at: DbMillis,
+    pub updated_at: DbMillis,
+    pub completed_at: Option<DbMillis>,
 }
 
 #[derive(Debug, Insertable)]
@@ -279,9 +279,9 @@ pub struct NewActivityAttemptRow {
     pub attempt_number: i32,
     pub worker_id: String,
     pub lease_token: String,
-    pub started_at: i64,
-    pub heartbeat_at: i64,
-    pub finished_at: Option<i64>,
+    pub started_at: DbMillis,
+    pub heartbeat_at: DbMillis,
+    pub finished_at: Option<DbMillis>,
     pub outcome: Option<AttemptOutcome>,
     pub error_category: Option<String>,
     pub error_message: Option<String>,
@@ -301,7 +301,7 @@ pub struct NewProgressEventRow {
     pub total_units: Option<i64>,
     pub severity: String,
     pub metadata_json: Option<String>,
-    pub created_at: i64,
+    pub created_at: DbMillis,
 }
 
 #[derive(Debug, Insertable)]
@@ -315,12 +315,12 @@ pub struct NewApprovalRow {
     pub validation_schema_json: String,
     pub validation_version: i32,
     pub status: ApprovalStatus,
-    pub requested_at: i64,
-    pub expires_at: Option<i64>,
+    pub requested_at: DbMillis,
+    pub expires_at: Option<DbMillis>,
     pub decision_payload_json: Option<String>,
     pub decided_by: Option<i32>,
     pub operator_reason: Option<String>,
-    pub resolved_at: Option<i64>,
+    pub resolved_at: Option<DbMillis>,
 }
 
 #[derive(Debug, Insertable)]
@@ -330,13 +330,13 @@ pub struct NewScheduleStateRow {
     pub definition_fingerprint: String,
     pub definition_version: i32,
     pub next_local_occurrence: String,
-    pub next_occurrence_at: i64,
-    pub last_materialized_at: Option<i64>,
-    pub paused_at: Option<i64>,
+    pub next_occurrence_at: DbMillis,
+    pub last_materialized_at: Option<DbMillis>,
+    pub paused_at: Option<DbMillis>,
     pub paused_by: Option<i32>,
     pub pause_reason: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: DbMillis,
+    pub updated_at: DbMillis,
 }
 
 #[derive(Debug, Insertable)]
@@ -344,13 +344,13 @@ pub struct NewScheduleStateRow {
 pub struct NewScheduleRunRow {
     pub schedule_key: String,
     pub local_occurrence: String,
-    pub scheduled_for: i64,
-    pub materialized_at: i64,
+    pub scheduled_for: DbMillis,
+    pub materialized_at: DbMillis,
     pub status: ScheduleRunStatus,
     pub reason: Option<String>,
     pub actor_id: Option<i32>,
     pub workflow_id: Option<WorkflowId>,
-    pub created_at: i64,
+    pub created_at: DbMillis,
 }
 
 #[derive(Debug, Insertable)]
@@ -358,7 +358,7 @@ pub struct NewScheduleRunRow {
 pub struct NewTopicLockRow {
     pub topic: String,
     pub max_concurrency: i32,
-    pub updated_at: i64,
+    pub updated_at: DbMillis,
 }
 
 /// Changeset fragment that clears an activity's lease (S1, S9). Every
@@ -370,7 +370,7 @@ pub struct NewTopicLockRow {
 pub(crate) struct LeaseCleared {
     lease_owner: Option<&'static str>,
     lease_token: Option<&'static str>,
-    lease_expires_at: Option<i64>,
+    lease_expires_at: Option<DbMillis>,
 }
 
 impl LeaseCleared {

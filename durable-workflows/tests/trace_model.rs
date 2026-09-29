@@ -1169,7 +1169,7 @@ async fn cancel_while_running_settles_the_revoked_attempt() {
             durable_activity_attempt::outcome,
             durable_activity_attempt::finished_at,
         ))
-        .first::<(Option<String>, Option<i64>)>(&mut connection)
+        .first::<(Option<String>, Option<durable_workflows::DbMillis>)>(&mut connection)
         .await
         .expect("attempt row");
     assert!(finished_at.is_some(), "the revoked attempt is closed");

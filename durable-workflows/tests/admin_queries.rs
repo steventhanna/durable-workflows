@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use async_trait::async_trait;
@@ -69,8 +70,8 @@ async fn seed_workflows(
     for id in &ids {
         diesel::update(durable_workflow::table.find(id))
             .set((
-                durable_workflow::created_at.eq(10_000_i64),
-                durable_workflow::updated_at.eq(10_000_i64),
+                durable_workflow::created_at.eq(DbMillis::from_database_millis(10_000_i64)),
+                durable_workflow::updated_at.eq(DbMillis::from_database_millis(10_000_i64)),
             ))
             .execute(&mut connection)
             .await
@@ -103,7 +104,7 @@ async fn seed_activity(
             payload_json: r#"{"secret":"activity-customer-secret"}"#.to_string(),
             status: durable_workflows::persistence::ActivityStatus::try_from("dead_lettered")
                 .expect("valid fixture status"),
-            available_at: 11_000,
+            available_at: DbMillis::from_database_millis(11_000),
             max_attempts: 2,
             attempt_count: 1,
             timeout_millis: 1_000,
@@ -119,9 +120,9 @@ async fn seed_activity(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: 11_000,
-            updated_at: 12_000,
-            completed_at: Some(12_000),
+            created_at: DbMillis::from_database_millis(11_000),
+            updated_at: DbMillis::from_database_millis(12_000),
+            completed_at: Some(DbMillis::from_database_millis(12_000)),
         })
         .execute(&mut connection)
         .await
@@ -138,9 +139,9 @@ async fn seed_activity(
             attempt_number: 1,
             worker_id: "worker-1".to_string(),
             lease_token: "00000000-0000-0000-0000-000000000001".to_string(),
-            started_at: 11_100,
-            heartbeat_at: 11_500,
-            finished_at: Some(12_000),
+            started_at: DbMillis::from_database_millis(11_100),
+            heartbeat_at: DbMillis::from_database_millis(11_500),
+            finished_at: Some(DbMillis::from_database_millis(12_000)),
             outcome: Some(durable_workflows::persistence::AttemptOutcome::DeadLettered),
             error_category: Some("provider".to_string()),
             error_message: Some("bounded failure".to_string()),
@@ -161,7 +162,7 @@ async fn seed_activity(
             total_units: Some(2),
             severity: "info".to_string(),
             metadata_json: Some(r#"{"secret":"progress-metadata"}"#.to_string()),
-            created_at: 11_400,
+            created_at: DbMillis::from_database_millis(11_400),
         })
         .execute(&mut connection)
         .await
@@ -253,9 +254,9 @@ async fn activity_detail_exposes_attempts_progress_and_payload_values() {
             attempt_number: 2,
             worker_id: "worker-2".to_string(),
             lease_token: "00000000-0000-0000-0000-000000000002".to_string(),
-            started_at: 12_100,
-            heartbeat_at: 12_500,
-            finished_at: Some(13_000),
+            started_at: DbMillis::from_database_millis(12_100),
+            heartbeat_at: DbMillis::from_database_millis(12_500),
+            finished_at: Some(DbMillis::from_database_millis(13_000)),
             outcome: Some(durable_workflows::persistence::AttemptOutcome::DeadLettered),
             error_category: Some("provider".to_string()),
             error_message: Some("bounded failure".to_string()),
@@ -276,7 +277,7 @@ async fn activity_detail_exposes_attempts_progress_and_payload_values() {
             total_units: Some(2),
             severity: "info".to_string(),
             metadata_json: None,
-            created_at: 12_400,
+            created_at: DbMillis::from_database_millis(12_400),
         })
         .execute(&mut connection)
         .await
@@ -402,12 +403,12 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
             validation_schema_json: r#"{"type":"boolean"}"#.to_string(),
             validation_version: 1,
             status: durable_workflows::persistence::ApprovalStatus::Resolved,
-            requested_at: 20_000,
+            requested_at: DbMillis::from_database_millis(20_000),
             expires_at: None,
             decision_payload_json: Some(r#"{"secret":"approval-decision-secret"}"#.to_string()),
             decided_by: Some(7),
             operator_reason: Some("Reviewed by operations".to_string()),
-            resolved_at: Some(20_100),
+            resolved_at: Some(DbMillis::from_database_millis(20_100)),
         })
         .execute(&mut connection)
         .await
@@ -415,12 +416,12 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
     diesel::update(
         durable_workflow_event::table.filter(durable_workflow_event::workflow_id.eq(workflow_id)),
     )
-    .set(durable_workflow_event::created_at.eq(20_000_i64))
+    .set(durable_workflow_event::created_at.eq(DbMillis::from_database_millis(20_000_i64)))
     .execute(&mut connection)
     .await
     .expect("event timestamp");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::created_at.eq(20_000_i64))
+        .set(durable_activity::created_at.eq(DbMillis::from_database_millis(20_000_i64)))
         .execute(&mut connection)
         .await
         .expect("activity timestamp");
@@ -428,14 +429,14 @@ async fn workflow_timeline_is_stable_across_sources_and_redacted() {
         durable_activity_attempt::table
             .filter(durable_activity_attempt::activity_id.eq(activity_id)),
     )
-    .set(durable_activity_attempt::started_at.eq(20_000_i64))
+    .set(durable_activity_attempt::started_at.eq(DbMillis::from_database_millis(20_000_i64)))
     .execute(&mut connection)
     .await
     .expect("attempt timestamp");
     diesel::update(
         durable_progress_event::table.filter(durable_progress_event::activity_id.eq(activity_id)),
     )
-    .set(durable_progress_event::created_at.eq(20_000_i64))
+    .set(durable_progress_event::created_at.eq(DbMillis::from_database_millis(20_000_i64)))
     .execute(&mut connection)
     .await
     .expect("progress timestamp");

@@ -96,7 +96,7 @@ async fn timers_wake_once_at_the_exact_command_and_preserve_pause() {
                 durable_workflow::status.eq(status),
                 durable_workflow::wait_kind.eq(Some("timer".to_string())),
                 durable_workflow::wait_reference_id.eq(Some(i64::from(command))),
-                durable_workflow::available_at.eq(available_at),
+                durable_workflow::available_at.eq(DbMillis::from_database_millis(available_at)),
                 durable_workflow::command_sequence.eq(command),
                 durable_workflow::delivered_event_sequence.eq(1),
             ))
@@ -180,7 +180,7 @@ async fn an_inconsistent_due_timer_rolls_back_without_clearing_the_wait() {
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
             durable_workflow::wait_reference_id.eq(Some(8_i64)),
-            durable_workflow::available_at.eq(now),
+            durable_workflow::available_at.eq(DbMillis::from_database_millis(now)),
             durable_workflow::command_sequence.eq(7),
             durable_workflow::delivered_event_sequence.eq(1),
         ))
@@ -218,8 +218,8 @@ async fn seed_approval(
             validation_schema_json: "{}".to_string(),
             validation_version: 1,
             status: durable_workflows::persistence::ApprovalStatus::Pending,
-            requested_at: expires_at - 1_000,
-            expires_at: Some(expires_at),
+            requested_at: DbMillis::from_database_millis(expires_at - 1_000),
+            expires_at: Some(DbMillis::from_database_millis(expires_at)),
             decision_payload_json: None,
             decided_by: None,
             operator_reason: None,
@@ -312,7 +312,7 @@ async fn approval_expiry_is_typed_atomic_race_safe_and_preserves_pause() {
         .await
         .expect("approval");
     assert_eq!(approval.status.as_str(), "expired");
-    assert_eq!(approval.resolved_at, Some(now));
+    assert_eq!(approval.resolved_at.map(DbMillis::get), Some(now));
 }
 
 #[tokio::test]

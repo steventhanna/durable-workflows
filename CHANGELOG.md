@@ -148,9 +148,12 @@ Compared with the production-internal version it was extracted from:
   and no `Default`; durations go through `plus(Duration) -> Result`,
   `plus_millis`, `checked_plus_millis`, `saturating_plus_millis`,
   `saturating_minus_millis` and `millis_since`. Persisted values are
-  unchanged; row structs and report fields stay `i64`. Migration: pass the
-  value `database_now_millis` returns as is; read the raw millis with
-  `.get()`; wrap a value read from a timestamp column (or a test fixture)
+  unchanged. Timestamp columns and row struct fields now use `DbMillis`;
+  duration and count columns stay `BIGINT`/`i64`. Raw `i64` values no longer
+  compare with timestamp columns (`timestamp_column_raw_i64`, E0277).
+  Report fields and external JSON remain plain integers. Migration: pass the
+  value `database_now_millis` returns as is; read raw millis with
+  `.get()` for an external value; wrap a value read from raw SQL (or a test fixture)
   with `DbMillis::from_database_millis(raw)`; replace `now + ms` with
   `now.plus_millis(ms)?` or `now.plus(duration)?`.
 

@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::time::Duration;
@@ -360,7 +361,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 error_message: None,
                 wait_kind: None,
                 wait_reference_id: None,
-                available_at: now,
+                available_at: DbMillis::from_database_millis(now),
                 activation_attempts: 0,
                 max_activation_attempts: 3,
                 consecutive_continuations: 0,
@@ -375,9 +376,11 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 parent_command_sequence: None,
                 command_sequence: 0,
                 delivered_event_sequence: 0,
-                created_at: now,
-                updated_at: now,
-                completed_at: (status == "succeeded").then_some(now),
+                created_at: DbMillis::from_database_millis(now),
+                updated_at: DbMillis::from_database_millis(now),
+                completed_at: (status == "succeeded")
+                    .then_some(now)
+                    .map(DbMillis::from_database_millis),
             })
             .execute(&mut connection)
             .await
@@ -403,7 +406,7 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 payload_json: r#"{"value":1}"#.to_string(),
                 status: durable_workflows::persistence::ActivityStatus::try_from(status)
                     .expect("valid fixture status"),
-                available_at: now,
+                available_at: DbMillis::from_database_millis(now),
                 max_attempts: 3,
                 attempt_count: 0,
                 timeout_millis: 30_000,
@@ -418,9 +421,11 @@ async fn mysql_readiness_excludes_terminal_definitions() {
                 lease_expires_at: None,
                 root_activity_id: None,
                 replaces_activity_id: None,
-                created_at: now,
-                updated_at: now,
-                completed_at: (status == "succeeded").then_some(now),
+                created_at: DbMillis::from_database_millis(now),
+                updated_at: DbMillis::from_database_millis(now),
+                completed_at: (status == "succeeded")
+                    .then_some(now)
+                    .map(DbMillis::from_database_millis),
             })
             .execute(&mut connection)
             .await

@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use async_trait::async_trait;
@@ -369,7 +370,7 @@ async fn outer_transaction_rollback_removes_the_workflow_and_event() {
                 .values(NewTopicLockRow {
                     topic: "domain-mutation".to_string(),
                     max_concurrency: 1,
-                    updated_at: now,
+                    updated_at: DbMillis::from_database_millis(now),
                 })
                 .execute(transaction)
                 .await?;

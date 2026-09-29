@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::sync::Arc;
@@ -162,8 +163,8 @@ async fn insert_approval(
             validation_schema_json: r#"{"type":"boolean"}"#.to_string(),
             validation_version: 1,
             status: durable_workflows::persistence::ApprovalStatus::Pending,
-            requested_at: now,
-            expires_at,
+            requested_at: DbMillis::from_database_millis(now),
+            expires_at: expires_at.map(DbMillis::from_database_millis),
             decision_payload_json: None,
             decided_by: None,
             operator_reason: None,
@@ -316,7 +317,7 @@ async fn expired_or_invalid_approval_decisions_roll_back_without_waking() {
 
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_approval::table.find(approval_id))
-        .set(durable_approval::expires_at.eq(None::<i64>))
+        .set(durable_approval::expires_at.eq(None::<DbMillis>))
         .execute(&mut connection)
         .await
         .expect("remove expiry");
@@ -358,13 +359,13 @@ async fn schedule_controls_are_code_owned_and_run_now_is_atomic_without_cadence_
             definition_fingerprint: schedule_fingerprint::<ManualSchedule>(),
             definition_version: ManualSchedule::VERSION,
             next_local_occurrence: "2099-01-01T00:00:00".to_string(),
-            next_occurrence_at: next_occurrence,
+            next_occurrence_at: DbMillis::from_database_millis(next_occurrence),
             last_materialized_at: None,
             paused_at: None,
             paused_by: None,
             pause_reason: None,
-            created_at: next_occurrence - 1_000,
-            updated_at: next_occurrence - 1_000,
+            created_at: DbMillis::from_database_millis(next_occurrence - 1_000),
+            updated_at: DbMillis::from_database_millis(next_occurrence - 1_000),
         })
         .execute(&mut connection)
         .await
@@ -415,10 +416,10 @@ async fn schedule_controls_are_code_owned_and_run_now_is_atomic_without_cadence_
     let state_next = durable_schedule_state::table
         .find(ManualSchedule::KEY)
         .select(durable_schedule_state::next_occurrence_at)
-        .first::<i64>(&mut connection)
+        .first::<DbMillis>(&mut connection)
         .await
         .expect("next occurrence");
-    assert_eq!(state_next, next_occurrence);
+    assert_eq!(state_next.get(), next_occurrence);
     let schedule_run = durable_schedule_run::table
         .find(run.schedule_run_id)
         .select(ScheduleRunRow::as_select())
@@ -462,13 +463,13 @@ async fn schedule_controls_reject_unregistered_and_mismatched_definitions() {
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
             definition_version: ManualSchedule::VERSION,
             next_local_occurrence: "2099-01-01T00:00:00".to_string(),
-            next_occurrence_at: now + 60_000,
+            next_occurrence_at: DbMillis::from_database_millis(now + 60_000),
             last_materialized_at: None,
             paused_at: None,
             paused_by: None,
             pause_reason: None,
-            created_at: now,
-            updated_at: now,
+            created_at: DbMillis::from_database_millis(now),
+            updated_at: DbMillis::from_database_millis(now),
         })
         .execute(&mut connection)
         .await
@@ -516,13 +517,13 @@ async fn failed_manual_schedule_start_rolls_back_the_run_row() {
             definition_fingerprint: schedule_fingerprint::<FailingSchedule>(),
             definition_version: FailingSchedule::VERSION,
             next_local_occurrence: "2099-01-01T00:00:00".to_string(),
-            next_occurrence_at: now + 60_000,
+            next_occurrence_at: DbMillis::from_database_millis(now + 60_000),
             last_materialized_at: None,
             paused_at: None,
             paused_by: None,
             pause_reason: None,
-            created_at: now,
-            updated_at: now,
+            created_at: DbMillis::from_database_millis(now),
+            updated_at: DbMillis::from_database_millis(now),
         })
         .execute(&mut connection)
         .await

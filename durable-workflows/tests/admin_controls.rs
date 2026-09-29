@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{sync::Arc, time::Duration};
@@ -194,7 +195,7 @@ async fn insert_activity(
             payload_json: r#"{"value":11}"#.to_string(),
             status: durable_workflows::persistence::ActivityStatus::try_from(status)
                 .expect("valid fixture status"),
-            available_at: 0,
+            available_at: DbMillis::from_database_millis(0),
             max_attempts: 2,
             attempt_count: 0,
             timeout_millis: 5_000,
@@ -212,9 +213,11 @@ async fn insert_activity(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now,
-            updated_at: now,
-            completed_at: (status == "dead_lettered").then_some(now),
+            created_at: DbMillis::from_database_millis(now),
+            updated_at: DbMillis::from_database_millis(now),
+            completed_at: (status == "dead_lettered")
+                .then_some(now)
+                .map(DbMillis::from_database_millis),
         })
         .execute(&mut connection)
         .await
@@ -499,7 +502,7 @@ async fn expire_activity_lease(
 ) {
     let mut connection = pool.get().await.expect("connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(0_i64)))
+        .set(durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(0_i64))))
         .execute(&mut connection)
         .await
         .expect("expire lease");
@@ -587,13 +590,13 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
             definition_fingerprint: "0".repeat(64),
             definition_version: 1,
             next_local_occurrence: "2026-01-01T00:01:00".to_string(),
-            next_occurrence_at: 60_000,
-            last_materialized_at: Some(0),
+            next_occurrence_at: DbMillis::from_database_millis(60_000),
+            last_materialized_at: Some(DbMillis::from_database_millis(0)),
             paused_at: None,
             paused_by: None,
             pause_reason: None,
-            created_at: 0,
-            updated_at: 0,
+            created_at: DbMillis::from_database_millis(0),
+            updated_at: DbMillis::from_database_millis(0),
         })
         .execute(&mut connection)
         .await
@@ -602,13 +605,13 @@ async fn restart_supersedes_paused_source_and_transfers_schedule_origin() {
         .values(NewScheduleRunRow {
             schedule_key: "restart_schedule".to_string(),
             local_occurrence: "2026-01-01T00:00:00".to_string(),
-            scheduled_for: 0,
-            materialized_at: 0,
+            scheduled_for: DbMillis::from_database_millis(0),
+            materialized_at: DbMillis::from_database_millis(0),
             status: durable_workflows::persistence::ScheduleRunStatus::Started,
             reason: None,
             actor_id: None,
             workflow_id: Some(workflow_id),
-            created_at: 0,
+            created_at: DbMillis::from_database_millis(0),
         })
         .execute(&mut connection)
         .await
@@ -709,7 +712,7 @@ async fn resuming_an_overdue_timer_does_not_run_without_a_timer_event() {
             durable_workflow::status.eq("sleeping"),
             durable_workflow::wait_kind.eq(Some("timer".to_string())),
             durable_workflow::wait_reference_id.eq(Some(1_i64)),
-            durable_workflow::available_at.eq(0_i64),
+            durable_workflow::available_at.eq(DbMillis::from_database_millis(0_i64)),
         ))
         .execute(&mut connection)
         .await
@@ -780,7 +783,7 @@ async fn restart_is_version_pinned_while_correction_selects_current_and_rolls_ba
     diesel::update(durable_workflow::table.find(workflow_id))
         .set((
             durable_workflow::status.eq("failed"),
-            durable_workflow::completed_at.eq(Some(20_000_i64)),
+            durable_workflow::completed_at.eq(Some(DbMillis::from_database_millis(20_000_i64))),
         ))
         .execute(&mut connection)
         .await
@@ -807,7 +810,7 @@ async fn restart_is_version_pinned_while_correction_selects_current_and_rolls_ba
     diesel::update(durable_workflow::table.find(correction_source))
         .set((
             durable_workflow::status.eq("failed"),
-            durable_workflow::completed_at.eq(Some(20_001_i64)),
+            durable_workflow::completed_at.eq(Some(DbMillis::from_database_millis(20_001_i64))),
         ))
         .execute(&mut connection)
         .await
@@ -924,7 +927,7 @@ async fn retry_creates_immutable_lineage_and_correction_changes_version_and_oper
             durable_activity::status.eq("dead_lettered"),
             durable_activity::last_error_category.eq(Some("provider".to_string())),
             durable_activity::last_error_message.eq(Some("failed again".to_string())),
-            durable_activity::completed_at.eq(Some(30_000_i64)),
+            durable_activity::completed_at.eq(Some(DbMillis::from_database_millis(30_000_i64))),
         ))
         .execute(&mut connection)
         .await

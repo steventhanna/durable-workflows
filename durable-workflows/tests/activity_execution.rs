@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{
@@ -313,7 +314,7 @@ async fn schedule_activity(
             payload_json: serde_json::to_string(&TestActivity { value: 21 }).expect("payload"),
             status: durable_workflows::persistence::ActivityStatus::try_from("pending")
                 .expect("valid fixture status"),
-            available_at: now.get(),
+            available_at: now,
             max_attempts,
             attempt_count: 0,
             timeout_millis,
@@ -329,8 +330,8 @@ async fn schedule_activity(
             lease_expires_at: None,
             root_activity_id: None,
             replaces_activity_id: None,
-            created_at: now.get(),
-            updated_at: now.get(),
+            created_at: now,
+            updated_at: now,
             completed_at: None,
         })
         .execute(&mut connection)
@@ -552,7 +553,7 @@ async fn activity_claim_eligibility_uses_database_time_when_process_clock_differ
     assert!(available_at > host_wall_clock_millis());
     let mut connection = pool.get().await.expect("test connection");
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(available_at))
+        .set(durable_activity::available_at.eq(DbMillis::from_database_millis(available_at)))
         .execute(&mut connection)
         .await
         .expect("schedule by database time");
@@ -692,7 +693,7 @@ async fn retryable_failure_reschedules_with_backoff_and_consumes_attempt() {
         .expect("activity");
     assert_eq!(row.status.as_str(), "pending");
     assert_eq!(row.attempt_count, 1);
-    assert!(row.available_at >= before + 900);
+    assert!(row.available_at.get() >= before + 900);
     assert_eq!(row.last_error_category.as_deref(), Some("provider_busy"));
     let retry_history = durable_workflow_event::table
         .filter(durable_workflow_event::workflow_id.eq(workflow_id))
@@ -797,7 +798,9 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
     let mut connection = pool.get().await.expect("test connection");
     let expired_at = support::expired_lease_at(&mut connection).await;
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::lease_expires_at.eq(Some(expired_at)))
+        .set(
+            durable_activity::lease_expires_at.eq(Some(DbMillis::from_database_millis(expired_at))),
+        )
         .execute(&mut connection)
         .await
         .expect("expire lease");
@@ -819,11 +822,11 @@ async fn expired_lease_is_reconciled_and_reclaimed_as_the_next_attempt() {
     let (status, available_at) = durable_activity::table
         .find(activity_id)
         .select((durable_activity::status, durable_activity::available_at))
-        .first::<(String, i64)>(&mut connection)
+        .first::<(String, DbMillis)>(&mut connection)
         .await
         .expect("reconciled activity");
     assert_eq!(status, "pending");
-    assert!(available_at >= recovery_started.get() + 900);
+    assert!(available_at.get() >= recovery_started.get() + 900);
     let now = durable_workflows::persistence::database_now_millis(&mut connection)
         .await
         .expect("database clock");
@@ -1244,7 +1247,7 @@ async fn heartbeat_updates_are_atomic_when_the_attempt_fence_is_stale() {
     let original_expiry = durable_activity::table
         .find(activity_id)
         .select(durable_activity::lease_expires_at)
-        .first::<Option<i64>>(&mut connection)
+        .first::<Option<DbMillis>>(&mut connection)
         .await
         .expect("lease expiry");
     diesel::update(durable_activity_attempt::table.find((activity_id, 1)))
@@ -1263,7 +1266,7 @@ async fn heartbeat_updates_are_atomic_when_the_attempt_fence_is_stale() {
     let final_expiry = durable_activity::table
         .find(activity_id)
         .select(durable_activity::lease_expires_at)
-        .first::<Option<i64>>(&mut connection)
+        .first::<Option<DbMillis>>(&mut connection)
         .await
         .expect("lease expiry after failed heartbeat");
     assert_eq!(final_expiry, original_expiry);
@@ -1408,7 +1411,10 @@ async fn single_and_batch_claims_share_the_attempt_and_lease_contract() {
         assert_eq!(attempt.lease_token, claim.lease_token());
         assert_eq!(attempt.worker_id, "contract-worker");
         assert_eq!(attempt.attempt_number, 1);
-        assert_eq!(row.lease_expires_at, Some(attempt.started_at + 120_000));
+        assert_eq!(
+            row.lease_expires_at.map(DbMillis::get),
+            Some(attempt.started_at.get() + 120_000)
+        );
         assert_eq!(attempt.heartbeat_at, attempt.started_at);
         assert!(attempt.finished_at.is_none());
     }

@@ -97,7 +97,7 @@ where
                     durable_workflow::status.eq(WorkflowStatus::Paused),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                 ))
                 .execute(connection)
@@ -149,13 +149,13 @@ where
                 .set((
                     durable_workflow::status.eq(status),
                     durable_workflow::available_at.eq(if status == WorkflowStatus::Ready {
-                        now.get()
+                        now
                     } else {
                         workflow.available_at
                     }),
                     durable_workflow::lease_owner.eq(None::<String>),
                     durable_workflow::lease_token.eq(None::<String>),
-                    durable_workflow::lease_expires_at.eq(None::<i64>),
+                    durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                     durable_workflow::updated_at.eq(now),
                 ))
                 .execute(connection)
@@ -317,7 +317,7 @@ where
                         durable_workflow::status.eq(WorkflowStatus::Cancelled),
                         durable_workflow::lease_owner.eq(None::<String>),
                         durable_workflow::lease_token.eq(None::<String>),
-                        durable_workflow::lease_expires_at.eq(None::<i64>),
+                        durable_workflow::lease_expires_at.eq(None::<DbMillis>),
                         durable_workflow::updated_at.eq(now),
                         durable_workflow::completed_at.eq(Some(now)),
                     ))
@@ -491,7 +491,7 @@ where
                             topic: command.topic().to_string(),
                             payload_json: command.payload_json().to_string(),
                             status: ActivityStatus::Pending,
-                            available_at: now.get(),
+                            available_at: now,
                             max_attempts: i32::try_from(command.max_attempts()).map_err(|_| {
                                 DurableError::InvalidDefinition(
                                     "activity attempts exceed the database integer range".to_string(),
@@ -510,8 +510,8 @@ where
                             lease_expires_at: None,
                             root_activity_id: Some(root_id),
                             replaces_activity_id: Some(source.id),
-                            created_at: now.get(),
-                            updated_at: now.get(),
+                            created_at: now,
+                            updated_at: now,
                             completed_at: None,
                         },
                     )
@@ -601,7 +601,7 @@ where
                 let now = persistence::database_now_millis(connection).await?;
                 if approval
                     .expires_at
-                    .is_some_and(|expires_at| expires_at <= now.get())
+                    .is_some_and(|expires_at| expires_at <= now)
                 {
                     return Err(DurableError::Conflict(format!(
                         "approval {approval_id} has expired"
@@ -658,7 +658,7 @@ where
                         actor_type: Some("operator".to_string()),
                         actor_id: Some(operator.actor_id().to_string()),
                         reason: Some(operator.reason().to_string()),
-                        created_at: now.get(),
+                        created_at: now,
                     },
                 )
                 .await?;
@@ -778,7 +778,7 @@ where
                             .filter(durable_schedule_state::paused_at.is_not_null()),
                     )
                     .set((
-                        durable_schedule_state::paused_at.eq(None::<i64>),
+                        durable_schedule_state::paused_at.eq(None::<DbMillis>),
                         durable_schedule_state::paused_by.eq(None::<i32>),
                         durable_schedule_state::pause_reason.eq(None::<String>),
                         durable_schedule_state::updated_at.eq(now),
@@ -842,11 +842,11 @@ where
             let last_scheduled = durable_schedule_run::table
                 .filter(durable_schedule_run::schedule_key.eq(&schedule_key))
                 .select(diesel::dsl::max(durable_schedule_run::scheduled_for))
-                .get_result::<Option<i64>>(connection)
+                .get_result::<Option<DbMillis>>(connection)
                 .await?;
             let scheduled_for = last_scheduled
-                .and_then(|last| last.checked_add(1))
-                .map_or(now.get(), |next| next.max(now.get()));
+                .and_then(|last| last.checked_plus_millis(1))
+                .map_or(now, |next| next.max(now));
             let schedule_run_id = crate::dialect::insert_schedule_run(
                 connection,
                 NewScheduleRunRow {
@@ -856,12 +856,12 @@ where
                         crate::schedule::MANUAL_OCCURRENCE_PREFIX
                     ),
                     scheduled_for,
-                    materialized_at: now.get(),
+                    materialized_at: now,
                     status: ScheduleRunStatus::Materializing,
                     reason: Some(operator.reason().to_string()),
                     actor_id: Some(actor_id),
                     workflow_id: None,
-                    created_at: now.get(),
+                    created_at: now,
                 },
             )
             .await?;
@@ -871,7 +871,7 @@ where
                     context.as_ref(),
                     connection,
                     schedule_run_id,
-                    scheduled_for,
+                    scheduled_for.get(),
                 )
                 .await?;
             let changed = diesel::update(
@@ -891,7 +891,7 @@ where
             Ok(trace.commit(ScheduleRunNowOutcome {
                 schedule_run_id,
                 workflow_id,
-                scheduled_for,
+                scheduled_for: scheduled_for.get(),
             }))
         })
         .await
@@ -1121,7 +1121,7 @@ async fn append_operator_event(
             actor_type: Some("operator".to_string()),
             actor_id: Some(operator.actor_id().to_string()),
             reason: Some(operator.reason().to_string()),
-            created_at: now.get(),
+            created_at: now,
         },
     )
     .await

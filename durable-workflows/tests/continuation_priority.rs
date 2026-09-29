@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{
@@ -315,7 +316,8 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
         .await
         .unwrap();
     assert_eq!(
-        current.available_at, 0,
+        current.available_at.get(),
+        0,
         "coordinator must persist continuation priority"
     );
     let capacity = HashMap::from([(ScanTopic.key().to_owned(), 2)]);
@@ -341,10 +343,10 @@ async fn continuation_batch_keeps_stable_workflow_order_and_respects_cap_and_ret
     diesel::update(durable_activity::table.filter(durable_activity::id.eq_any(&claimed_ids)))
         .set((
             durable_activity::status.eq(ActivityStatus::Pending),
-            durable_activity::available_at.eq(now.get() + 60_000),
+            durable_activity::available_at.eq(DbMillis::from_database_millis(now.get() + 60_000)),
             durable_activity::lease_owner.eq(None::<String>),
             durable_activity::lease_token.eq(None::<String>),
-            durable_activity::lease_expires_at.eq(None::<i64>),
+            durable_activity::lease_expires_at.eq(None::<DbMillis>),
         ))
         .execute(&mut conn)
         .await
@@ -394,7 +396,7 @@ async fn failed_continuation_waits_for_backoff_then_reacquires_priority() {
     assert_eq!(failed.status, ActivityStatus::Pending);
     assert_eq!(failed.attempt_count, 1);
     assert_eq!(
-        failed.available_at - failed.updated_at,
+        failed.available_at.millis_since(failed.updated_at),
         5_000,
         "priority must not remove provider retry backoff"
     );
@@ -408,7 +410,7 @@ async fn failed_continuation_waits_for_backoff_then_reacquires_priority() {
         .await
         .unwrap();
     diesel::update(durable_activity::table.find(activity_id))
-        .set(durable_activity::available_at.eq(now.get() - 1))
+        .set(durable_activity::available_at.eq(DbMillis::from_database_millis(now.get() - 1)))
         .execute(&mut conn)
         .await
         .unwrap();
@@ -421,6 +423,6 @@ async fn failed_continuation_waits_for_backoff_then_reacquires_priority() {
         .await
         .unwrap();
     assert_ne!(continuation.id, activity_id);
-    assert_eq!(continuation.available_at, 0);
+    assert_eq!(continuation.available_at.get(), 0);
     support::drop_durable_tables(&mut conn).await;
 }

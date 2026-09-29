@@ -1,4 +1,5 @@
 use super::*;
+use durable_workflows::DbMillis;
 
 // Budgets: a 60ms timeout, a 150ms shutdown grace and a 40ms cleanup, so the
 // cleanup finishes well inside the grace and the lingering handler is dropped
@@ -550,7 +551,7 @@ async fn timed_out_handler_holding_the_activity_row_lock_does_not_block_its_fini
             total_units: None,
             severity: "info".to_string(),
             metadata_json: None,
-            created_at: now,
+            created_at: DbMillis::from_database_millis(now),
         })
         .execute(&mut blocker)
         .await

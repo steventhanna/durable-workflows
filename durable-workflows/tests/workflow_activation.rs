@@ -1,3 +1,4 @@
+use durable_workflows::DbMillis;
 mod support;
 
 use std::{sync::Arc, time::Duration};
@@ -1030,7 +1031,7 @@ async fn non_deliverable_history_never_reaches_workflow_code() {
             actor_type: Some("operator".to_string()),
             actor_id: Some("test".to_string()),
             reason: Some("history only".to_string()),
-            created_at: support::db_now_on(&mut connection).await,
+            created_at: DbMillis::from_database_millis(support::db_now_on(&mut connection).await),
         })
         .execute(&mut connection)
         .await
@@ -1253,7 +1254,7 @@ async fn sixteenth_continue_yields_to_another_ready_workflow() {
     assert_eq!(long_row.consecutive_continuations, 0);
     let delay = i64::try_from(CoordinatorConfig::default().continuation_delay.as_millis())
         .expect("continuation delay fits in i64");
-    assert!(long_row.available_at >= before_yield.get() + delay);
+    assert!(long_row.available_at.get() >= before_yield.get() + delay);
     assert_eq!(short_row.status.as_str(), "succeeded");
 
     support::drop_durable_tables(&mut connection).await;
@@ -1405,7 +1406,8 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
             .set((
                 durable_workflow::status.eq(WorkflowStatus::Running),
                 durable_workflow::lease_token.eq(Some("original-lease")),
-                durable_workflow::lease_expires_at.eq(Some(expired_at)),
+                durable_workflow::lease_expires_at
+                    .eq(Some(DbMillis::from_database_millis(expired_at))),
             ))
             .execute(&mut connection)
             .await
@@ -1434,7 +1436,8 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
                 .set((
                     durable_workflow::status.eq(current_status),
                     durable_workflow::lease_token.eq(lease),
-                    durable_workflow::lease_expires_at.eq(expiry),
+                    durable_workflow::lease_expires_at
+                        .eq(expiry.map(DbMillis::from_database_millis)),
                 ))
                 .execute(&mut connection),
         )
@@ -1460,7 +1463,7 @@ async fn expired_candidates_are_rechecked_after_renewal_or_completion() {
             .expect("current workflow");
         assert_eq!(row.status, current_status);
         assert_eq!(row.lease_token.as_deref(), lease);
-        assert_eq!(row.lease_expires_at, expiry);
+        assert_eq!(row.lease_expires_at.map(DbMillis::get), expiry);
         let recoveries = durable_workflow_event::table
             .filter(durable_workflow_event::workflow_id.eq(workflow_id))
             .filter(durable_workflow_event::event_type.eq("lease_recovered"))
@@ -1527,7 +1530,8 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
             .set((
                 durable_workflow::status.eq(WorkflowStatus::Running),
                 durable_workflow::lease_token.eq(Some("expired-lease")),
-                durable_workflow::lease_expires_at.eq(Some(expired_at)),
+                durable_workflow::lease_expires_at
+                    .eq(Some(DbMillis::from_database_millis(expired_at))),
             ))
             .execute(&mut connection)
             .await
@@ -1571,7 +1575,10 @@ async fn expired_lease_recovery_advances_past_locked_candidate_pages() {
             .filter(durable_workflow::id.eq_any(&workflow_ids[..32]))
             .filter(durable_workflow::status.eq(WorkflowStatus::Running))
             .filter(durable_workflow::lease_token.eq(Some("expired-lease")))
-            .filter(durable_workflow::lease_expires_at.eq(Some(expired_at)))
+            .filter(
+                durable_workflow::lease_expires_at
+                    .eq(Some(DbMillis::from_database_millis(expired_at))),
+            )
             .count()
             .get_result::<i64>(&mut connection)
             .await

@@ -1174,8 +1174,9 @@ non-terminating child are stable states that need an operator.
   function; every function that takes the current time takes a `DbMillis`,
   so a raw `i64` or a host stamp is a type error at the call
   (`db_millis_raw_i64_argument` compile-fail case). The timestamp columns
-  themselves are still `BIGINT` in `schema.rs`, so a raw `i64` can still be
-  compared with or written to one; test fixtures read the
+  store `BIGINT` values, but `schema.rs` gives them the distinct
+  `sql_types::DbMillis` type. A raw `i64` cannot be compared with a timestamp
+  column (`timestamp_column_raw_i64` compile-fail case). Test fixtures read the
   database clock too (`tests/support::db_now`). Tests confirm session time is
   honoured (`tests/database_time.rs`).
 - Each transaction samples `now` once, usually at the start, so stored times
