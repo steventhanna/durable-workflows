@@ -88,6 +88,21 @@ module durable_tests {
       .then(all { keepPrev, TW2_FenceMiss(1) })
       .expect(inv_S17_capAlways and inv_S17_capAtClaim and safety)
 
+  // L-W: a renewal that fails without a fence answer (a checkout or connection error; the
+  // model keeps it in flight) after the handler returned inside the confirmed lease does
+  // not end the execution: T-W3 commits the handler's outcome, and the late renewal then
+  // misses the fence (activity_worker.rs execute_claim, HeartbeatFailure::Unconfirmed)
+  run unconfirmedRenewalStillFinishesTest =
+    init
+      .then(startAndRunActivity(1))
+      .then(tw1Claim(1, 1))                                            // a1 token 3, lease to 3
+      .then(all { keepPrev, TW2_Send(1, 1, atok(1), ghost.nextHb) })   // renewal fails unanswered
+      .then(handler(1, 1, "succeeded"))
+      .then(finish(1, 1, "succeeded"))
+      .expect(db.act.get(1).status == "succeeded" and db.wf.get(1).status == "ready" and proc.hbs.size() == 1)
+      .then(all { keepPrev, TW2_FenceMiss(ghost.nextHb - 1) })
+      .expect(proc.hbs.size() == 0 and proc.execs.size() == 0 and safety)
+
   // Replay: a recorded T-W1 that under-counted in_flight is flagged by inv_S17_capAtClaim
   run tw1ReplayDetectsCapTest =
     init

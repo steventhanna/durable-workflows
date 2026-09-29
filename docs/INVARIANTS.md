@@ -419,9 +419,16 @@ deadline already passed.
   may run cleanup up to `shutdown_grace` while heartbeats continue.
 - Runtime cancellation → cancel the handler token, start the grace timer;
   if grace elapses first, outcome `Retryable(cancelled)`.
-- Heartbeat failure (fence miss or local deadline) → cancel the handler token,
-  wait at most `min(grace, last confirmed lease deadline)`, then return the
-  error **without** T-W3.
+- Heartbeat failure (fence miss or local deadline,
+  `HeartbeatFailure::LeaseLost`) → cancel the handler token, wait at most
+  `min(grace, last confirmed lease deadline)`, then return the error
+  **without** T-W3.
+- Heartbeat error without a fence answer (a pool checkout or database error,
+  `HeartbeatFailure::Unconfirmed`): if the handler has already returned and
+  the last confirmed lease deadline is still in the future, the outcome
+  stands and T-W3 runs (its fence decides; the failed renewal either
+  committed or rolled back, and a late commit only extends the lease T-W3
+  then clears). Otherwise it is handled like a heartbeat failure above.
 - Heartbeat reports the row revoked (`Renewed::Revoked`, a pause or cancel
   moved it to `cancelling`) → cancel the handler token, wait at most
   `min(grace, lease deadline)` for the handler to stop, outcome

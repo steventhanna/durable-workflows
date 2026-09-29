@@ -311,6 +311,134 @@ async fn heartbeat_failure_limits_cleanup_to_the_last_confirmed_lease() {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FinishDuringRenewalActivity;
+
+impl DurableActivity for FinishDuringRenewalActivity {
+    type Topic = CaptureTopic;
+    const KIND: &'static str = "finish_during_renewal_activity";
+    const VERSION: i32 = 1;
+    const MAX_ATTEMPTS: u32 = 3;
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const LEASE_DURATION: Duration = Duration::from_secs(10);
+
+    fn topic() -> Self::Topic {
+        CaptureTopic
+    }
+
+    fn retry_policy() -> RetryPolicy {
+        RetryPolicy::fixed(1).expect("retry policy")
+    }
+}
+
+#[derive(Default)]
+struct FinishDuringRenewalContext {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ActivityHandler for FinishDuringRenewalActivity {
+    type Context = FinishDuringRenewalContext;
+    type Output = ();
+
+    async fn execute(
+        &self,
+        context: ActivityContext<'_, Self::Context>,
+    ) -> Result<(), ActivityError> {
+        context.application().started.notify_one();
+        context.application().release.notified().await;
+        Ok(())
+    }
+}
+
+// Budgets: renewals every 50ms through a one-connection pool with a 400ms
+// checkout timeout. The test holds that connection for 600ms: a renewal that
+// starts in the first 50ms fails its checkout at 400-450ms (the handler
+// returned at 100ms), and T-W3's checkout then gets the connection at 600ms,
+// inside its own 400ms timeout. The 10s lease stays confirmed throughout.
+#[tokio::test]
+async fn unconfirmed_renewal_after_the_handler_returned_still_finishes_the_attempt() {
+    const CHECKOUT_MILLIS: u64 = 400;
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let (_, activity_id) = schedule_activity(&pool, "capture", 3, 5_000, 10_000).await;
+    let mut connection = pool.get().await.expect("connection");
+    diesel::update(durable_activity::table.find(activity_id))
+        .set((
+            durable_activity::kind.eq(FinishDuringRenewalActivity::KIND),
+            durable_activity::payload_json
+                .eq(serde_json::to_string(&FinishDuringRenewalActivity).expect("payload")),
+        ))
+        .execute(&mut connection)
+        .await
+        .expect("activity payload");
+    drop(connection);
+    let url = support::durable_database_url().expect("fixture URL");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        durable_workflows::DurableConnection,
+    >::new(url);
+    let limited_pool = diesel_async::pooled_connection::bb8::Pool::builder()
+        .max_size(1)
+        .min_idle(Some(1))
+        .connection_timeout(Duration::from_millis(CHECKOUT_MILLIS))
+        .build(manager)
+        .await
+        .expect("short-checkout worker pool");
+    let context = Arc::new(FinishDuringRenewalContext::default());
+    let worker = durable_workflows::ActivityWorker::new(
+        limited_pool.clone(),
+        context.clone(),
+        Arc::new(
+            durable_workflows::register_durable_activities!(
+                FinishDuringRenewalContext; FinishDuringRenewalActivity
+            )
+            .expect("activities"),
+        ),
+        Arc::new(durable_workflows::register_durable_topics!(CaptureTopic).expect("topics")),
+        "renewal-failure-worker",
+        WorkerConfig::default().with_heartbeat_interval(Duration::from_millis(50)),
+    )
+    .expect("worker");
+    let mut run = tokio::spawn(async move { worker.run_one("capture").await });
+    tokio::select! {
+        () = context.started.notified() => {}
+        finished = &mut run => panic!("run_one finished before the handler started: {finished:?}"),
+        () = tokio::time::sleep(Duration::from_secs(2)) => panic!("the handler starts"),
+    }
+    let held = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(held) = limited_pool.get().await {
+                break held;
+            }
+        }
+    })
+    .await
+    .expect("hold the only worker connection");
+    // A renewal is now waiting on the held connection; the handler returns under it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    context.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(held);
+    let result = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("bounded finish")
+        .expect("worker join");
+    assert_eq!(
+        result.expect("a failed renewal inside the confirmed lease keeps the handler's outcome"),
+        Some(activity_id)
+    );
+    let mut connection = pool.get().await.expect("connection");
+    let status = durable_activity::table
+        .find(activity_id)
+        .select(durable_activity::status)
+        .first::<durable_workflows::persistence::ActivityStatus>(&mut connection)
+        .await
+        .expect("activity status");
+    assert_eq!(status.as_str(), "succeeded");
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct LockingProgressActivity;
 
 impl DurableActivity for LockingProgressActivity {

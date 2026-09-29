@@ -859,6 +859,24 @@ where
                         continue;
                     }
                     if let Err(failure) = result {
+                        let lease_deadline = match &failure {
+                            HeartbeatFailure::LeaseLost { lease_deadline } => *lease_deadline,
+                            HeartbeatFailure::Unconfirmed { error, lease_deadline } => {
+                                if execution_finished
+                                    && tokio::time::Instant::now() < *lease_deadline
+                                {
+                                    // The handler returned inside the last confirmed
+                                    // lease, which still holds: T-W3's fence decides.
+                                    tracing::warn!(
+                                        %error,
+                                        "lease renewal failed after the handler returned; finishing under the last confirmed lease"
+                                    );
+                                    heartbeat_stopped = true;
+                                    continue;
+                                }
+                                *lease_deadline
+                            }
+                        };
                         child_cancellation.cancel();
                         heartbeat_stop.cancel();
                         if !execution_finished {
@@ -866,7 +884,7 @@ where
                                 shutdown_deadline.deadline()
                             } else {
                                 tokio::time::Instant::now() + self.config.shutdown_grace
-                            }.min(failure.lease_deadline);
+                            }.min(lease_deadline);
                             // Cleanup cannot outlive the last confirmed lease when renewal fails.
                             if deadline > tokio::time::Instant::now() {
                                 tokio::select! {
@@ -883,7 +901,7 @@ where
                                 }
                             }
                         }
-                        return Err(failure.error);
+                        return Err(failure.into_error());
                     }
                     heartbeat_stopped = true;
                 }
@@ -957,9 +975,40 @@ where
     }
 }
 
-struct HeartbeatFailure {
-    error: DurableError,
-    lease_deadline: tokio::time::Instant,
+/// How a heartbeat loop that lost or could not confirm its lease ended.
+/// `lease_deadline` is the last confirmed local lease deadline.
+enum HeartbeatFailure {
+    /// A renewal missed the lease fence, or the local deadline passed: the
+    /// lease is gone, so the executor must not run T-W3.
+    LeaseLost {
+        lease_deadline: tokio::time::Instant,
+    },
+    /// A renewal failed without an answer from the fence (a pool checkout or
+    /// database error): the last confirmed lease still holds until
+    /// `lease_deadline`.
+    Unconfirmed {
+        error: DurableError,
+        lease_deadline: tokio::time::Instant,
+    },
+}
+
+impl HeartbeatFailure {
+    fn from_renewal_error(error: DurableError, lease_deadline: tokio::time::Instant) -> Self {
+        match error {
+            DurableError::FencedWrite => Self::LeaseLost { lease_deadline },
+            error => Self::Unconfirmed {
+                error,
+                lease_deadline,
+            },
+        }
+    }
+
+    fn into_error(self) -> DurableError {
+        match self {
+            Self::LeaseLost { .. } => DurableError::FencedWrite,
+            Self::Unconfirmed { error, .. } => error,
+        }
+    }
 }
 
 /// How a heartbeat loop that kept its lease ended.
@@ -1023,7 +1072,7 @@ async fn heartbeat_loop(
                         record_execution_step(&pool, &actor, &claim, "LocalDeadline", None).await;
                     });
                 }
-                return Err(HeartbeatFailure { error: DurableError::FencedWrite, lease_deadline });
+                return Err(HeartbeatFailure::LeaseLost { lease_deadline });
             }
             _ = heartbeat.tick() => {}
         }
@@ -1054,12 +1103,7 @@ async fn heartbeat_loop(
                     lease_deadline: deadline,
                 })
             }
-            Err(error) => {
-                return Err(HeartbeatFailure {
-                    error,
-                    lease_deadline,
-                })
-            }
+            Err(error) => return Err(HeartbeatFailure::from_renewal_error(error, lease_deadline)),
         }
     }
 }

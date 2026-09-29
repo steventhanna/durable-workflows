@@ -356,3 +356,9 @@ Compared with the production-internal version it was extracted from:
 - G12: admin run-now respects the schedule's overlap policy (see Changed).
 - G11: cancelling or superseding a parent no longer leaves the children it
   owns running (see Changed).
+- An activity whose handler returned while a lease renewal was in flight no
+  longer loses its outcome when that renewal fails with a pool checkout or
+  database error (not a fence miss) before the last confirmed lease
+  deadline. The executor now runs T-W3, whose fence decides; before, it
+  returned the error without T-W3, so lease expiry requeued a handler that
+  had succeeded, or dead-lettered it on its last attempt.
