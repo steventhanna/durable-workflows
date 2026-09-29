@@ -50,8 +50,12 @@ pub struct CoordinatorConfig {
     pub max_consecutive_continuations: u32,
     pub continuation_delay: Duration,
     /// Longest a workflow `step` may run. A step that exceeds it, or panics,
-    /// is a bounded activation failure (T-C3). Defaults to the default
-    /// `lease_duration` (30 s).
+    /// is a bounded activation failure (T-C3). Default 20 s, a third below
+    /// the default `lease_duration` (30 s). Keep it below `lease_duration`
+    /// with a margin for the claim-to-step delay and the T-C3 commit: the
+    /// lease is not renewed during a step, so a step that times out at or
+    /// after lease expiry races lease recovery by another runtime, and a
+    /// T-C3 that loses that race records no activation attempt (G3, S8).
     pub step_timeout: Duration,
 }
 
@@ -67,7 +71,7 @@ impl Default for CoordinatorConfig {
             }),
             max_consecutive_continuations: 16,
             continuation_delay: Duration::from_millis(100),
-            step_timeout: Duration::from_secs(30),
+            step_timeout: Duration::from_secs(20),
         }
     }
 }
@@ -1490,4 +1494,18 @@ fn duration_millis(duration: Duration) -> Result<i64, DurableError> {
     i64::try_from(duration.as_millis()).map_err(|_| {
         DurableError::InvalidDefinition("duration exceeds the database range".to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G3/S8: with the defaults, a timed-out step finishes (T-C3) before its
+    /// workflow lease expires, leaving a third of the lease as margin.
+    #[test]
+    fn default_step_timeout_leaves_a_margin_below_the_lease() {
+        let config = CoordinatorConfig::default();
+        assert!(config.step_timeout < config.lease_duration);
+        assert!(config.lease_duration - config.step_timeout >= config.lease_duration / 3);
+    }
 }

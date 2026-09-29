@@ -52,9 +52,12 @@ production on MySQL since August 2026.
   (`sql_types::WorkflowId`, `ActivityId`, `ApprovalId`, `ScheduleRunId`), so
   downstream code can name the SQL type of an id column of the public
   `schema` (for example `impl Expression<SqlType = sql_types::WorkflowId>`).
-- `CoordinatorConfig::step_timeout` (default 30 s, the default lease;
-  must be non-zero): the longest a workflow `step` may run before the
-  activation fails.
+- `CoordinatorConfig::step_timeout` (default 20 s, a third below the
+  30 s default lease; must be non-zero): the longest a workflow `step` may
+  run before the activation fails. Keep it below `lease_duration` with a
+  margin: a step that times out after its lease expired races lease
+  recovery by another runtime, and the lost T-C3 records no activation
+  attempt (G3).
 - `RuntimeConfig::restart_window` (default 10 minutes; must be non-zero):
   `max_task_restarts` now counts restarts of one task within this window,
   not over the process lifetime.

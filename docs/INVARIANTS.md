@@ -314,7 +314,8 @@ There is no workflow lease renewal anywhere in the code.
 deliverable event with `deliverySequence > deliveredEventSequence`
 (`src/persistence/events.rs` `next_delivery_event`); error if none. Run
 `WorkflowRegistry::step_stored(input, state, event)` (user code) under an
-unwind boundary and `CoordinatorConfig::step_timeout` (default 30 s): a panic
+unwind boundary and `CoordinatorConfig::step_timeout` (default 20 s, below
+the 30 s default lease; see G3): a panic
 or a timeout is an activation failure (T-C3; G3, fixed). A build with
 `panic = "abort"` still aborts the process on a panic.
 Validate that a `RunChild`/`RunActivity` target is registered locally and the
@@ -1351,11 +1352,23 @@ budget. A `step` that never returns blocks that runtime's only coordinator
 loop (`src/runtime/supervisor.rs` `run_task`; no timeout around
 `src/runtime/coordinator.rs` `WorkflowCoordinator::activate_claim_inner`), and after lease expiry the next
 runtime that claims it also blocks. **Fixed**: `step` runs under an unwind
-boundary and `CoordinatorConfig::step_timeout` (default 30 s, the default
-lease); a panic (`step panicked: <message>`) or a timeout (`step exceeded
-step_timeout`) is a T-C3 activation failure, so the workflow fails after
-`min(max_activation_attempts, 8)` attempts. Lease recovery still does not
-count an attempt (intended; S8). A `panic = "abort"` build still aborts, and a
+boundary and `CoordinatorConfig::step_timeout` (default 20 s, below the
+30 s default lease); a panic (`step panicked: <message>`) or a timeout
+(`step exceeded step_timeout`) is a T-C3 activation failure, so the workflow
+fails after `min(max_activation_attempts, 8)` attempts. Lease recovery still
+does not count an attempt (intended; S8). The bound needs the timed-out
+T-C3 to commit before the workflow lease expires: the lease is not renewed
+during a step, and the step starts only after T-C1 committed and the event
+was read. With `step_timeout` at or above `lease_duration`, another
+runtime's T-C1 can recover and reclaim the row first; the T-C3 then misses
+its fence (benign `FenceMiss`), records no attempt, and the step runs again
+there, so on several runtimes the bound holds only for the cycles T-C3
+wins. The default keeps a third of the lease as margin (unit test
+`default_step_timeout_leaves_a_margin_below_the_lease`); a config that sets
+`step_timeout >= lease_duration` is not rejected yet (open: rejecting it
+needs a decision on the N4 stale-coordinator tests, which build a stale
+claim from a step that outlives a short lease under the default
+`step_timeout`). A `panic = "abort"` build still aborts, and a
 `step` that blocks its thread without yielding cannot be timed out. Tests:
 `g3_panicking_step_fails_at_the_activation_cap`,
 `g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts`.
