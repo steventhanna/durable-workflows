@@ -250,7 +250,10 @@ mod tests {
             assert!(serde_json::from_str::<WorkflowId>(text).is_err(), "{text}");
             assert!(serde_json::from_str::<ActivityId>(text).is_err(), "{text}");
             assert!(serde_json::from_str::<ApprovalId>(text).is_err(), "{text}");
-            assert!(serde_json::from_str::<ScheduleRunId>(text).is_err(), "{text}");
+            assert!(
+                serde_json::from_str::<ScheduleRunId>(text).is_err(),
+                "{text}"
+            );
         }
         let id: WorkflowId = serde_json::from_str("7").expect("a positive id decodes");
         assert_eq!(id.get(), 7);
