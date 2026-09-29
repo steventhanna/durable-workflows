@@ -48,6 +48,10 @@ production on MySQL since August 2026.
 - `docs/INVARIANTS.md` (protocol invariants), a Quint model of the core
   protocol in `spec/`, and reproduction tests for the known gaps in
   `tests/gaps.rs`.
+- `durable_workflows::sql_types`: the SQL types of the id columns
+  (`sql_types::WorkflowId`, `ActivityId`, `ApprovalId`, `ScheduleRunId`), so
+  downstream code can name the SQL type of an id column of the public
+  `schema` (for example `impl Expression<SqlType = sql_types::WorkflowId>`).
 - `CoordinatorConfig::step_timeout` (default 30 s, the default lease;
   must be non-zero): the longest a workflow `step` may run before the
   activation fails.

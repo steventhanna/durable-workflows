@@ -28,6 +28,22 @@ use crate::{Db, DurableError};
 
 /// SQL types of the id columns. Each is a `BIGINT` on the wire (signed on
 /// both backends), distinct only to the type checker.
+///
+/// Public (re-exported as `durable_workflows::sql_types`) so downstream code
+/// can name the SQL type of a column in [`crate::schema`], for example in a
+/// helper that returns an id expression or a custom query:
+///
+/// ```
+/// use diesel::prelude::*;
+/// use durable_workflows::{schema::durable_activity, sql_types};
+///
+/// fn parent_column() -> impl Expression<SqlType = sql_types::WorkflowId> {
+///     durable_activity::workflow_id
+/// }
+/// # let _ = parent_column();
+/// ```
+///
+/// Only the matching id newtype reads and writes each type.
 pub mod sql_types {
     macro_rules! define_id_sql_type {
         ($name:ident) => {

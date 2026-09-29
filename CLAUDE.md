@@ -46,7 +46,7 @@ system can make the violation fail to compile. In order of preference:
    `Locked<ClaimFence>` that `lock_fence` returns, N4; `commit_child`'s parent
    update takes the `ChildStart` whose `Existing` arm is the locked child,
    G9), a SQL type per id column (each id column in `schema.rs` has its own
-   type from `ids::sql_types`, and only the matching id newtype is
+   type from `ids::sql_types` (public as `durable_workflows::sql_types`), and only the matching id newtype is
    `AsExpression`/`FromSql` for it, so comparing `durable_workflow::id`
    with an `ActivityId` is E0277: `id_swapped_in_query` compile-fail case;
    `wait_reference_id` stays `BigInt` and is compared through
