@@ -1310,8 +1310,12 @@ async fn set_child_wait(
     ensure_fenced(changed)
 }
 
-/// Whether `target` is the claimed workflow or on its `parent_workflow_id`
-/// chain. A parent exists before its child, so the chain ends.
+/// Whether `target` is the claimed workflow or one of its ancestors (G8). The
+/// walk follows `parent_workflow_id`, and from a row without a parent its
+/// `restarted_from_workflow_id`: a T-X2 or T-A5 successor carries no parent,
+/// but it stands in for the generation it restarted, whose parent G2 may have
+/// re-attached to it. Both links point at a row inserted earlier, so the
+/// walk ends.
 async fn is_caller_or_ancestor(
     connection: &mut crate::DurableConnection,
     claim: &ClaimedRow,
@@ -1322,15 +1326,22 @@ async fn is_caller_or_ancestor(
         if id == target {
             return Ok(true);
         }
-        current = if id == claim.row.id {
-            claim.row.parent_workflow_id
+        let (parent, restarted_from) = if id == claim.row.id {
+            (
+                claim.row.parent_workflow_id,
+                claim.row.restarted_from_workflow_id,
+            )
         } else {
             durable_workflow::table
                 .find(id)
-                .select(durable_workflow::parent_workflow_id)
-                .first::<Option<WorkflowId>>(connection)
+                .select((
+                    durable_workflow::parent_workflow_id,
+                    durable_workflow::restarted_from_workflow_id,
+                ))
+                .first::<(Option<WorkflowId>, Option<WorkflowId>)>(connection)
                 .await?
         };
+        current = parent.or(restarted_from);
     }
     Ok(false)
 }

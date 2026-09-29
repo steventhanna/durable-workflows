@@ -83,12 +83,14 @@
  *   G2  fixed: T-X2 re-points the superseded row's waiting parents to its successor (S24 in `safety`)
  *   G7  inv_S17_capAlways (RR_SNAPSHOT only)
  *   G10 fixed: TW1_QuarantineRow (an invalid row no longer aborts every topic's claims)
- *   G11 fixed: T-X3/T-A4 cancel every generation of the owned auto-keyed children, recursively
- *       (cancelTargets; inv_G11_cancelReachesChildren, inv_G11_cancelReachesGenerations in `safety`).
+ *   G11 fixed: T-X3/T-A4, and T-X2 when it supersedes a blocked row, cancel every generation of
+ *       the owned auto-keyed children, recursively (cancelTargets; inv_G11_cancelReachesChildren,
+ *       inv_G11_cancelReachesGenerations in `safety`).
  *       Domain-keyed children keep running (intended). T-A5 is unmodeled.
  *   N1  fixed: T-X2's newest generation is the end of the keyed row's restartedFrom chain (tx2Latest)
  *   D4  TC2_RunChild attaches to the newest generation of the keyed row (newestGen)
- *   G8  fixed: TC2_RunChild never attaches to the caller or an ancestor (inv_G8_noAncestorWait, in `safety`)
+ *   G8  fixed: TC2_RunChild never attaches to the caller or an ancestor, through restart lineage
+ *       too (selfAndAncestors; inv_G8_noAncestorWait, in `safety`)
  *   G1  inv_G1_noSelfCancelFromOperator (fixed; in `safety`: a coordinator never errors)
  *   N2  fixed: cancel/pause revoke a running activity to cancelling, which keeps its slot until
  *       TW3_Revoked or reconcile settles it (inv_S13_topicConcurrency, in `safety`)
@@ -339,9 +341,12 @@ module durable {
   // (S19: at most one successor per row, so the chain is linear); 0 stays 0
   pure def newestGen(d: Db, x: int): int =
     WF_IDS.fold(x, (cur, i) => { val s = successorsOf(d, cur); if (s == Set()) cur else anyOf(s) })
-  // coordinator.rs is_caller_or_ancestor: w and its parent chain (MAX_WF rounds reach the root)
+  // coordinator.rs is_caller_or_ancestor: w and its ancestors. Each step follows the parent,
+  // or from a row without one (a T-X2/T-A5 successor) the row it was restarted from, whose
+  // parent G2 may have re-attached to it. MAX_WF rounds reach the root.
+  pure def lineageUp(r: WfRow): int = if (r.parent != 0) r.parent else r.restartedFrom
   pure def selfAndAncestors(d: Db, w: int): Set[int] =
-    WF_IDS.fold(Set(w), (acc, i) => acc.union(acc.map(x => d.wf.get(x).parent).filter(p => p != 0)))
+    WF_IDS.fold(Set(w), (acc, i) => acc.union(acc.map(x => lineageUp(d.wf.get(x))).filter(p => p != 0)))
   // T-X2 (G2 fixed): every parent waiting on the superseded row c waits on its successor
   // instead. The code re-attaches only when the successor runs c's version and otherwise
   // wakes the parents with child_failed (child_superseded); versions are not modeled.
@@ -387,12 +392,16 @@ module durable {
   //   superseded = false, successor exists: Conflict, all rolled back  -> TX2_Conflict
   //                                       (unreachable here: latest ends its chain; the code keeps the path)
   //   superseded = true                 : successor sNew, cancel latest's dead letters,
-  //                                       blocked -> cancelled and its waiting parents re-pointed to sNew
+  //                                       blocked -> cancelled and its waiting parents re-pointed to sNew,
+  //                                       and (G11) the cascade cancels every live generation of the
+  //                                       children it owns, as cancel_owned_descendants
   action TX2_RecoverableStart(kind: str, key: int, orig: int, latest: int, superseded: bool, sNew: int, tnow: int): bool = {
     val root = if (orig == 0) 0 else rootOf(db, orig)
     val lr = db.wf.get(latest)
     val failedOrBlocked = latest != 0 and (lr.status == "failed" or lr.status == "blocked")
     val succ = successorsOf(db, latest)
+    // the cascade's targets below the blocked row it supersedes
+    val ts = if (latest != 0 and lr.status == "blocked") cancelTargets(db, latest).exclude(Set(latest)) else Set()
     all {
       key != NO_KEY,
       orig == tx2Orig(db, kind, key), latest == tx2Latest(db, kind, key),
@@ -409,12 +418,17 @@ module durable {
       } else all {
         failedOrBlocked, succ == Set(), sNew == db.nextWf, sNew <= MAX_WF,
         not(ACT_IDS.exists(a => db.act.get(a).wf == latest and actLocked(proc, a))),
+        ts.forall(x => all {
+          not(wfLocked(proc, x)),
+          not(ACT_IDS.exists(a => db.act.get(a).wf == x and actLocked(proc, a))),
+        }),
         // cancel its dead_lettered activities
         val d1 = ACT_IDS.fold(db, (acc, a) =>
           if (acc.act.get(a).wf == latest and acc.act.get(a).status == "dead_lettered")
             setAct(acc, a, acc.act.get(a).with("status", "cancelled")) else acc)
         // blocked -> cancelled (its own wait fields kept), its waiting parents re-pointed to sNew
-        val d2 = if (lr.status == "blocked") reattachParents(setWf(d1, latest, lr.with("status", "cancelled").with("token", 0).with("leaseExp", 0)), latest, sNew)
+        // then the G11 cascade to its owned generations (ts is empty unless it was blocked)
+        val d2 = if (lr.status == "blocked") cancelWriteTo(reattachParents(setWf(d1, latest, lr.with("status", "cancelled").with("token", 0).with("leaseExp", 0)), latest, sNew), ts)
                  else d1
         val d3 = newStarted(d2, sNew, { ...emptyWf, status: "ready", kind: kind, availableAt: tnow, root: root, restartedFrom: latest })
         commitAt(d3, proc, ghost, "TX2_RecoverableStart", tnow),
@@ -1542,15 +1556,16 @@ module durable {
   // and may outlive it (intended).
   val inv_G11_cancelReachesChildren = WF_IDS.forall(p => db.wf.get(p).status == "cancelled" implies
     WF_IDS.forall(c => (ownedBy(db.wf.get(c), p) and db.wf.get(c).status != "none") implies isTerminal(db.wf.get(c).status)))
-  // G11 (fixed), generations: a cancel step (T-X3, T-A4) leaves no live generation of a child
-  // owned by any row it cancelled. An action property: a later T-X2 or T-A5 may restart a
-  // terminal child of a cancelled parent on purpose.
-  val inv_G11_cancelReachesGenerations = Set("TX3_Cancel", "AdminCancel").contains(lastAction) implies
+  // G11 (fixed), generations: a cancel step (T-X3, T-A4, or a T-X2 that supersedes a blocked
+  // row) leaves no live generation of a child owned by any row it cancelled. An action
+  // property: a later T-X2 or T-A5 may restart a terminal child of a cancelled parent on purpose.
+  val inv_G11_cancelReachesGenerations = Set("TX3_Cancel", "AdminCancel", "TX2_RecoverableStart").contains(lastAction) implies
     WF_IDS.forall(p => (db.wf.get(p).status == "cancelled" and prevWf.get(p) != "cancelled") implies
       WF_IDS.forall(g => ownedGenOf(db, g, p) implies isTerminal(db.wf.get(g).status)))
 
-  // G8 (fixed): no workflow waits on itself or an ancestor. Cycles through non-ancestors
-  // (two keyed rows that name each other) are not guarded.
+  // G8 (fixed): no workflow waits on itself or an ancestor, restart lineage included
+  // (selfAndAncestors). Cycles through non-ancestors (two keyed rows that name each other)
+  // are not guarded.
   val inv_G8_noAncestorWait = WF_IDS.forall(w => {
     val r = db.wf.get(w)
     not(r.waitKind == "child" and selfAndAncestors(db, w).contains(r.waitRef))

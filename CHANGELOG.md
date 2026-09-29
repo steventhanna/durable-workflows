@@ -228,8 +228,10 @@ Compared with the production-internal version it was extracted from:
 - Cancelling a workflow cancels every generation of the child workflows it
   owns (the child and its recovery or restart successors), and theirs, in
   the same transaction (G11): `DurableStore::cancel_with_conn`,
-  `AdminControlService::cancel_workflow`, and an admin restart that
-  supersedes a paused or blocked source. A child is owned when the flow
+  `AdminControlService::cancel_workflow`, an admin restart that
+  supersedes a paused or blocked source, and a
+  `DurableStore::start_or_restart_recoverable` that supersedes a blocked
+  workflow (reason `a successor recovery generation was started`). A child is owned when the flow
   started it with `WfCtx::child` (key `child:{parent}:{command}`); a child
   started with `WfCtx::child_with_key` may be shared and keeps running. The
   child's history records `workflow_cancelled` with the reason
@@ -328,7 +330,11 @@ Compared with the production-internal version it was extracted from:
 - G8: `child_with_key` resolving to the calling workflow or one of its
   ancestors is an activation failure (`InvalidDefinition`: "child key {k}
   resolves to workflow {id}, which is the caller or an ancestor") instead of
-  a wait that never ends. Wait cycles through keyed workflows that are not
+  a wait that never ends. The ancestors include those reached through
+  restart lineage: a recovery or restart successor, which has no parent row
+  of its own, counts the parent of the generation it restarted, so the
+  recovery successor of a blocked child can no longer wait on the parent
+  that waits on it. Wait cycles through keyed workflows that are not
   ancestors of each other are still not detected.
 - N2: an application cancel or operator pause no longer frees the topic
   concurrency slot while the revoked handler still runs, so a cap-1 topic

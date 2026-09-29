@@ -178,7 +178,7 @@ pre-read misses but the insert collides with (a concurrent commit inserted it)
 takes the same path: the conflict returns the keyed row locked, and the same
 walk and version check follow (G6, fixed); a mismatch is `DefinitionMismatch`.
 A key that resolves to the caller or one of its ancestors
-(`parentWorkflowId` chain) is `InvalidDefinition` (G8, fixed). Both roll back
+(`parentWorkflowId` chain, through restart lineage: G8) is `InvalidDefinition` (G8, fixed). Both roll back
 the commit and are T-C3 activation failures. Parent-side
 states:
 
@@ -553,7 +553,10 @@ old cursor, version, and fingerprint (`ScheduleMaterializer::materialize_schedul
   version (`W::VERSION`) their `waitReferenceId` moves to the successor
   (status and `availableAt` unchanged; history `child_wait_reattached` with
   `{from, to}`), otherwise they are woken with `child_failed`
-  (`child_superseded`) as after an operator restart (G2 fixed).
+  (`child_superseded`) as after an operator restart (G2 fixed). Then
+  `cancel_owned_descendants` cancels every live generation of the children
+  the blocked newest owns, as in T-X3, with the reason `parent workflow {p}
+  cancelled: a successor recovery generation was started` (G11).
 - **T-X3 cancel_with_conn**: inside the caller's transaction; lock
   workflow `FOR UPDATE`; terminal → no-op; else `cancel_locked_workflow`:
   `cancel_activities` moves `pending` activities to `cancelled`
@@ -628,7 +631,7 @@ Each action is one transaction that first locks the workflow `FOR UPDATE`
   `waitReferenceId`, so the scan can lock many rows; UNCLEAR how many).
 - `RunChild` commit attaching to an existing child: child → parent, the same
   order as the previous line (G9, fixed; it was parent → child).
-- Cancel cascade (T-X3, T-A4, T-A5; G11): parent → each owned child (siblings
+- Cancel cascade (T-X3, T-A4, T-A5, T-X2 of a blocked row; G11): parent → each owned child (siblings
   in id order) → each later generation on its restart chain, oldest first
   (the order T-X2 uses) → each cancelled generation's activities and
   approvals → its owned children. This is
@@ -890,7 +893,8 @@ for every live generation of every child the workflow owns (key
 `child:{parent}:{command}`, and the T-X2/T-A5 successors on its restart
 chain), and for theirs (G11 fixed: a parent's cancel reaches every
 generation of its owned children); a T-A5 supersession of a non-terminal
-source does it for the source's owned children. A child started with a domain key is not
+source and a T-X2 supersession of a blocked newest generation do it for the
+superseded row's owned children. A child started with a domain key is not
 owned and keeps running (intended: the key may be shared by other parents).
 `cancel_with_conn` is idempotent on terminal workflows; admin cancel returns
 Conflict. **ENFORCED** (model `inv_S25_cancelAtomic` and
@@ -1433,18 +1437,32 @@ test `g7CapExceededTest`) still violate S17, as expected.
 calling workflow or an ancestor (same kind and key). `commit_child` then
 waits on a non-terminal row (`src/runtime/coordinator.rs`). There is
 no cycle detection. Liveness only. **Fixed** for the caller and its
-ancestors: after a dedup hit, `commit_child` walks the caller's
-`parentWorkflowId` chain and returns `InvalidDefinition` ("child key {k}
+ancestors: after a dedup hit, `commit_child` walks the caller's ancestor
+chain and returns `InvalidDefinition` ("child key {k}
 resolves to workflow {id}, which is the caller or an ancestor"), a T-C3
 activation failure, before the parent update. For the caller's own key the
 keyed row `insert_child` locks is the caller's row, the only lock the
 transaction holds when it rolls back, so there is no second lock and no
-wait. Intended (not fixed): cycles through keyed rows that are not ancestors
-of each other (A waits on B's key while B waits on A's) stay unguarded. Tests:
+wait. The ancestor chain follows `parentWorkflowId`, and from a row without
+one (a T-X2 or T-A5 successor, which is inserted with no parent) its
+`restartedFromWorkflowId`: a successor stands in for the generation it
+restarted, so that generation's parent is the successor's ancestor. Without
+this step the T-X2 successor of a blocked child, to which G2 re-attached the
+parent, could wait on that parent while the parent waited on it (fixed
+2026-09-28). The rule is the same as for the first generation: the successor
+replays the same code, which would have been rejected at the same step. It
+also rejects a T-A5 successor of a terminal child that asks for its old
+parent's key although that parent no longer waits on it (no cycle then); that
+is the same design error G8 exists to report. Intended (not fixed): cycles
+through keyed rows that are not ancestors of each other (A waits on B's key
+while B waits on A's) stay unguarded. Tests:
 `g8_child_key_resolving_to_self_does_not_wait_on_itself`,
-`g8_child_key_resolving_to_a_grandparent_is_an_activation_failure`. Model:
-`TC2_RunChild` never attaches to the caller or an ancestor
-(`inv_G8_noAncestorWait`, in `safety`).
+`g8_child_key_resolving_to_a_grandparent_is_an_activation_failure`,
+`g8_child_key_resolving_to_the_parent_of_a_restart_successor_is_an_activation_failure`.
+Model: `TC2_RunChild` never attaches to the caller or an ancestor
+(`selfAndAncestors`, restart lineage included; `inv_G8_noAncestorWait`, in
+`safety`; directed tests `g8LineageParentKeyRejectedTest`,
+`g8LineageActivationFailureTest`).
 
 **G9. Lock-order inversion between a child's terminal commit and a parent
 attaching to it.** A child's terminal transaction locks the child, then scans
@@ -1482,8 +1500,10 @@ row in `TW1_Claim.quarantined` (interface v5). Tests:
 **G11. Parent cancellation does not reach descendants** (specification gap).
 See the rejected candidate in §3. Child workflows and their external side
 effects continue after the parent is cancelled or superseded.
-**Fixed** for owned children: `cancel_locked_workflow` (T-X3, T-A4) and the
-T-A5 supersession of a non-terminal source call `cancel_owned_descendants`,
+**Fixed** for owned children: `cancel_locked_workflow` (T-X3, T-A4), the
+T-A5 supersession of a non-terminal source and the T-X2 supersession of a
+blocked newest generation (fixed 2026-09-28; before, T-X2 left the owned
+children's live generations running) call `cancel_owned_descendants`,
 which cancels every live generation of every child whose key is
 `child:{parent}:{command}` (the child and the T-X2/T-A5 successors on its
 restart chain, to which G2 may have re-attached the parent), and their owned
@@ -1493,11 +1513,15 @@ history records `workflow_cancelled` with reason
 `parent workflow {p} cancelled: {reason}`, and its running activities become
 `cancelling` (N2). Documented as intended: a child started with a domain key
 is not owned and keeps running. Model: `cancelWrite` cancels
-`cancelTargets`; `inv_G11_cancelReachesChildren` (owned children) and the
-action property `inv_G11_cancelReachesGenerations` are in `safety`. Tests:
+`cancelTargets`, and `TX2_RecoverableStart` cancels them below a blocked
+row it supersedes; `inv_G11_cancelReachesChildren` (owned children) and the
+action property `inv_G11_cancelReachesGenerations` (after `TX3_Cancel`,
+`AdminCancel` and `TX2_RecoverableStart`) are in `safety`; directed test
+`g11Tx2SupersedeCascadeTest`. Tests:
 `g11_parent_cancellation_cancels_child_workflow`,
 `g11_cancel_reaches_grandchildren`,
 `g11_cancel_reaches_the_restart_successor_of_an_owned_child`,
+`g11_recoverable_start_of_a_blocked_parent_cancels_its_owned_generations`,
 `g11_domain_keyed_child_survives_parent_cancellation`,
 `g11_cascade_revokes_a_running_child_activity` (`tests/gaps.rs`) and
 `restart_supersession_cancels_the_owned_child` (`tests/admin_controls.rs`),

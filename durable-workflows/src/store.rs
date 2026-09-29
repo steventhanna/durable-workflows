@@ -514,7 +514,7 @@ impl DurableStore {
                     metadata_json: None,
                     actor_type: Some("system".to_string()),
                     actor_id: None,
-                    reason: Some("a successor recovery generation was started".to_string()),
+                    reason: Some(SUPERSEDED_BY_RECOVERY.to_string()),
                     created_at: now.get(),
                 },
             )
@@ -524,6 +524,14 @@ impl DurableStore {
                 latest.as_ref(),
                 successor.workflow_id,
                 W::VERSION,
+                now,
+            )
+            .await?;
+            cancel_owned_descendants(
+                transaction,
+                latest.as_ref(),
+                SUPERSEDED_BY_RECOVERY,
+                None,
                 now,
             )
             .await?;
@@ -853,6 +861,10 @@ async fn lock_successor<'tx>(
     )
     .await?)
 }
+
+/// The reason T-X2 records on a blocked row it supersedes; the G11 cascade
+/// passes it on to the children that row owns.
+const SUPERSEDED_BY_RECOVERY: &str = "a successor recovery generation was started";
 
 /// T-X2 supersedes the blocked row `superseded` with `successor`. Parents that
 /// wait on it (`waiting_child`, or `paused` with a child wait) wait on the

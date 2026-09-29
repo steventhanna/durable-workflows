@@ -341,6 +341,52 @@ impl DurableFlow for G11RecoveringParent {
     }
 }
 
+// Fails on its first generation (`fail`); a recovery generation blocks on a
+// dead-lettered activity.
+gap_flow!(
+    G11FailingChild { fail: bool },
+    "gap_g11_failing_child",
+    1,
+    |this, ctx| {
+        if this.fail {
+            return Err(WfError::Domain {
+                category: "test".to_string(),
+                message: "first generation fails".to_string(),
+            });
+        }
+        ctx.run(&G2FailingActivity).await
+    }
+);
+
+// Starts an owned child that fails, handles the failure and then blocks
+// itself, for the G11 test of a T-X2 supersession.
+gap_flow!(G11Tx2Parent {}, "gap_g11_tx2_parent", 1, |_this, ctx| {
+    let _ = ctx.child(&G11FailingChild { fail: true }).await;
+    ctx.run(&G2FailingActivity).await
+});
+
+// Owns a `G8LineageChild`; started with the key the child asks for.
+gap_flow!(
+    G8LineageParent {},
+    "gap_g8_lineage_parent",
+    1,
+    |_this, ctx| ctx.child(&G8LineageChild { fail: true }).await
+);
+
+// Blocks on its first generation (`fail`); its recovery generation asks for
+// a child with its parent's key.
+gap_flow!(
+    G8LineageChild { fail: bool },
+    "gap_g8_lineage_child",
+    1,
+    |this, ctx| {
+        if this.fail {
+            ctx.run(&G2FailingActivity).await?;
+        }
+        ctx.child_with_key(&G8LineageParent {}, "g8-lineage").await
+    }
+);
+
 gap_flow!(G11Grandparent {}, "gap_g11_grandparent", 1, |_this, ctx| {
     ctx.child(&G11Parent {}).await
 });
@@ -451,7 +497,11 @@ fn workflows() -> Arc<WorkflowRegistry<GapContext>> {
             G11KeyedParent,
             G11RunningChild,
             G11RunningParent,
-            G11RecoveringParent
+            G11RecoveringParent,
+            G11Tx2Parent,
+            G11FailingChild,
+            G8LineageParent,
+            G8LineageChild
         )
         .expect("workflow registry is valid"),
     )
@@ -1086,6 +1136,100 @@ async fn g11_cancel_reaches_the_restart_successor_of_an_owned_child() {
             .await
             .as_deref(),
         Some(format!("parent workflow {parent_id} cancelled: cancel the parent").as_str())
+    );
+}
+
+/// A T-X2 supersession of a blocked parent is a cancel of that parent: it
+/// reaches the live restart successor of a child the parent owns. Here the
+/// owned child failed, a recoverable start on its key started a successor
+/// (no re-attach: the parent had its `child_failed`), and the parent handled
+/// the failure and then blocked itself.
+#[tokio::test]
+async fn g11_recoverable_start_of_a_blocked_parent_cancels_its_owned_generations() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let store = DurableStore::new(pool.clone());
+    let parent_id = store
+        .start(
+            &G11Tx2Parent {},
+            StartOptions::default().with_deduplication_key("g11-tx2-parent"),
+        )
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    // One activation attempt: the child's first failure is terminal.
+    let mut coordinator = coordinator(
+        &pool,
+        context.clone(),
+        CoordinatorConfig::default().with_max_activation_attempts(1),
+    );
+    let child_id = activate_to_child(&pool, &mut coordinator, parent_id).await;
+    assert_eq!(
+        coordinator.activate_one().await.expect("child activates"),
+        Some(child_id)
+    );
+    let child = load(&pool, child_id).await;
+    assert_eq!(child.status.as_str(), "failed");
+    let key = child
+        .deduplication_key
+        .expect("owned child has the generated key");
+
+    let generation = store
+        .start_or_restart_recoverable(
+            &G11FailingChild { fail: false },
+            StartOptions::default().with_deduplication_key(key),
+        )
+        .await
+        .expect("child recovery starts")
+        .workflow_id;
+    assert_eq!(load(&pool, parent_id).await.status.as_str(), "ready");
+    // The parent and the child's successor are both ready; each runs to its
+    // failing activity, which dead-letters, in whichever order they are claimed.
+    for _ in 0..2 {
+        coordinator
+            .activate_one()
+            .await
+            .expect("activation")
+            .expect("claim");
+    }
+    for _ in 0..2 {
+        worker(&pool, context.clone())
+            .run_one("gap_g2")
+            .await
+            .expect("activity runs")
+            .expect("activity claim");
+    }
+    assert_eq!(load(&pool, parent_id).await.status.as_str(), "blocked");
+    assert_eq!(load(&pool, generation).await.status.as_str(), "blocked");
+
+    let successor = store
+        .start_or_restart_recoverable(
+            &G11Tx2Parent {},
+            StartOptions::default().with_deduplication_key("g11-tx2-parent"),
+        )
+        .await
+        .expect("recoverable start");
+    assert!(successor.inserted);
+    assert_eq!(load(&pool, parent_id).await.status.as_str(), "cancelled");
+    assert_eq!(
+        load(&pool, generation).await.status.as_str(),
+        "cancelled",
+        "the owned child's successor {generation} outlived its superseded parent {parent_id}"
+    );
+    assert_eq!(
+        cancelled_reason(&pool, generation).await.as_deref(),
+        Some(
+            format!(
+                "parent workflow {parent_id} cancelled: a successor recovery generation was started"
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        load(&pool, successor.workflow_id).await.status.as_str(),
+        "ready"
     );
 }
 
@@ -2164,6 +2308,68 @@ async fn g8_child_key_resolving_to_a_grandparent_is_an_activation_failure() {
         message.contains(&format!(
             "child key g8-ancestor resolves to workflow {}, which is the caller or an ancestor",
             grandparent.get()
+        )),
+        "{message}"
+    );
+}
+
+/// G8 through restart lineage: the T-X2 successor of a blocked owned child
+/// carries no `parent_workflow_id`, but G2 re-attached the parent to it. Its
+/// `child_with_key` on the parent's key resolves to that parent, which waits
+/// on it: an activation failure, not a wait cycle.
+#[tokio::test]
+async fn g8_child_key_resolving_to_the_parent_of_a_restart_successor_is_an_activation_failure() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    let context = Arc::new(GapContext::default());
+    let parent_id = DurableStore::new(pool.clone())
+        .start(
+            &G8LineageParent {},
+            StartOptions::default().with_deduplication_key("g8-lineage"),
+        )
+        .await
+        .expect("parent starts")
+        .workflow_id;
+    let mut coordinator = coordinator(&pool, context.clone(), CoordinatorConfig::default());
+    let child_id = activate_to_child(&pool, &mut coordinator, parent_id).await;
+    block_child(&pool, &context, &mut coordinator, child_id).await;
+    let key = load(&pool, child_id)
+        .await
+        .deduplication_key
+        .expect("owned child has the generated key");
+
+    let successor = DurableStore::new(pool.clone())
+        .start_or_restart_recoverable(
+            &G8LineageChild { fail: false },
+            StartOptions::default().with_deduplication_key(key),
+        )
+        .await
+        .expect("recoverable start")
+        .workflow_id;
+    let parent = load(&pool, parent_id).await;
+    assert_eq!(parent.status.as_str(), "waiting_child");
+    assert_eq!(parent.wait_reference_id, Some(successor.get()));
+    assert_eq!(load(&pool, successor).await.parent_workflow_id, None);
+
+    assert_eq!(
+        coordinator
+            .activate_one()
+            .await
+            .expect("successor activates"),
+        Some(successor)
+    );
+    let row = load(&pool, successor).await;
+    assert!(
+        !(row.status.as_str() == "waiting_child" && row.wait_reference_id == Some(parent_id.get())),
+        "successor {successor} waits on its parent {parent_id}, which waits on it"
+    );
+    assert_eq!(row.activation_attempts, 1);
+    let message = row.error_message.expect("activation failure message");
+    assert!(
+        message.contains(&format!(
+            "child key g8-lineage resolves to workflow {}, which is the caller or an ancestor",
+            parent_id.get()
         )),
         "{message}"
     );

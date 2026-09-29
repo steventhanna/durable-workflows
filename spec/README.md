@@ -288,14 +288,22 @@ Changes in v5 (from v4):
   property `inv_G11_cancelReachesGenerations` (a cancel step leaves no live
   generation of an owned child of any row it cancelled; a later T-X2 or T-A5
   may restart one on purpose, so it is not a state invariant). The T-A5 cascade is
-  not modeled (T-A5 stays `Unmodeled`).
+  not modeled (T-A5 stays `Unmodeled`). Since 2026-09-28 `TX2_RecoverableStart`
+  applies the same cascade (`cancelWriteTo` on `cancelTargets` of the latest
+  row, without that row) when it supersedes a blocked row, and
+  `inv_G11_cancelReachesGenerations` covers that step too (directed test
+  `g11Tx2SupersedeCascadeTest`); the recorder already touches every cascaded
+  row, so the interface is unchanged.
 - D4: `TC2_RunChild`'s `existing` is the newest generation of the row with
   `(kind, key)` (`store.rs` `insert_child` locks the keyed row and walks its
   chain), so a parent that starts a keyed child after a recovery waits on the
   successor.
 - G8 fixed: `TC2_RunChild` requires `existing` not to be `w` or an ancestor
   of `w` (`selfAndAncestors`, the `parent` chain; `coordinator.rs`
-  `is_caller_or_ancestor`). The code rolls that commit back with
+  `is_caller_or_ancestor`). Since 2026-09-28 the chain steps from a row
+  without a parent to its `restartedFrom` (`lineageUp`), so a T-X2/T-A5
+  successor counts the parent of the generation it restarted (directed tests
+  `g8LineageParentKeyRejectedTest`, `g8LineageActivationFailureTest`). The code rolls that commit back with
   `InvalidDefinition` and records `TC3_ActivationFailure`, so a trace never
   has a `TC2_RunChild` that attaches to the caller or an ancestor. New
   invariant `inv_G8_noAncestorWait` (no row has a child wait on itself or an

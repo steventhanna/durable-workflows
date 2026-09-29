@@ -273,14 +273,15 @@ T-C2 and T-C3 as benign and goes on (G1, fixed).
 flow) inserts the child row in the parent's T-C2 commit, with the dedup key
 `child:{parentId}:{command}` or a caller-supplied domain key. A dedup hit
 attaches to the newest recovery generation of the existing row and must match
-its version (G6, fixed); a key that resolves to the caller or an ancestor is
-an activation failure (G8, fixed). When the child becomes terminal, the same
+its version (G6, fixed); a key that resolves to the caller or an ancestor
+(through restart lineage too: a successor counts the parent of the generation
+it restarted) is an activation failure (G8, fixed). When the child becomes terminal, the same
 transaction wakes every parent that waits on it with `child_succeeded` or
 `child_failed` (L11). Both paths lock the child before the parent (G9, fixed;
 [INVARIANTS §2.8](INVARIANTS.md#28-lock-order-summary)). A parent that
 attaches to a child that is already terminal wakes itself in its own commit
-(S24). **Cancel cascades to owned children:** cancelling a parent (T-X3, T-A4)
-or superseding a non-terminal one (T-A5) cancels, in the same transaction,
+(S24). **Cancel cascades to owned children:** cancelling a parent (T-X3, T-A4),
+superseding a non-terminal one (T-A5) or a blocked one (T-X2) cancels, in the same transaction,
 every live generation of the children it owns (the child and the T-X2/T-A5
 successors on its restart chain), and theirs (`cancel_owned_descendants`, G11
 fixed). A child is owned when its key is the generated

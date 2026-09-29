@@ -1,6 +1,6 @@
 {
   "mysql": {
-    "pass": 114,
+    "pass": 116,
     "violation_confirmed": 0,
     "excluded": {
       "deferred_commit": 1,
@@ -12,7 +12,7 @@
     }
   },
   "postgres": {
-    "pass": 114,
+    "pass": 116,
     "violation_confirmed": 0,
     "excluded": {
       "deferred_commit": 1,

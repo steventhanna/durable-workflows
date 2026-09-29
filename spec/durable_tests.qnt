@@ -277,6 +277,30 @@ module durable_tests {
       .then(runChild(1, DOMAIN_KEY))
       .fail()
 
+  // G8 through restart lineage (fixed): w1 (C, key "k") owns w2; w2 blocks and T-X2 starts w3,
+  // which carries no parent, and re-attaches w1 to it (G2). w1 is still w3's ancestor, so
+  // w3's RunChild on "k" is rejected and the code records an activation failure instead.
+  action g8LineageSuccessorClaimed: bool =
+    init
+      .then(tx2("C", false))                                           // w1 = C key "k"
+      .then(claim(1, 1))
+      .then(runChild(1, nextAutoKey(1)))                               // w2 owned by w1
+      .then(claim(1, 2))
+      .then(runAct(1))                                                 // a1 for w2
+      .then(tw1Claim(1, 1))
+      .then(handler(1, 1, "permanent"))
+      .then(finish(1, 1, "permanent"))
+      .then(all { keepPrev, TX2_RecoverableStart("C", autoKey(1, 1), 2, 2, true, db.nextWf, now) })   // w3
+      .expect(db.wf.get(3).parent == 0 and db.wf.get(3).restartedFrom == 2
+              and db.wf.get(1).status == "waiting_child" and db.wf.get(1).waitRef == 3)
+      .then(claim(1, 3))
+      .expect(selfAndAncestors(db, 3) == Set(1, 2, 3))
+  run g8LineageParentKeyRejectedTest = g8LineageSuccessorClaimed.then(runChild(1, DOMAIN_KEY)).fail()
+  run g8LineageActivationFailureTest =
+    g8LineageSuccessorClaimed
+      .then(all { keepPrev, TC3_ActivationFailure(1, 3, ct(1), 1, MAX_ACTIVATION, now, now) })
+      .expect(lastAction == "TC3_Retry" and db.wf.get(3).status == "ready" and safety)
+
   // N1 (fixed): the keyed child succeeded; a later auto-keyed sibling of the same kind is
   // blocked. T-X2(C, "k") follows the keyed row's own restart chain: it returns w2 and
   // leaves the sibling alone (superseding the sibling is not a step)
@@ -339,6 +363,24 @@ module durable_tests {
       .expect(db.wf.get(3).status == "ready" and db.wf.get(3).restartedFrom == 2 and db.wf.get(1).waitRef == 3)
       .then(all { keepPrev, TX3_Cancel(1, now) })
       .expect(db.wf.get(1).status == "cancelled" and db.wf.get(3).status == "cancelled" and safety)
+  // T-X2 superseding a blocked parent cancels the live generation of the child it owns: w1
+  // (P, key "k") owns w2; w2 is cancelled and restarted (T-A5, w3); w1 moves on and blocks;
+  // T-X2 on "k" supersedes w1 with w4 and the cascade cancels w3
+  run g11Tx2SupersedeCascadeTest =
+    init
+      .then(tx2("P", false))                                           // w1 = P key "k"
+      .then(claim(1, 1)).then(runChild(1, nextAutoKey(1)))             // w2 owned by w1
+      .then(all { keepPrev, TX3_Cancel(2, now) })                      // w2 cancelled, w1 woken
+      .then(all { keepPrev, TX1_Start(db.nextWf, "P", NO_KEY, 2, true, now) })   // w3 restarted from w2
+      .expect(db.wf.get(1).status == "ready" and db.wf.get(3).status == "ready" and ownedGenOf(db, 3, 1))
+      .then(claim(1, 1)).then(runAct(1))                               // a1 for w1
+      .then(tw1Claim(1, 1))
+      .then(handler(1, 1, "permanent")).then(finish(1, 1, "permanent"))
+      .expect(db.wf.get(1).status == "blocked" and db.wf.get(3).status == "ready")
+      .then(tx2("P", true))                                            // w4 successor of w1
+      .expect(lastAction == "TX2_RecoverableStart" and db.wf.get(1).status == "cancelled"
+              and db.wf.get(3).status == "cancelled" and db.wf.get(4).restartedFrom == 1
+              and db.wf.get(4).status == "ready" and inv_G11_cancelReachesGenerations and safety)
   // a domain-keyed child is not owned and keeps running
   run g11DomainKeyedChildTest =
     init
