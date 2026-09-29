@@ -478,7 +478,9 @@ async fn stale_coordinator_fence_miss() {
         .await
         .expect("workflow starts")
         .workflow_id;
-    let short = CoordinatorConfig::default().with_lease_duration(Duration::from_millis(500));
+    let short = CoordinatorConfig::default()
+        .with_lease_duration(Duration::from_millis(500))
+        .with_step_timeout(Duration::from_millis(400));
     let mut stale = coordinator(&pool, "rt1:coordinator", short);
     let mut fresh = coordinator(&pool, "rt2:coordinator", short);
     let claim = stale.claim_one().await.expect("claim").expect("claimed");

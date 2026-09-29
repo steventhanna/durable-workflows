@@ -720,7 +720,9 @@ async fn expired_claim_is_recovered_by_another_coordinator() {
         durable_workflows::register_durable_workflows!(() ; ContinueWorkflow)
             .expect("registry is valid"),
     );
-    let config = CoordinatorConfig::default().with_lease_duration(Duration::from_millis(2));
+    let config = CoordinatorConfig::default()
+        .with_lease_duration(Duration::from_millis(2))
+        .with_step_timeout(Duration::from_millis(1));
     let mut first = durable_workflows::WorkflowCoordinator::new(
         pool.clone(),
         Arc::new(()),

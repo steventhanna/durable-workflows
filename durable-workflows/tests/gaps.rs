@@ -1501,7 +1501,7 @@ where
         workflows(),
         activities(),
         "n4-stale-coordinator",
-        CoordinatorConfig::default().with_lease_duration(Duration::from_millis(300)),
+        CoordinatorConfig::default(),
     )
     .expect("coordinator is valid");
     let activation = tokio::spawn(async move {
@@ -1519,16 +1519,19 @@ where
         .expect("entered semaphore")
         .forget();
 
-    wait_until("the stale claim's lease to expire", || async {
-        let row = load(&pool, workflow_id).await;
-        let mut connection = pool.get().await.expect("test connection");
-        let now = database_now_millis(&mut connection)
-            .await
-            .expect("database clock");
-        row.lease_expires_at
-            .is_some_and(|expiry| expiry < now.get())
-    })
-    .await;
+    // Expire the claim while its step waits, without timing out the step.
+    let mut connection = pool.get().await.expect("test connection");
+    let expired_at = database_now_millis(&mut connection)
+        .await
+        .expect("database clock")
+        .saturating_minus_millis(1)
+        .get();
+    diesel::update(durable_workflow::table.find(workflow_id))
+        .set(durable_workflow::lease_expires_at.eq(Some(expired_at)))
+        .execute(&mut connection)
+        .await
+        .expect("claim lease expires");
+    drop(connection);
     let recovering_context = Arc::new(GapContext::default());
     recovering_context.release.add_permits(1);
     let mut recovering = WorkflowCoordinator::new(

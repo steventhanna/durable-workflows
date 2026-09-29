@@ -58,6 +58,41 @@ fn runtime_defaults_bound_transient_activation_alerts() {
 }
 
 #[tokio::test]
+async fn coordinator_and_runtime_reject_step_timeouts_at_or_after_the_lease() {
+    let Some(pool) = support::fresh_pool().await else {
+        return;
+    };
+    for step_timeout in [Duration::from_secs(30), Duration::from_secs(31)] {
+        let coordinator_config = CoordinatorConfig::default().with_step_timeout(step_timeout);
+        assert!(matches!(
+            WorkflowCoordinator::new(
+                pool.clone(),
+                Arc::new(()),
+                Arc::new(WorkflowRegistry::new()),
+                Arc::new(ActivityRegistry::new()),
+                "invalid-step-timeout",
+                coordinator_config,
+            ),
+            Err(DurableError::InvalidDefinition(message)) if message.contains("step_timeout")
+        ));
+        assert!(matches!(
+            DurableRuntime::new(
+                pool.clone(),
+                Arc::new(()),
+                Arc::new(WorkflowRegistry::new()),
+                Arc::new(ActivityRegistry::new()),
+                Arc::new(TopicRegistry::new()),
+                "invalid-step-timeout",
+                RuntimeConfig::default().with_coordinator(coordinator_config),
+            ),
+            Err(DurableError::InvalidDefinition(message)) if message.contains("step_timeout")
+        ));
+    }
+    let mut connection = pool.get().await.expect("test connection");
+    support::drop_durable_tables(&mut connection).await;
+}
+
+#[tokio::test]
 async fn runtime_rejects_zero_transient_activation_alert_bounds() {
     let Some(pool) = support::fresh_pool().await else {
         return;

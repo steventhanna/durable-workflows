@@ -391,7 +391,11 @@ fn registries() -> Registries {
 
 fn runtime_config() -> RuntimeConfig {
     RuntimeConfig::default()
-        .with_coordinator(CoordinatorConfig::default().with_lease_duration(Duration::from_secs(2)))
+        .with_coordinator(
+            CoordinatorConfig::default()
+                .with_lease_duration(Duration::from_secs(2))
+                .with_step_timeout(Duration::from_millis(1900)),
+        )
         .with_worker(
             WorkerConfig::default()
                 .with_heartbeat_interval(Duration::from_millis(500))

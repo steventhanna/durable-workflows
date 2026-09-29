@@ -80,6 +80,25 @@ impl Default for CoordinatorConfig {
 /// [`CoordinatorConfig::default`] and override fields with these. Bounds (non-zero
 /// durations and counts) are checked where the config is used, not here.
 impl CoordinatorConfig {
+    pub(crate) fn validate(self) -> Result<(), DurableError> {
+        if self.lease_duration.is_zero()
+            || self.max_activation_attempts == 0
+            || self.max_consecutive_continuations == 0
+            || self.continuation_delay.is_zero()
+            || self.step_timeout.is_zero()
+        {
+            return Err(DurableError::InvalidDefinition(
+                "coordinator bounds must be non-zero".to_string(),
+            ));
+        }
+        if self.step_timeout >= self.lease_duration {
+            return Err(DurableError::InvalidDefinition(
+                "step_timeout must be shorter than lease_duration".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
         self.lease_duration = lease_duration;
@@ -216,17 +235,12 @@ where
         config: CoordinatorConfig,
     ) -> Result<Self, DurableError> {
         let worker_id = worker_id.into();
-        if worker_id.is_empty()
-            || config.lease_duration.is_zero()
-            || config.max_activation_attempts == 0
-            || config.max_consecutive_continuations == 0
-            || config.continuation_delay.is_zero()
-            || config.step_timeout.is_zero()
-        {
+        if worker_id.is_empty() {
             return Err(DurableError::InvalidDefinition(
-                "coordinator identity and bounds must be non-zero".to_string(),
+                "coordinator identity must be non-empty".to_string(),
             ));
         }
+        config.validate()?;
         Ok(Self {
             pool,
             context,

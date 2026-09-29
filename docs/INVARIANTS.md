@@ -1363,12 +1363,13 @@ was read. With `step_timeout` at or above `lease_duration`, another
 runtime's T-C1 can recover and reclaim the row first; the T-C3 then misses
 its fence (benign `FenceMiss`), records no attempt, and the step runs again
 there, so on several runtimes the bound holds only for the cycles T-C3
-wins. The default keeps a third of the lease as margin (unit test
-`default_step_timeout_leaves_a_margin_below_the_lease`); a config that sets
-`step_timeout >= lease_duration` is not rejected yet (open: rejecting it
-needs a decision on the N4 stale-coordinator tests, which build a stale
-claim from a step that outlives a short lease under the default
-`step_timeout`). A `panic = "abort"` build still aborts, and a
+wins. Both coordinator and runtime constructors reject a config with
+`step_timeout >= lease_duration`. The default keeps a third of the lease as
+margin (unit test `default_step_timeout_leaves_a_margin_below_the_lease`).
+Callers need enough margin for the claim-to-step delay and T-C3 commit;
+the strict inequality alone does not remove every timing race. The N4 stale
+coordinator test expires the claim while its step waits. A `panic = "abort"`
+build still aborts, and a
 `step` that blocks its thread without yielding cannot be timed out. Tests:
 `g3_panicking_step_fails_at_the_activation_cap`,
 `g3_step_exceeding_step_timeout_is_bounded_by_activation_attempts`.

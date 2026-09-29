@@ -258,6 +258,7 @@ where
                 "durable runtime identity and bounds must be non-zero".to_string(),
             ));
         }
+        config.coordinator.validate()?;
         HealthScannerConfig {
             stale_after: config.health_stale_after,
             max_alerts_per_kind: config.max_health_alerts_per_kind,
