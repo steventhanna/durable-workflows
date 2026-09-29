@@ -1027,13 +1027,26 @@ where
 /// Restarts of one task counted within a window that starts at the first
 /// restart after the previous window ended.
 #[derive(Debug)]
-struct RestartBudget {
+struct RestartBudget<I = tokio::time::Instant> {
     count: u32,
-    window_started: tokio::time::Instant,
+    window_started: I,
 }
 
-impl RestartBudget {
-    fn new(now: tokio::time::Instant) -> Self {
+/// The clock a [`RestartBudget`] reads: `tokio::time::Instant` in the
+/// runtime. Generic only so the Kani proof can use a model clock (Kani
+/// cannot call `clock_gettime`, so it cannot build a real `Instant`).
+trait BudgetInstant: Copy {
+    fn saturating_duration_since(self, earlier: Self) -> Duration;
+}
+
+impl BudgetInstant for tokio::time::Instant {
+    fn saturating_duration_since(self, earlier: Self) -> Duration {
+        tokio::time::Instant::saturating_duration_since(&self, earlier)
+    }
+}
+
+impl<I: BudgetInstant> RestartBudget<I> {
+    fn new(now: I) -> Self {
         Self {
             count: 0,
             window_started: now,
@@ -1042,13 +1055,81 @@ impl RestartBudget {
 
     /// Counts one restart at `now`; false once the window holds more than
     /// `max_restarts`.
-    fn record(&mut self, now: tokio::time::Instant, window: Duration, max_restarts: u32) -> bool {
+    fn record(&mut self, now: I, window: Duration, max_restarts: u32) -> bool {
         if now.saturating_duration_since(self.window_started) > window {
             self.count = 0;
             self.window_started = now;
         }
         self.count = self.count.saturating_add(1);
         self.count <= max_restarts
+    }
+}
+
+/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking").
+#[cfg(kani)]
+mod restart_budget_verification {
+    use super::*;
+
+    /// A model clock: the time since an arbitrary origin.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct ModelInstant(Duration);
+
+    impl BudgetInstant for ModelInstant {
+        fn saturating_duration_since(self, earlier: Self) -> Duration {
+            self.0.saturating_sub(earlier.0)
+        }
+    }
+
+    /// Any `Duration`, built without the division `Duration::from_nanos`
+    /// needs (a 64-bit division makes the proof take minutes).
+    fn any_duration() -> Duration {
+        let nanos: u32 = kani::any();
+        kani::assume(nanos < 1_000_000_000);
+        Duration::new(kani::any(), nanos)
+    }
+
+    /// `later > earlier + span`, computed on (seconds, nanoseconds) pairs
+    /// with an explicit carry; no multiplication, which SAT solvers handle
+    /// badly when they must prove it equal to `Duration` arithmetic.
+    fn exceeds(later: Duration, earlier: Duration, span: Duration) -> bool {
+        let nanos = earlier.subsec_nanos() + span.subsec_nanos();
+        let carry = nanos >= 1_000_000_000;
+        let end_nanos = if carry { nanos - 1_000_000_000 } else { nanos };
+        let end_secs =
+            u128::from(earlier.as_secs()) + u128::from(span.as_secs()) + u128::from(carry);
+        let later_secs = u128::from(later.as_secs());
+        later_secs > end_secs || (later_secs == end_secs && later.subsec_nanos() > end_nanos)
+    }
+
+    /// For any budget state, restart time, window and limit: a restart
+    /// more than `window` after the window start opens a new window with a
+    /// count of 1; otherwise the count grows by one, saturating, so it
+    /// never wraps to 0; the result is `count <= max_restarts`. A restart
+    /// time before the window start (the clock is monotonic, but the model
+    /// allows it) counts in the current window.
+    #[kani::proof]
+    fn restart_budget_resets_after_the_window_and_never_wraps() {
+        let started = any_duration();
+        let now = any_duration();
+        let window = any_duration();
+        let count: u32 = kani::any();
+        let max_restarts: u32 = kani::any();
+        let mut budget = RestartBudget {
+            count,
+            window_started: ModelInstant(started),
+        };
+
+        let allowed = budget.record(ModelInstant(now), window, max_restarts);
+
+        if exceeds(now, started, window) {
+            assert!(budget.count == 1);
+            assert!(budget.window_started == ModelInstant(now));
+        } else {
+            assert!(budget.count == count.saturating_add(1));
+            assert!(budget.window_started == ModelInstant(started));
+        }
+        assert!(budget.count >= 1);
+        assert!(allowed == (budget.count <= max_restarts));
     }
 }
 

@@ -67,6 +67,15 @@ production on MySQL since August 2026.
   be non-zero) add `HealthAlert::TransientActivationErrors` to the next health
   report and its `HealthAlertSink` call. `HealthAlert` is now
   `#[non_exhaustive]`.
+- Kani proofs (`cargo kani -p durable-workflows`, Kani 0.68.0) for the
+  pure-logic helpers: retry delay and jitter (no panic for any input, the
+  jitter bound, the database millisecond range, capped doubling, never
+  decreasing in the attempt), the supervisor's restart budget (window
+  reset, the count never wraps), UTF-8 truncation (the longest
+  char-boundary prefix that fits), id newtype construction, and status
+  text parsing and predicates. A separate `kani` CI workflow runs them on
+  PRs that touch those modules, on main, weekly and on demand. The crate
+  declares `cfg(kani)` as an expected cfg. No public API change.
 
 ### Changed
 

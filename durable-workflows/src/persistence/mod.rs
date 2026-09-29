@@ -359,6 +359,78 @@ status_set_matches_predicate!(ActivityStatus::NON_TERMINAL == is_non_terminal);
 
 pub use activities::find_activity_by_id;
 
+/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking").
+#[cfg(kani)]
+mod verification {
+    use std::mem::ManuallyDrop;
+
+    use super::*;
+
+    /// Every variant's `as_str` parses back to it with `try_from`. The
+    /// variants are enumerated concretely: with a symbolic text the
+    /// unknown-status path, which formats its message through `dyn Write`,
+    /// makes CBMC run for tens of minutes even at 5 bytes, so arbitrary
+    /// text stays with the unit tests. The unwind bound 22 covers the loop
+    /// over `ALL` (at most 11 variants) and the byte comparison of the
+    /// longest persisted value (`application_cancelled`, 21 bytes).
+    macro_rules! status_parse_round_trips {
+        ($harness:ident, $name:ident) => {
+            #[kani::proof]
+            #[kani::unwind(22)]
+            fn $harness() {
+                for &status in $name::ALL {
+                    // Not dropped: `DurableError`'s drop glue calls through
+                    // `dyn` pointers, which the verifier cannot bound.
+                    let parsed = ManuallyDrop::new($name::try_from(status.as_str()));
+                    assert!(matches!(&*parsed, Ok(parsed) if *parsed == status));
+                }
+            }
+        };
+    }
+
+    status_parse_round_trips!(workflow_status_parse_round_trips, WorkflowStatus);
+    status_parse_round_trips!(activity_status_parse_round_trips, ActivityStatus);
+    status_parse_round_trips!(wait_kind_parse_round_trips, WaitKind);
+    status_parse_round_trips!(approval_status_parse_round_trips, ApprovalStatus);
+    status_parse_round_trips!(schedule_run_status_parse_round_trips, ScheduleRunStatus);
+    status_parse_round_trips!(attempt_outcome_parse_round_trips, AttemptOutcome);
+
+    /// The workflow predicates agree with what their docs promise: a
+    /// status that waits is not terminal, an operator restart accepts
+    /// exactly the terminal, paused and blocked statuses (N3), and a
+    /// recoverable start is a restartable one.
+    #[kani::proof]
+    fn workflow_status_predicates_are_consistent() {
+        let index: usize = kani::any();
+        kani::assume(index < WorkflowStatus::ALL.len());
+        let status = WorkflowStatus::ALL[index];
+        if status.awaits_child() || status.awaits_approval() || status.awaits_dead_letter() {
+            assert!(!status.is_terminal());
+        }
+        assert!(
+            status.is_restartable()
+                == (status.is_terminal()
+                    || status == WorkflowStatus::Paused
+                    || status == WorkflowStatus::Blocked)
+        );
+        if status.is_start_recoverable() {
+            assert!(status.is_restartable());
+        }
+    }
+
+    /// An activity that holds a slot or a lease owns an open attempt, so
+    /// it is not terminal (N2, S1).
+    #[kani::proof]
+    fn activity_status_predicates_are_consistent() {
+        let index: usize = kani::any();
+        kani::assume(index < ActivityStatus::ALL.len());
+        let status = ActivityStatus::ALL[index];
+        if status.holds_slot() || status.holds_lease() {
+            assert!(!status.is_terminal());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

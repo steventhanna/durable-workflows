@@ -171,3 +171,37 @@ where
     Self: diesel::AppearsOnTable<QS>,
 {
 }
+
+/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking").
+#[cfg(kani)]
+mod verification {
+    use std::mem::ManuallyDrop;
+
+    use super::*;
+
+    /// `new` accepts exactly the positive values, `get` returns the value
+    /// it accepted, and a rejected value is an `InvalidId` that carries it.
+    macro_rules! id_new_accepts_only_positive {
+        ($harness:ident, $id:ident) => {
+            #[kani::proof]
+            fn $harness() {
+                let raw: i64 = kani::any();
+                // Not dropped: `DurableError`'s drop glue calls through
+                // `dyn` pointers, which the verifier cannot bound.
+                let result = ManuallyDrop::new($id::new(raw));
+                match &*result {
+                    Ok(id) => assert!(raw > 0 && id.get() == raw),
+                    Err(DurableError::InvalidId(rejected)) => {
+                        assert!(raw <= 0 && *rejected == raw)
+                    }
+                    Err(_) => panic!("new returned an error other than InvalidId"),
+                }
+            }
+        };
+    }
+
+    id_new_accepts_only_positive!(workflow_id_new_accepts_only_positive, WorkflowId);
+    id_new_accepts_only_positive!(activity_id_new_accepts_only_positive, ActivityId);
+    id_new_accepts_only_positive!(approval_id_new_accepts_only_positive, ApprovalId);
+    id_new_accepts_only_positive!(schedule_run_id_new_accepts_only_positive, ScheduleRunId);
+}

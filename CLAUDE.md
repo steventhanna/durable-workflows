@@ -243,6 +243,50 @@ scripts/trace-pipeline.sh mysql && scripts/trace-pipeline.sh postgres
 - Pipe long cargo output through `tail` or a `grep` for
   `error|warning|FAILED|panicked|test result`.
 
+## Bounded model checking (Kani)
+
+Pure-logic helpers have Kani proofs: `#[cfg(kani)] #[kani::proof]`
+harnesses in a `verification` module next to the code. A harness checks a
+property for every input (within its unwind bound), not for samples; keep
+proptest for code Kani cannot model in reasonable time (the schedule
+`next_after` search). Today: `policy.rs` (`apply_jitter` and
+`delay_for_attempt`: no panic, the jitter bound, the millisecond range,
+capped doubling, monotonic in the attempt), `runtime/supervisor.rs`
+(`RestartBudget`: window reset, the count never wraps), `error.rs`
+(`truncate_utf8`: the longest char-boundary prefix that fits), `ids.rs`
+(`Id::new` accepts exactly the positive values) and `persistence/mod.rs`
+(status `as_str`/`try_from` round trip for every variant; the workflow
+and activity predicates agree with their docs; arbitrary status text stays
+with the unit tests, since the unknown-status error formats its message
+and CBMC does not finish on that path).
+
+```sh
+cargo kani -p durable-workflows                        # 18 harnesses, ~4 min
+cargo kani -p durable-workflows --harness policy::     # one module
+```
+
+- Kani is pinned (`KANI_VERSION` in `.github/workflows/kani.yml`, 0.68.0);
+  install it with `cargo install --locked kani-verifier --version <v> &&
+  cargo kani setup`. The `kani` workflow runs on PRs that touch a module
+  with harnesses, on main, weekly and on demand; it is not on the per-PR
+  critical path.
+- Never drop a `DurableError` in a harness: its drop glue calls through
+  `dyn` pointers, which CBMC cannot bound (out of memory). Keep a result in
+  `ManuallyDrop`, or call the error-free check (`BoundViolation::check`).
+- Kani cannot read a clock (`clock_gettime`). Code that takes an instant
+  is generic over a small private trait with the real instant as the
+  default type (`RestartBudget<I = tokio::time::Instant>`,
+  `BudgetInstant`), and the harness passes a model instant.
+- Write the reference side of an assertion without multiplication or
+  division by symbolic values where you can (a carry on
+  (seconds, nanoseconds) pairs, an exact `u128` shift,
+  `100 * |d| <= base * p` instead of `|d| <= base * p / 100`): a SAT solver
+  proves such arithmetic equal to the code's only slowly (minutes instead
+  of seconds).
+- Give every loop an explicit `#[kani::unwind(n)]` and say in the doc
+  comment why `n` covers it. A harness without one on a symbolic loop never
+  finishes.
+
 ## Changing behavior
 
 Use the `verify-invariants` skill (`.claude/skills/verify-invariants/`) for

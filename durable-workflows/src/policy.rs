@@ -262,3 +262,129 @@ mod tests {
         assert_eq!(delay.as_secs(), u64::MAX, "got {delay:?}");
     }
 }
+
+/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking"). No
+/// harness here needs an unwind bound: the delay code has no loops. The
+/// reference computations avoid division and multiplication by symbolic
+/// values where they can: a SAT solver proves such arithmetic equal to the
+/// code's only slowly.
+#[cfg(kani)]
+mod verification {
+    use std::mem::ManuallyDrop;
+
+    use super::*;
+
+    /// A symbolic policy that the checked constructors accept.
+    fn any_valid_policy() -> RetryPolicy {
+        let backoff = if kani::any() {
+            BackoffPolicy::Fixed {
+                delay_secs: kani::any(),
+            }
+        } else {
+            BackoffPolicy::Exponential {
+                initial_secs: kani::any(),
+                max_secs: kani::any(),
+                jitter_percent: kani::any(),
+            }
+        };
+        // The bound check the constructors use, without building the
+        // `DurableError` they return.
+        let checked = BoundViolation::check(backoff);
+        kani::assume(checked.is_ok());
+        RetryPolicy {
+            backoff: checked.unwrap_or(backoff),
+        }
+    }
+
+    /// `policy.delay_for_attempt`, which must succeed. The result is not
+    /// dropped: `DurableError`'s drop glue calls through `dyn` pointers,
+    /// which the verifier cannot bound.
+    fn delay(policy: RetryPolicy, attempt: u32, percentile: u8) -> Duration {
+        let result = ManuallyDrop::new(policy.delay_for_attempt(attempt, percentile));
+        match &*result {
+            Ok(delay) => *delay,
+            Err(_) => panic!("a valid attempt and percentile were rejected"),
+        }
+    }
+
+    /// `apply_jitter` never panics or overflows for any input, and with
+    /// both percents in `0..=100` the result is at most
+    /// `floor(base * jitter_percent / 100)` away from `base` (checked as
+    /// `100 * |delay - base| <= base * jitter_percent`, the same bound on
+    /// integers); the midpoint percentile adds nothing.
+    #[kani::proof]
+    fn apply_jitter_is_total_and_bounded() {
+        let base: u64 = kani::any();
+        let jitter_percent: u8 = kani::any();
+        let percentile: u8 = kani::any();
+        let delay = apply_jitter(base, jitter_percent, percentile);
+        if jitter_percent <= 100 && percentile <= 100 {
+            let distance = u128::from(delay.abs_diff(base));
+            assert!(100 * distance <= u128::from(base) * u128::from(jitter_percent));
+            if percentile == 50 {
+                assert!(delay == base);
+            }
+        }
+    }
+
+    /// For every valid policy, attempt and percentile the call never
+    /// panics, errors exactly on attempt 0 or a percentile above 100, and
+    /// fits the database's millisecond range (`MAX_RETRY_DELAY_SECS`); a
+    /// fixed policy's delay is its `delay_secs`.
+    #[kani::proof]
+    fn delay_for_attempt_is_total_and_fits_millis() {
+        let policy = any_valid_policy();
+        let attempt: u32 = kani::any();
+        let percentile: u8 = kani::any();
+        let result = ManuallyDrop::new(policy.delay_for_attempt(attempt, percentile));
+        assert!(result.is_ok() == (attempt >= 1 && percentile <= 100));
+        let Ok(delay) = result.as_ref().copied() else {
+            return;
+        };
+        // The delay is whole seconds, so this is `as_millis() <= i64::MAX`.
+        assert!(delay.subsec_nanos() == 0);
+        assert!(delay.as_secs() <= i64::MAX as u64 / 1_000);
+        if let BackoffPolicy::Fixed { delay_secs } = policy.backoff {
+            assert!(delay.as_secs() == delay_secs);
+        }
+    }
+
+    /// At the midpoint percentile (no jitter) an exponential policy's delay
+    /// is `min(initial_secs * 2^(attempt - 1), max_secs)`, computed here
+    /// with an exact `u128` shift instead of the saturating multiply.
+    #[kani::proof]
+    fn exponential_delay_without_jitter_is_capped_doubling() {
+        let initial_secs: u64 = kani::any();
+        let max_secs: u64 = kani::any();
+        let jitter_percent: u8 = kani::any();
+        let backoff = BackoffPolicy::Exponential {
+            initial_secs,
+            max_secs,
+            jitter_percent,
+        };
+        kani::assume(BoundViolation::check(backoff).is_ok());
+        let policy = RetryPolicy { backoff };
+        let attempt: u32 = kani::any();
+        kani::assume(attempt >= 1);
+
+        let exponent = attempt - 1;
+        let expected = if exponent >= 63 {
+            // initial_secs >= 1, so initial * 2^63 is above any valid max.
+            max_secs
+        } else {
+            (u128::from(initial_secs) << exponent).min(u128::from(max_secs)) as u64
+        };
+        assert!(delay(policy, attempt, 50).as_secs() == expected);
+    }
+
+    /// The un-jittered delay (the midpoint percentile) never decreases as
+    /// the attempt number grows.
+    #[kani::proof]
+    fn delay_without_jitter_is_non_decreasing_in_attempt() {
+        let policy = any_valid_policy();
+        let earlier: u32 = kani::any();
+        let later: u32 = kani::any();
+        kani::assume(1 <= earlier && earlier <= later);
+        assert!(delay(policy, earlier, 50) <= delay(policy, later, 50));
+    }
+}
