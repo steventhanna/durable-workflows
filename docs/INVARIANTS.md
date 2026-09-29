@@ -374,8 +374,16 @@ transaction:
 3. For each topic:
    a. `reconcile_expired`: consistent read of lease holders
       (`status IN LEASE_HOLDERS` = `running`, `cancelling`) with
-      `leaseExpiresAt <= now OR NULL`; for each: lock workflow `FOR UPDATE`
-      (blocking), relock the activity `FOR UPDATE` and recheck. A `running`
+      `leaseExpiresAt <= now OR NULL`; for each: lock workflow `FOR UPDATE
+      SKIP LOCKED`, relock the activity `FOR UPDATE` (blocking) and recheck.
+      A workflow row another transaction holds (an application transaction
+      in `cancel_with_conn` or `start_with_conn` can hold it for as long as
+      it likes) is skipped: the activity stays expired and **unsettled**,
+      and a later sweep reconciles it. So T-W1 never waits on an
+      application transaction while it holds every topic row. The activity
+      relock still blocks: only short engine transactions (T-W2, T-W4) lock
+      an activity without its workflow, and G7's closure needs a heartbeat
+      to commit before the recheck or to wait for this transaction. A `running`
       row: fenced `UPDATE WHERE status=running AND attemptCount=k AND leaseToken=t`
       → `pending` (backoff) or `dead_lettered` (if `attemptCount >= maxAttempts`);
       close the attempt `lease_expired`; history `activity_lease_expired`; if
@@ -386,7 +394,10 @@ transaction:
       with `availableAt=now`; lease cleared; history `activity_revoke_settled`).
       No attempt is added to the budget and nothing is dead-lettered.
    b. `in_flight` = count of slot holders (`status IN SLOT_HOLDERS` =
-      `running`, `cancelling`) with `leaseExpiresAt > now` (consistent read).
+      `running`, `cancelling`) with `leaseExpiresAt > now` or unsettled in
+      3a (consistent read; `TopicReconciled::in_flight`, the only way to
+      read the count). An unsettled row keeps its slot because a heartbeat
+      may still revive it after the count (S17, G7).
    c. `wanted = min(cap − in_flight, local capacity, remaining batch)`.
    d. Candidates: consistent read joining workflow on
       `workflow.status=waiting_activity AND workflow.waitReferenceId=activity.id`,
@@ -1053,7 +1064,10 @@ it no longer stops the claims of other rows and topics (G10, fixed).
 
 **L5. An expired activity lease is eventually reconciled.** Needs a dispatcher
 for that topic with local capacity > 0 (T-W1 returns early otherwise,
-`src/runtime/activity_worker.rs` `ActivityWorker::claim_batch`). **ENFORCED**.
+`src/runtime/activity_worker.rs` `ActivityWorker::claim_batch`), and any
+application transaction that holds the activity's workflow row to commit
+or roll back (T-W1 skips a locked workflow row and retries in a later
+sweep, §2.3 step 3a). **ENFORCED**.
 
 **L6. Every activity eventually becomes `succeeded`, `dead_lettered`, or
 `cancelled`.** Attempts are bounded (S12); each attempt ends by T-W3 or by

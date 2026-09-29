@@ -118,8 +118,9 @@ transaction that would lock it (those actions are disabled until the commit).
 | `TW1_BeginBatch(r)` | topic rows `FOR UPDATE SKIP LOCKED` (all or nothing), `UTC_TIMESTAMP` | locking | yes |
 | `TW1_BeginOne(r, t, tnow)` | `UTC_TIMESTAMP` (= `tnow`), then topic row `FOR UPDATE` (blocking) | locking | yes; `tnow ≤ now` covers the lock wait |
 | `TW1_ReconcileScan(r, t)` | reconcile candidate `SELECT` (running or cancelling, lease ≤ now) | plain | yes (the old G7 window starts here) |
-| `TW1_ReconcileRow(r, a)` | workflow `FOR UPDATE`; activity `FOR UPDATE` with the filters; the updates; history; block | locking | yes |
-| `TW1_Count(r)` | `in_flight` count; if `wanted > 0`, the candidate join | plain, plain | yes |
+| `TW1_ReconcileRow(r, a)` | workflow `FOR UPDATE SKIP LOCKED`; activity `FOR UPDATE` with the filters; the updates; history; block | locking | yes |
+| `TW1_ReconcileLockSkip(r, a)` | the workflow `FOR UPDATE SKIP LOCKED` passed a row another transaction holds: the row stays expired and unsettled | locking | yes |
+| `TW1_Count(r)` | `in_flight` count (live slot holders plus the unsettled ones); if `wanted > 0`, the candidate join | plain, plain | yes |
 | `TW1_ClaimRow(r, a, tok)` / `TW1_SkipRow(r, a)` | workflow and activity `FOR UPDATE SKIP LOCKED` with the filters; update; attempt insert | locking | yes |
 | `TW1_QuarantineRow(r, a)` | same locks; the row is past its attempt cap or has invalid bounds: dead-letter it, block its workflow (G10 fixed) | locking | yes |
 | `TW1_Commit(r)` | `COMMIT` | | yes |
@@ -154,7 +155,12 @@ concurrent insert falls back to `DeduplicationConflict` and a locking reload).
   is reduced to kind (`P` top-level, `C` child); versions (G6) are not modeled.
 - Candidate order: claims pick any candidate (parameter), a superset of the
   code's `(availableAt, id)` order. SKIP LOCKED against a transaction that is
-  itself in flight is `TW1_SkipRow`, which may skip any candidate.
+  itself in flight is `TW1_SkipRow`, which may skip any candidate. The
+  reconcile's workflow lock against an application transaction that holds
+  the row (not modeled) is `TW1_ReconcileLockSkip`, which may skip any
+  reconcile candidate; the row stays expired, keeps its slot in that T-W1's
+  `in_flight` count, and a later sweep reconciles it (L5 therefore assumes
+  strong fairness of `TW1_ReconcileRow`).
 - `StartOptions.root_workflow_id` and `available_at` on T-X1; admin restart
   and retry (T-A5, T-A6), progress events (T-W4), timers, approvals,
   schedules. The supervisor restart budget is modeled per runtime and task
@@ -458,7 +464,7 @@ in-flight simulation T-W1, which block the action):
 | `TW1_Claim(r, tnow, localAvail: str->int, reconciled: List[{a, exhausted, availableAt}], inFlightSeen: str->int, quarantined: List[{a, reason}], claimed: List[{a, tok, leaseExp}])` — `reason` = `"attempt_cap"` (checked first) or `"invalid_bounds"` | `runtime/activity_worker.rs:claim_batch` / `claim_one` (`reconcile_expired`, `claim_locked_candidate`, `quarantine_candidate`), one commit | `db.act`, `db.att`, `db.wf`, `db.nextToken`, `proc.topicHolder` | `db.act`, `db.att`, `db.wf` (blocked), `db.nextToken`, `proc.execs`, `ghost.capExceededAtClaim`, `ghost.lastIssuedAct`, `now` |
 | `EnvCorruptActivityBounds(a)` — needs `ENABLE_ENV_EDITS`; blocks while a T-W1 holds `a` | external write (raw SQL; simulation of the G10 gap test's edit) | `db.act[a]`, locks | `db.act[a].invalidBounds` |
 | `EnvSetWf(w, row)`, `EnvSetAct(a, row)`, `EnvSetAtt(a, n, row)`, `EnvAppendEvent(w, ev)` — trace replay only; need `ENABLE_ENV_EDITS`; block while a T-W1 holds the row | recorded external write (trigger-captured `External` record) | locks | the row / `db.events[w]`; `db.nextWf`, `db.nextAct`, `db.nextToken`; `ghost.lastIssuedWf` / `lastIssuedAct` |
-| `TW1_BeginBatch(r)`, `TW1_BeginOne(r, t, tnow)`, `TW1_ReconcileScan(r, t)`, `TW1_ReconcileRow(r, a, availableAt)`, `TW1_Count(r)`, `TW1_ClaimRow(r, a, tok)`, `TW1_QuarantineRow(r, a)`, `TW1_SkipRow(r, a)`, `TW1_Commit(r)` (simulation) | `claim_batch` / `claim_one` statement groups (table above) | `db`, `proc.tw1[r]`, `proc.topicHolder`, `proc.execs` | `proc.tw1[r]`, `proc.topicHolder`; `TW1_ClaimRow`: `db.nextToken`; `TW1_Commit`: `db.act`, `db.att`, `db.wf`, `proc.execs`, ghost |
+| `TW1_BeginBatch(r)`, `TW1_BeginOne(r, t, tnow)`, `TW1_ReconcileScan(r, t)`, `TW1_ReconcileRow(r, a, availableAt)`, `TW1_ReconcileLockSkip(r, a)`, `TW1_Count(r)`, `TW1_ClaimRow(r, a, tok)`, `TW1_QuarantineRow(r, a)`, `TW1_SkipRow(r, a)`, `TW1_Commit(r)` (simulation) | `claim_batch` / `claim_one` statement groups (table above) | `db`, `proc.tw1[r]`, `proc.topicHolder`, `proc.execs` | `proc.tw1[r]`, `proc.topicHolder`; `TW1_ClaimRow`: `db.nextToken`; `TW1_Commit`: `db.act`, `db.att`, `db.wf`, `proc.execs`, ghost |
 | `HandlerReturn(r, a, tok, outcome)` | `activity_worker.rs:execute_claim` (dispatch result) | `proc.execs`, `now` | `proc.execs` |
 | `LocalDeadline(r, a, tok)` | `execute_claim`, `wait_for_lease_deadline` | `proc.execs`, `now` | `proc.execs` |
 | `TW2_Send(r, a, tok, hb)` | `activity_worker.rs:heartbeat_loop` → `heartbeat_once` starts | `proc.execs`, `proc.hbs`, `ghost.nextHb` | `proc.hbs`, `ghost.nextHb` |
@@ -680,7 +686,9 @@ The temporal properties typecheck but were not model-checked.
 `L1_readyClaimed`, `L2_expiredRecovered`, `L5_expiredReconciled` in
 `durable.qnt`. Fairness assumptions are hypotheses of each formula: weak
 fairness of `TC1_Claim` (recovery and claim) for every runtime and workflow
-(F2, F3), and of every simulation T-W1 step (F2, L5's local capacity). F1
+(F2, F3), and of every simulation T-W1 step (F2, L5's local capacity),
+strong for `TW1_ReconcileRow` (a sweep may skip a row whose workflow an
+application transaction holds; L5 needs that transaction to commit). F1
 (time advances) is `Tick` with a bounded clock. Crashes must eventually stop.
 
 ## Gap status

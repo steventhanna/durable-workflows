@@ -362,3 +362,12 @@ Compared with the production-internal version it was extracted from:
   deadline. The executor now runs T-W3, whose fence decides; before, it
   returned the error without T-W3, so lease expiry requeued a handler that
   had succeeded, or dead-lettered it on its last attempt.
+- An application transaction that held a workflow row (for example
+  `cancel_with_conn`, then slow work before its commit) no longer stalls
+  activity claims on every topic when that workflow has an activity with an
+  expired lease. Lease reconciliation in `claim_batch`/`claim_one` locks the
+  workflow `FOR UPDATE SKIP LOCKED` and skips a held row; the activity stays
+  expired, keeps its slot in the topic's in-flight count, and a later sweep
+  reconciles it. Before, the sweep waited for the application transaction
+  (Postgres: without limit; MySQL: until `innodb_lock_wait_timeout`) while it
+  held every topic lock row.

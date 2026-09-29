@@ -88,6 +88,34 @@ module durable_tests {
       .then(all { keepPrev, TW2_FenceMiss(1) })
       .expect(inv_S17_capAlways and inv_S17_capAtClaim and safety)
 
+  // reconcile skips a1 because another transaction holds w1 (SKIP LOCKED): a1 stays expired
+  // and keeps its slot in the in_flight count, so the late heartbeat that revives it after
+  // the count cannot push the topic over its cap (G7 stays closed)
+  run reconcileLockSkipKeepsSlotTest =
+    g7Prefix
+      .then(all { keepPrev, TW1_ReconcileLockSkip(2, 1) })
+      .expect(proc.tw1.get(2).unsettled == Set(1) and not(wfLocked(proc, 1)) and not(actLocked(proc, 1)))
+      .then(all { keepPrev, TW1_Count(2) })
+      .expect(lastAction == "TW1_CountFull")                           // wanted = 1 - 1 = 0
+      .then(all { keepPrev, TW2_Commit(1, 1, 4) })                     // the revival lands after the count
+      .then(all { keepPrev, TW1_Commit(2) })
+      .expect(inv_S17_capAlways and inv_S17_capAtClaim and proc.execs.size() == 0 and safety)
+
+  // the skipped row is reconciled by a later sweep once the workflow row is free
+  run reconcileLockSkipLaterSweepTest =
+    g7Prefix
+      .then(all { keepPrev, TW1_ReconcileLockSkip(2, 1) })
+      .then(all { keepPrev, TW1_Count(2) })
+      .then(all { keepPrev, TW1_Commit(2) })
+      .expect(db.act.get(1).status == "running" and db.act.get(1).leaseExp <= now)
+      .then(all { keepPrev, TW1_BeginBatch(2) })
+      .then(all { keepPrev, TW1_ReconcileScan(2, "t") })
+      .then(all { keepPrev, TW1_ReconcileRow(2, 1, 4) })
+      .then(all { keepPrev, TW1_Count(2) })
+      .then(all { keepPrev, TW1_SkipRow(2, 2) })
+      .then(all { keepPrev, TW1_Commit(2) })
+      .expect(db.act.get(1).status == "pending" and db.act.get(1).token == 0 and safety)
+
   // L-W: a renewal that fails without a fence answer (a checkout or connection error; the
   // model keeps it in flight) after the handler returned inside the confirmed lease does
   // not end the execution: T-W3 commits the handler's outcome, and the late renewal then

@@ -34,9 +34,11 @@
  *     TW1_BeginBatch(r)           topic rows FOR UPDATE SKIP LOCKED (all or nothing), then now
  *     TW1_BeginOne(r, t, tnow)    claim_one: now sampled BEFORE the blocking topic FOR UPDATE
  *     TW1_ReconcileScan(r, t)     reconcile_expired: plain candidate read (running or cancelling, lease <= now)
- *     TW1_ReconcileRow(r, a, availableAt)  reconcile_expired: workflow FOR UPDATE, activity FOR UPDATE + recheck,
+ *     TW1_ReconcileRow(r, a, availableAt)  reconcile_expired: workflow FOR UPDATE SKIP LOCKED, activity FOR UPDATE + recheck,
  *                                 updates (pending at availableAt = now + retry delay, or dead-lettered at now;
  *                                 a cancelling row settles: settle_revoked, N2)
+ *     TW1_ReconcileLockSkip(r, a) reconcile_expired: SKIP LOCKED passed the workflow row (another transaction
+ *                                 holds it): a stays expired and unsettled, counted in in_flight, for a later sweep
  *     TW1_Count(r)                in_flight count + candidate join (two plain reads)
  *     TW1_ClaimRow(r, a, tok)     claim_locked_candidate: workflow + activity FOR UPDATE SKIP LOCKED + recheck, claim
  *     TW1_QuarantineRow(r, a)     claim_locked_candidate: the locked row is past its attempt cap or has invalid
@@ -153,11 +155,12 @@ module durable {
   // In-flight T-W1. phase: idle | topics (between topics) | reconcile | claim.
   // wAct/wWf/wAtt hold its own (uncommitted) writes for the rows in tA/tW.
   // lockA/lockW: rows it holds FOR UPDATE until COMMIT.
+  // unsettled: expired lease holders whose workflow lock reconcile skipped (counted in in_flight).
   type Tw1 = {
     phase: str, mode: str, now: int, topic: str, todo: Set[str], cands: Set[int], wanted: int,
     lockA: Set[int], lockW: Set[int], tA: Set[int], tW: Set[int],
     wAct: int -> ActRow, wWf: int -> WfRow, wAtt: int -> (int -> AttRow),
-    claimed: Set[Exec], snap: bool, snapAct: int -> ActRow, snapWf: int -> WfRow
+    claimed: Set[Exec], unsettled: Set[int], snap: bool, snapAct: int -> ActRow, snapWf: int -> WfRow
   }
   type Proc = { claims: int -> Claim, execs: Set[Exec], hbs: Set[Hb], tw1: int -> Tw1, topicHolder: int }
   type Ghost = {
@@ -202,7 +205,7 @@ module durable {
     lockA: Set(), lockW: Set(), tA: Set(), tW: Set(),
     wAct: ACT_IDS.mapBy(a => emptyAct), wWf: WF_IDS.mapBy(w => emptyWf),
     wAtt: ACT_IDS.mapBy(a => ATT_NOS.mapBy(n => noAtt)),
-    claimed: Set(), snap: false, snapAct: ACT_IDS.mapBy(a => emptyAct), snapWf: WF_IDS.mapBy(w => emptyWf)
+    claimed: Set(), unsettled: Set(), snap: false, snapAct: ACT_IDS.mapBy(a => emptyAct), snapWf: WF_IDS.mapBy(w => emptyWf)
   }
 
   pure def setWf(d: Db, w: int, r: WfRow): Db = d.with("wf", d.wf.set(w, r))
@@ -778,13 +781,28 @@ module durable {
     }
   }
 
-  // in_flight count, then (if wanted > 0) the candidate join; both plain reads
+  // reconcile_expired, per candidate: the workflow FOR UPDATE SKIP LOCKED passed a row that
+  // another transaction holds (not modeled: an application transaction can hold it for as long
+  // as it likes, so the choice is free). Nothing is locked or written; a stays expired and
+  // unsettled until a later sweep, and this T-W1's in_flight count keeps its slot, since a
+  // heartbeat may still revive it after the count (G7 stays closed).
+  action TW1_ReconcileLockSkip(r: int, a: int): bool = {
+    val tw = proc.tw1.get(r)
+    all {
+      tw.phase == "reconcile", tw.cands.contains(a),
+      setTw1(r, tw.with("cands", tw.cands.exclude(Set(a))).with("unsettled", tw.unsettled.union(Set(a))),
+             "TW1_ReconcileLockSkip"),
+    }
+  }
+
+  // in_flight count (live slot holders, plus the ones reconcile left unsettled), then (if
+  // wanted > 0) the candidate join; both plain reads
   action TW1_Count(r: int): bool = {
     val tw = proc.tw1.get(r)
     val t = tw.topic
     val inFlight = ACT_IDS.filter(a => {
       val v = plainAct(db, tw, a)
-      v.topic == t and holdsLease(v.status) and v.leaseExp > tw.now
+      v.topic == t and holdsLease(v.status) and (v.leaseExp > tw.now or tw.unsettled.contains(a))
     }).size()
     val limit = if (tw.mode == "one") 1 else localAvail(proc, r)
     val wanted = min2(TOPIC_CAP.get(t) - inFlight, limit - tw.claimed.size())
@@ -1341,6 +1359,7 @@ module durable {
         TW1_BeginOne(r, topic, tnowOne),
         TW1_ReconcileScan(r, topic),
         TW1_ReconcileRow(r, a, reconcileAvail(r, a, backoff)),
+        TW1_ReconcileLockSkip(r, a),
         TW1_Count(r),
         TW1_ClaimRow(r, a, db.nextToken),
         TW1_SkipRow(r, a),
@@ -1591,7 +1610,9 @@ module durable {
   temporal fairDispatcher = RUNTIMES.forall(r => and {
     weakFair(TW1_BeginBatch(r), (db, proc)), weakFair(TW1_Count(r), (db, proc)), weakFair(TW1_Commit(r), (db, proc)),
     TOPICS.forall(t => weakFair(TW1_ReconcileScan(r, t), (db, proc))),
-    ACT_IDS.forall(a => weakFair(TW1_ReconcileRow(r, a, reconcileAvail(r, a, 1)), (db, proc)) and weakFair(TW1_ClaimRow(r, a, db.nextToken), (db, proc))),
+    // strong: a sweep may skip a row whose workflow another transaction holds (TW1_ReconcileLockSkip),
+    // so L5 needs that transaction to commit and a later sweep to reconcile the row
+    ACT_IDS.forall(a => strongFair(TW1_ReconcileRow(r, a, reconcileAvail(r, a, 1)), (db, proc)) and weakFair(TW1_ClaimRow(r, a, db.nextToken), (db, proc))),
   })
 
   // L1: a due ready workflow is eventually claimed (or otherwise leaves ready)

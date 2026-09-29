@@ -455,5 +455,7 @@ async fn application_cancellation_is_atomic_idempotent_and_releases_capacity() {
     }
 }
 
+#[path = "application_cancellation/reconcile_lock.rs"]
+mod reconcile_lock;
 #[path = "application_cancellation/timeout_cleanup.rs"]
 mod timeout_cleanup;

@@ -244,14 +244,8 @@ where
                 let max_concurrency = i64::from(max_concurrency);
 
                 let reconciled = reconcile_expired(connection, scope, &topic, now).await?;
-
-                let in_flight = durable_activity::table
-                    .filter(durable_activity::topic.eq(&topic))
-                    .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
-                    .filter(durable_activity::lease_expires_at.gt(now))
-                    .count()
-                    .get_result::<i64>(connection)
-                    .await?;
+                let in_flight = reconciled.in_flight(connection, now).await?;
+                let reconciled = reconciled.rows;
                 crate::trace::note("in_flight_seen", || topic_value(&topic, in_flight.into()));
                 crate::trace::note("local_avail", || topic_value(&topic, 1.into()));
                 if in_flight >= max_concurrency {
@@ -393,14 +387,10 @@ where
                 let mut reconciled = Vec::new();
                 let mut quarantined = Vec::new();
                 for (topic, persisted_limit) in locked_topics {
-                    reconciled.extend(reconcile_expired(connection, scope, &topic, now).await?);
-                    let in_flight = durable_activity::table
-                        .filter(durable_activity::topic.eq(&topic))
-                        .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
-                        .filter(durable_activity::lease_expires_at.gt(now))
-                        .count()
-                        .get_result::<i64>(connection)
-                        .await?;
+                    let topic_reconciled =
+                        reconcile_expired(connection, scope, &topic, now).await?;
+                    let in_flight = topic_reconciled.in_flight(connection, now).await?;
+                    reconciled.extend(topic_reconciled.rows);
                     let global_available =
                         i64::from(persisted_limit).saturating_sub(in_flight).max(0) as usize;
                     let wanted = global_available
@@ -1335,14 +1325,57 @@ fn dispatch_outcome(result: Result<String, ActivityDispatchError>) -> ExecutionO
     }
 }
 
-/// Returns the reconciled rows (`TW1_Claim` `reconciled`) in order.
-async fn reconcile_expired(
+/// One topic's lease reconciliation in a T-W1. The topic's `in_flight`
+/// count is read only through it, so the rows it left unsettled keep their
+/// slots.
+struct TopicReconciled<'t> {
+    topic: &'t str,
+    /// The reconciled rows (`TW1_Claim` `reconciled`) in order.
+    rows: Vec<serde_json::Value>,
+    /// Expired lease holders whose workflow row another transaction held:
+    /// skipped, still expired, reconciled by a later sweep.
+    unsettled: Vec<ActivityId>,
+}
+
+impl TopicReconciled<'_> {
+    /// Slot holders with a live lease, plus the expired ones this sweep left
+    /// unsettled: a heartbeat may still revive one of those, and this count
+    /// runs before that heartbeat commits (S17, G7).
+    async fn in_flight(
+        &self,
+        connection: &mut crate::DurableConnection,
+        now: DbMillis,
+    ) -> Result<i64, DurableError> {
+        Ok(durable_activity::table
+            .filter(durable_activity::topic.eq(self.topic))
+            .filter(durable_activity::status.eq_any(ActivityStatus::SLOT_HOLDERS))
+            .filter(
+                durable_activity::lease_expires_at
+                    .gt(now)
+                    .or(durable_activity::id.eq_any(&self.unsettled)),
+            )
+            .count()
+            .get_result::<i64>(connection)
+            .await?)
+    }
+}
+
+/// Reconciles the topic's expired lease holders. It runs while T-W1 holds
+/// every topic lock row, so it never waits on a workflow lock: a workflow
+/// row that another transaction holds (an application transaction can hold
+/// one for as long as it likes) is skipped, and its activity stays expired
+/// for a later sweep. The activity relock still blocks: only short engine
+/// transactions (T-W2, T-W4) lock an activity without its workflow, and G7's
+/// closure needs a heartbeat to commit before the recheck or to wait for
+/// this transaction.
+async fn reconcile_expired<'t>(
     connection: &mut crate::DurableConnection,
     scope: TxScope<'_>,
-    topic: &str,
+    topic: &'t str,
     now: DbMillis,
-) -> Result<Vec<serde_json::Value>, DurableError> {
+) -> Result<TopicReconciled<'t>, DurableError> {
     let mut reconciled = Vec::new();
+    let mut unsettled = Vec::new();
     let candidates = durable_activity::table
         .filter(durable_activity::topic.eq(topic))
         .filter(durable_activity::status.eq_any(ActivityStatus::LEASE_HOLDERS))
@@ -1355,15 +1388,21 @@ async fn reconcile_expired(
         .load::<(ActivityId, WorkflowId)>(connection)
         .await?;
     for (activity_id, workflow_id) in candidates {
-        let workflow = durable_workflow::table
+        let Some(workflow) = durable_workflow::table
             .find(workflow_id)
             .for_update()
+            .skip_locked()
             .select((
                 durable_workflow::status,
                 durable_workflow::wait_reference_id,
             ))
             .first::<(WorkflowStatus, Option<i64>)>(connection)
-            .await?;
+            .await
+            .optional()?
+        else {
+            unsettled.push(activity_id);
+            continue;
+        };
         let Some(row) = tx::lock_optional(
             connection,
             scope,
@@ -1518,7 +1557,11 @@ async fn reconcile_expired(
             }));
         }
     }
-    Ok(reconciled)
+    Ok(TopicReconciled {
+        topic,
+        rows: reconciled,
+        unsettled,
+    })
 }
 
 /// Where a settled revoke left its row.
