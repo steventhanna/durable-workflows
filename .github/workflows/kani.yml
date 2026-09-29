@@ -38,6 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
       - name: Install Kani ${{ env.KANI_VERSION }}
         run: |
           cargo install --locked kani-verifier --version "$KANI_VERSION"
