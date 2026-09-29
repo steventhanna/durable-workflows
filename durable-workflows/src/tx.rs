@@ -20,8 +20,10 @@
 //!   step, and under `trace-model` it panics if the scope declared a step or
 //!   touched a row. A path that writes a row without touching it is not
 //!   caught by either; that is a review rule (every write touches its row).
-//! - [`Locked`] proves that its row was read `FOR UPDATE` (or changed by a
-//!   one-row fenced `UPDATE`) in the transaction of its brand `'tx`. Only the
+//! - [`Locked`] proves that its row was read `FOR UPDATE` (or, for a
+//!   workflow row, changed by the claim-fenced one-row `UPDATE` that
+//!   [`lock_by_update`] builds from the row itself) in the transaction of its
+//!   brand `'tx`. Only the
 //!   `lock_*` functions in this module build one; they need the scope token,
 //!   and the token exists only inside the callback.
 //!
@@ -77,18 +79,29 @@
 //! 9. Trace: in `coordinator::commit_activity`, drop the
 //!    `let trace = trace.declare(..)` statement: E0308 (expected
 //!    `Trace<'_, Declared>`, found `Trace<'_, Undeclared>`).
+//! 10. Witness for an unrelated row: in `coordinator::commit_on_connection`'s
+//!     `Complete` arm, pass `&claim.lease_token` (any value that is not a
+//!     `&WorkflowRow`) as the `row` of `lock_by_update`: E0308 (expected
+//!     `&WorkflowRow`). Set a `durable_activity` column in its `changes`:
+//!     E0271 (`AsChangeset::Target == durable_workflow::table`). The
+//!     statement's table and key come from the row, not the caller.
 
 use std::{future::Future, marker::PhantomData, ops::Deref};
 
 use diesel::{
-    dsl::Limit, query_builder::QueryFragment, query_dsl::methods::LimitDsl, OptionalExtension,
+    dsl::Limit,
+    query_builder::{AsChangeset, QueryFragment},
+    query_dsl::methods::LimitDsl,
+    ExpressionMethods, OptionalExtension, QueryDsl,
 };
-use diesel_async::{
-    methods::{ExecuteDsl, LoadQuery},
-    AsyncConnection, RunQueryDsl,
-};
+use diesel_async::{methods::LoadQuery, AsyncConnection, RunQueryDsl};
 
-use crate::{dialect::TransactionCallback, Db, DurableConnection, DurableError, WorkflowId};
+use crate::{
+    dialect::TransactionCallback,
+    persistence::{WorkflowRow, WorkflowStatus},
+    schema::durable_workflow,
+    Db, DurableConnection, DurableError, WorkflowId,
+};
 
 /// Brand of one transaction callback. Invariant in `'tx`, `Copy`, no public
 /// constructor: it exists only inside the callback that [`enter`] runs.
@@ -322,7 +335,7 @@ impl CommandParent for ClaimFence {
     }
 }
 
-impl CommandParent for crate::persistence::WorkflowRow {
+impl CommandParent for WorkflowRow {
     fn workflow_id(&self) -> WorkflowId {
         self.id
     }
@@ -392,30 +405,37 @@ where
     }
 }
 
-/// Runs a fenced one-row `UPDATE`, which holds the row's lock to commit, and
-/// returns `row` (the caller's copy of the row) as its witness. Zero or
-/// several changed rows is `FencedWrite`. Weaker than a read lock: the witness
-/// holds the caller's pre-update copy.
+/// Runs the claim-fenced one-row `UPDATE` of `row` (the workflow row with
+/// `row.id`, `status = running` and `lease_token = lease_token`, set to
+/// `changes`, whose target must be `durable_workflow`), which holds the
+/// row's lock to commit, and returns `row` (the caller's copy of the row) as
+/// its witness. The helper builds the statement itself, so the witness is
+/// always for the row the `UPDATE` changed. Zero changed rows (the fence
+/// missed) is `FencedWrite`. Weaker than a read lock: the witness holds the
+/// caller's pre-update copy.
 // Not `async fn`: see `lock_optional` (higher-ranked Send).
 #[allow(clippy::manual_async_fn)]
-pub(crate) fn lock_by_update<'conn, 'tx, S, T>(
+pub(crate) fn lock_by_update<'conn, 'tx, 'r, V>(
     connection: &'conn mut DurableConnection,
     scope: TxScope<'tx>,
-    update: S,
-    row: T,
-) -> impl Future<Output = Result<Locked<'tx, T>, DurableError>> + Send + 'conn
+    row: &'r WorkflowRow,
+    lease_token: &'r str,
+    changes: V,
+) -> impl Future<Output = Result<Locked<'tx, &'r WorkflowRow>, DurableError>> + Send + 'conn
 where
-    S: ExecuteDsl<DurableConnection> + QueryFragment<Db> + Send + 'conn,
-    T: Send + 'conn,
+    V: AsChangeset<Target = durable_workflow::table>,
+    V::Changeset: QueryFragment<Db> + Send + 'conn,
     'tx: 'conn,
+    'r: 'conn,
 {
+    let update = diesel::update(
+        durable_workflow::table
+            .find(row.id)
+            .filter(durable_workflow::status.eq(WorkflowStatus::Running))
+            .filter(durable_workflow::lease_token.eq(lease_token)),
+    )
+    .set(changes);
     async move {
-        debug_assert!(
-            diesel::debug_query::<Db, _>(&update)
-                .to_string()
-                .starts_with("UPDATE"),
-            "lock_by_update needs an UPDATE statement"
-        );
         let changed = update.execute(connection).await?;
         if changed == 1 {
             Ok(Locked::new(scope, row))

@@ -188,7 +188,11 @@ the row `FOR UPDATE`", depend on them.
   `connection: &mut DurableConnection`. Locks are taken through
   `tx::lock_optional` / `lock_first` / `lock_by_update`, or a wrapper of
   them (`lock_fence`, `lock_workflow_by_id`, `lock_workflow`,
-  `lock_schedule_state`), which need the `scope`.
+  `lock_schedule_state`), which need the `scope`. `lock_by_update` takes
+  the `&WorkflowRow` and builds the claim-fenced `UPDATE` of that row
+  itself (the caller passes only the lease token and a `durable_workflow`
+  changeset), so its witness cannot name a row the statement did not
+  change (manual probe 10).
 - `Locked::new` stays private to `tx.rs`. No `Clone`, `Default` or `From`
   on `Locked<'tx, Row>` other than the `Row: Copy` impl.
 - Compiler limit 1: never put `&mut Tx<'_>`, `&mut T<'tx>` or any

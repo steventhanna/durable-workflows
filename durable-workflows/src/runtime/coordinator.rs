@@ -844,7 +844,9 @@ async fn commit_on_connection<'tx>(
             let completed = tx::lock_by_update(
                 connection,
                 scope,
-                diesel::update(fenced_workflow!(claim)).set((
+                &claim.row,
+                &claim.lease_token,
+                (
                     durable_workflow::status.eq(WorkflowStatus::Succeeded),
                     durable_workflow::result_json.eq(Some(output_json.clone())),
                     durable_workflow::delivered_event_sequence.eq(delivered),
@@ -857,8 +859,7 @@ async fn commit_on_connection<'tx>(
                     durable_workflow::lease_expires_at.eq(None::<i64>),
                     durable_workflow::updated_at.eq(now),
                     durable_workflow::completed_at.eq(Some(now)),
-                )),
-                &claim.row,
+                ),
             )
             .await?;
             let trace = trace.declare(|| {
