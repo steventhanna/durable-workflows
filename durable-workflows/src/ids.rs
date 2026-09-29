@@ -11,8 +11,10 @@
 //! }
 //! ```
 //!
-//! A row read from the database is checked on decode: an id that is not
-//! positive is a deserialization error, never a panic.
+//! An id is checked wherever it is decoded: a row read from the database
+//! (`FromSql`) and a serde value (JSON, a query string) both go through
+//! `new`, so an id that is not positive is a deserialization error, never a
+//! panic and never a value. Serialization writes the plain integer.
 
 use std::fmt;
 
@@ -63,15 +65,30 @@ macro_rules! define_id {
             Hash,
             PartialOrd,
             Ord,
-            Serialize,
             Deserialize,
             utoipa::ToSchema,
             AsExpression,
             FromSqlRow,
         )]
-        #[serde(transparent)]
+        #[serde(try_from = "i64")]
         #[diesel(sql_type = sql_types::$name)]
         pub struct $name(i64);
+
+        impl TryFrom<i64> for $name {
+            type Error = DurableError;
+
+            fn try_from(value: i64) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        // Written by hand: `#[serde(transparent)]` cannot be combined with
+        // `try_from`, and the wire form stays the plain integer.
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.serialize(serializer)
+            }
+        }
 
         impl FromSql<sql_types::$name, Db> for $name {
             fn from_sql(
@@ -204,4 +221,58 @@ mod verification {
     id_new_accepts_only_positive!(activity_id_new_accepts_only_positive, ActivityId);
     id_new_accepts_only_positive!(approval_id_new_accepts_only_positive, ApprovalId);
     id_new_accepts_only_positive!(schedule_run_id_new_accepts_only_positive, ScheduleRunId);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::{ActivityListFilter, ApprovalListFilter, WorkflowListFilter};
+
+    #[test]
+    fn a_non_positive_id_does_not_deserialize() {
+        for text in ["0", "-7"] {
+            assert!(serde_json::from_str::<WorkflowId>(text).is_err(), "{text}");
+            assert!(serde_json::from_str::<ActivityId>(text).is_err(), "{text}");
+            assert!(serde_json::from_str::<ApprovalId>(text).is_err(), "{text}");
+            assert!(serde_json::from_str::<ScheduleRunId>(text).is_err(), "{text}");
+        }
+        let id: WorkflowId = serde_json::from_str("7").expect("a positive id decodes");
+        assert_eq!(id.get(), 7);
+    }
+
+    #[test]
+    fn an_id_serializes_as_the_plain_integer() {
+        let id = ActivityId::new(42).expect("positive");
+        assert_eq!(serde_json::to_string(&id).expect("serializes"), "42");
+        assert_eq!(
+            serde_json::to_value(Some(id)).expect("serializes"),
+            serde_json::json!(42)
+        );
+    }
+
+    #[test]
+    fn admin_filters_reject_a_non_positive_id() {
+        for value in [0, -7] {
+            assert!(serde_json::from_value::<WorkflowListFilter>(
+                serde_json::json!({ "rootWorkflowId": value })
+            )
+            .is_err());
+            assert!(serde_json::from_value::<WorkflowListFilter>(
+                serde_json::json!({ "scheduleRunId": value })
+            )
+            .is_err());
+            assert!(serde_json::from_value::<ActivityListFilter>(
+                serde_json::json!({ "workflowId": value })
+            )
+            .is_err());
+            assert!(serde_json::from_value::<ApprovalListFilter>(
+                serde_json::json!({ "workflowId": value })
+            )
+            .is_err());
+        }
+        let filter: WorkflowListFilter =
+            serde_json::from_value(serde_json::json!({ "rootWorkflowId": 3 }))
+                .expect("a positive id decodes");
+        assert_eq!(filter.root_workflow_id.map(WorkflowId::get), Some(3));
+    }
 }

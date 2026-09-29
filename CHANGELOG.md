@@ -114,6 +114,17 @@ Compared with the production-internal version it was extracted from:
   id columns as the id type (`.first::<WorkflowId>(..)`), write
   `wait_reference_id` and raw-SQL binds as `id.get()`, and drop the
   `?`/`expect` after the two claim id accessors.
+- Id deserialization is checked (breaking): serde decodes each id newtype
+  through its `new` (`#[serde(try_from = "i64")]`, `TryFrom<i64>` returning
+  `DurableError::InvalidId`), so a JSON body, query string or path segment
+  with `0` or a negative id is a deserialization error instead of an id
+  value. This covers the id fields of the admin filters
+  (`WorkflowListFilter::root_workflow_id` / `schedule_run_id`,
+  `ActivityListFilter::workflow_id`, `ApprovalListFilter::workflow_id`).
+  Serialization and the OpenAPI schema are unchanged (the plain integer).
+  Migration: a caller that sent a non-positive id to mean "none" omits the
+  field instead; an HTTP layer that decodes a `Path<WorkflowId>` or
+  `Query<..Filter>` now rejects such a request before it runs a query.
 - The database clock is typed (breaking): `persistence::database_now_millis`
   returns a `DbMillis` (epoch millis on the database clock), not an `i64`,
   and every function that takes the current time takes one:
