@@ -632,29 +632,50 @@ struct Count {
     count: i64,
 }
 
-/// Number of InnoDB transactions in lock wait that have already modified rows.
+/// Which lock-waiting transactions `lock_waiters` counts.
+#[derive(Clone, Copy)]
+enum Waiters {
+    Any,
+    /// Only transactions that have already written.
+    Writers,
+}
+
+/// Number of InnoDB transactions waiting on a lock in this database. A writer
+/// holds a granted `IX` table lock. `performance_schema.data_lock_waits` reads
+/// the lock system directly; `information_schema.innodb_trx` serves a
+/// server-wide cache that concurrent pollers keep from refreshing.
 #[cfg(feature = "mysql")]
-async fn lock_waiters(pool: &DurablePool, min_rows_modified: i64) -> i64 {
+async fn lock_waiters(pool: &DurablePool, waiters: Waiters) -> i64 {
+    let writers_only = matches!(waiters, Waiters::Writers);
     let mut connection = pool.get().await.expect("test connection");
     diesel::sql_query(format!(
-        "SELECT COUNT(*) AS count FROM information_schema.innodb_trx \
-         WHERE trx_state = 'LOCK WAIT' AND trx_rows_modified >= {min_rows_modified}"
+        "SELECT COUNT(DISTINCT w.REQUESTING_ENGINE_TRANSACTION_ID) AS count \
+         FROM performance_schema.data_lock_waits w \
+         JOIN performance_schema.data_locks l \
+           ON l.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID \
+         WHERE l.OBJECT_SCHEMA = DATABASE() \
+         AND (NOT {writers_only} OR EXISTS ( \
+           SELECT 1 FROM performance_schema.data_locks h \
+           WHERE h.ENGINE_TRANSACTION_ID = w.REQUESTING_ENGINE_TRANSACTION_ID \
+           AND h.LOCK_TYPE = 'TABLE' AND h.LOCK_MODE = 'IX' \
+           AND h.LOCK_STATUS = 'GRANTED'))"
     ))
     .get_result::<Count>(&mut connection)
     .await
-    .expect("innodb_trx query")
+    .expect("data_lock_waits query")
     .count
 }
 
-/// Number of backends in this database waiting on a heavyweight lock. With
-/// `min_rows_modified > 0`, only transactions that already hold a write xid.
+/// Number of backends in this database waiting on a heavyweight lock. A
+/// writer holds a write xid.
 #[cfg(feature = "postgres")]
-async fn lock_waiters(pool: &DurablePool, min_rows_modified: i64) -> i64 {
+async fn lock_waiters(pool: &DurablePool, waiters: Waiters) -> i64 {
+    let writers_only = matches!(waiters, Waiters::Writers);
     let mut connection = pool.get().await.expect("test connection");
     diesel::sql_query(format!(
         "SELECT COUNT(*) AS count FROM pg_stat_activity \
          WHERE datname = current_database() AND wait_event_type = 'Lock' \
-         AND ({min_rows_modified} = 0 OR backend_xid IS NOT NULL)"
+         AND (NOT {writers_only} OR backend_xid IS NOT NULL)"
     ))
     .get_result::<Count>(&mut connection)
     .await
@@ -675,8 +696,6 @@ where
             tokio::time::Instant::now() < deadline,
             "timed out waiting for {what}"
         );
-        // information_schema.innodb_trx refreshes its cache only after 100 ms
-        // without reads, so polling faster would never observe new state.
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
@@ -1687,7 +1706,7 @@ async fn g4_child_completion_sees_a_parent_pause_committed_after_its_first_read(
     activate_child.send(()).expect("child claim task waits");
     wait_until(
         "child completion to block on its history insert",
-        || async { lock_waiters(&pool, 1).await >= 1 },
+        || async { lock_waiters(&pool, Waiters::Writers).await >= 1 },
     )
     .await;
 
@@ -1790,7 +1809,7 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
 
     activate_v1.send(()).expect("v1 claim task waits");
     wait_until("v1 commit to insert its child and block", || async {
-        lock_waiters(&pool, 1).await >= 1
+        lock_waiters(&pool, Waiters::Writers).await >= 1
     })
     .await;
 
@@ -1798,7 +1817,7 @@ async fn g6_child_dedup_race_rejects_version_mismatch() {
     // child; its insert then waits on the v1 child's unique key.
     activate_v2.send(()).expect("v2 claim task waits");
     wait_until("v2 commit to block on the dedup key", || async {
-        lock_waiters(&pool, 0).await >= 2
+        lock_waiters(&pool, Waiters::Any).await >= 2
     })
     .await;
     blocker.batch_execute("ROLLBACK").await.expect("release");
