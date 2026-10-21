@@ -47,7 +47,6 @@ To learn how the engine works, start with
 durable-workflows = "0.1"
 diesel-async = { version = "0.9", features = ["postgres", "bb8"] }
 serde = { version = "1", features = ["derive"] }
-async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -143,7 +142,6 @@ struct SendGreeting {
     name: String,
 }
 
-#[async_trait::async_trait]
 impl ActivityHandler for SendGreeting {
     type Context = App;
     type Output = String;

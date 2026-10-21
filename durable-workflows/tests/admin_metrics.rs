@@ -1,6 +1,5 @@
 mod support;
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use durable_workflows::DbMillis;
@@ -90,7 +89,6 @@ impl DurableWorkflow for MetricsWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for MetricsWorkflow {
     type Context = ();
     type State = ();
@@ -121,7 +119,6 @@ impl DurableSchedule for RegisteredSchedule {
     const MISFIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 }
 
-#[async_trait]
 impl ScheduleHandler for RegisteredSchedule {
     type Context = ();
 

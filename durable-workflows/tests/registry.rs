@@ -3,7 +3,6 @@ mod support;
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use durable_workflows::{
     ActivityContext, ActivityHandler, ActivityTopic, DurableActivity, DurableWorkflow, RetryPolicy,
     WorkflowContext, WorkflowEvent, WorkflowHandler, WorkflowTransition,
@@ -19,7 +18,6 @@ impl DurableWorkflow for WorkflowV1 {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for WorkflowV1 {
     type Context = ();
     type State = i32;
@@ -55,7 +53,6 @@ impl DurableWorkflow for WorkflowV2 {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl WorkflowHandler for WorkflowV2 {
     type Context = ();
     type State = i32;
@@ -125,7 +122,6 @@ impl DurableActivity for ActivityV1 {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for ActivityV1 {
     type Context = ();
     type Output = i32;
@@ -161,7 +157,6 @@ impl DurableActivity for ActivityV2 {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for ActivityV2 {
     type Context = ();
     type Output = i32;

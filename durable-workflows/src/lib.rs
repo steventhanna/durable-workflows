@@ -60,10 +60,6 @@ pub use durable_workflows_macros::{
     durable_flow, DurableActivity, DurableSchedule, DurableWorkflow,
 };
 
-// Generated `#[durable_flow]` code references these re-exports so user crates
-// do not need matching direct dependencies.
-#[doc(hidden)]
-pub use async_trait;
 pub use clock::DbMillis;
 pub use error::{ActivityError, DurableError, WorkflowError};
 pub use flow::{DurableFlow, FlowJournal, JournalEntry, WfCtx, WfError};

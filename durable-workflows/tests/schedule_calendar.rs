@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use durable_workflows::DurableConnection;
 use durable_workflows::{
@@ -20,7 +19,6 @@ use durable_workflows::{
 )]
 struct DailyDenver;
 
-#[async_trait]
 impl ScheduleHandler for DailyDenver {
     type Context = ();
 
@@ -46,7 +44,6 @@ impl ScheduleHandler for DailyDenver {
 )]
 struct DailyDenverSkip;
 
-#[async_trait]
 impl ScheduleHandler for DailyDenverSkip {
     type Context = ();
 
@@ -73,7 +70,6 @@ impl ScheduleHandler for DailyDenverSkip {
 )]
 struct DailyDenverCatchUp;
 
-#[async_trait]
 impl ScheduleHandler for DailyDenverCatchUp {
     type Context = ();
 
@@ -142,7 +138,6 @@ fn invalid_cron_and_timezone_fail_registration() {
         const OVERLAP: OverlapPolicy = OverlapPolicy::Allow;
         const MISFIRE_GRACE: Duration = Duration::from_secs(60);
     }
-    #[async_trait]
     impl ScheduleHandler for InvalidCron {
         type Context = ();
         async fn start_occurrence(
@@ -165,7 +160,6 @@ fn invalid_cron_and_timezone_fail_registration() {
         const OVERLAP: OverlapPolicy = OverlapPolicy::Allow;
         const MISFIRE_GRACE: Duration = Duration::from_secs(60);
     }
-    #[async_trait]
     impl ScheduleHandler for InvalidTimezone {
         type Context = ();
         async fn start_occurrence(

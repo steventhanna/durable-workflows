@@ -2,7 +2,6 @@ mod support;
 
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -27,7 +26,6 @@ impl DurableWorkflow for GatedWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for GatedWorkflow {
     type Context = GateContext;
     type State = ();

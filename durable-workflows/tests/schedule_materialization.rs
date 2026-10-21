@@ -3,7 +3,6 @@ mod support;
 use durable_workflows::DbMillis;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
@@ -26,7 +25,6 @@ impl DurableWorkflow for ScheduledWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ScheduledWorkflow {
     type Context = ();
     type State = ();
@@ -59,7 +57,6 @@ macro_rules! schedule {
             const MISFIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
         }
 
-        #[async_trait]
         impl ScheduleHandler for $name {
             type Context = ();
 
@@ -149,7 +146,6 @@ impl DurableSchedule for FailingRecoverySchedule {
     const MISFIRE_GRACE: std::time::Duration = ScanBoundSchedule::MISFIRE_GRACE;
 }
 
-#[async_trait]
 impl ScheduleHandler for FailingRecoverySchedule {
     type Context = ();
 
@@ -165,7 +161,6 @@ impl ScheduleHandler for FailingRecoverySchedule {
 
 macro_rules! successful_handler {
     ($name:ident) => {
-        #[async_trait]
         impl ScheduleHandler for $name {
             type Context = ();
 

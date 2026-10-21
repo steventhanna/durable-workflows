@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -66,7 +65,6 @@ impl DurableActivity for ScanPage {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for ScanPage {
     type Context = ScanContext;
     type Output = Option<Cursor>;
@@ -115,7 +113,6 @@ impl DurableWorkflow for ScanWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ScanWorkflow {
     type Context = ScanContext;
     type State = ();

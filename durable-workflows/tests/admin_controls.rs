@@ -3,7 +3,6 @@ mod support;
 
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel::{BoolExpressionMethods, ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 use durable_workflows::{
@@ -29,7 +28,6 @@ impl DurableWorkflow for ControlWorkflowV1 {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ControlWorkflowV1 {
     type Context = ();
     type State = i32;
@@ -61,7 +59,6 @@ impl DurableWorkflow for ControlWorkflowV2 {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl WorkflowHandler for ControlWorkflowV2 {
     type Context = ();
     type State = String;
@@ -122,7 +119,6 @@ macro_rules! control_activity {
             }
         }
 
-        #[async_trait]
         impl ActivityHandler for $name {
             type Context = ();
             type Output = i32;
@@ -1223,7 +1219,6 @@ impl DurableWorkflow for CascadeChild {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for CascadeChild {
     type Context = ();
     type Output = i32;
@@ -1241,7 +1236,6 @@ impl DurableWorkflow for CascadeParent {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for CascadeParent {
     type Context = ();
     type Output = i32;

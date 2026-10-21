@@ -9,7 +9,8 @@
 //! be deterministic: replay verifies each requested step against the recorded
 //! entry and fails closed on a mismatch.
 
-use async_trait::async_trait;
+use std::future::Future;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -293,16 +294,18 @@ impl<'a, C> WfCtx<'a, C> {
 /// Implementors gain a [`WorkflowHandler`] implementation automatically, so a
 /// flow registers, starts, and composes as a child exactly like a hand-written
 /// state machine. Use the `#[durable_flow]` attribute macro to derive this
-/// from an `async fn`.
-#[async_trait]
+/// from an `async fn`, or implement `run` as an `async fn` by hand; the
+/// returned future must be `Send`.
 pub trait DurableFlow: DurableWorkflow {
     type Context: Send + Sync + 'static;
     type Output: Serialize + serde::de::DeserializeOwned + Send + Sync + 'static;
 
-    async fn run(&self, ctx: &mut WfCtx<'_, Self::Context>) -> Result<Self::Output, WfError>;
+    fn run(
+        &self,
+        ctx: &mut WfCtx<'_, Self::Context>,
+    ) -> impl Future<Output = Result<Self::Output, WfError>> + Send;
 }
 
-#[async_trait]
 impl<F> WorkflowHandler for F
 where
     F: DurableFlow,
@@ -505,7 +508,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl ActivityHandler for DoubleActivity {
         type Context = ();
         type Output = i64;
@@ -525,7 +527,6 @@ mod tests {
         const VERSION: i32 = 1;
     }
 
-    #[async_trait]
     impl DurableFlow for ChildEcho {
         type Context = ();
         type Output = String;
@@ -546,7 +547,6 @@ mod tests {
         const VERSION: i32 = 1;
     }
 
-    #[async_trait]
     impl DurableFlow for PipelineFlow {
         type Context = ();
         type Output = i64;
@@ -792,7 +792,6 @@ mod tests {
         const VERSION: i32 = 1;
     }
 
-    #[async_trait]
     impl DurableFlow for EmptyFlow {
         type Context = ();
         type Output = ();

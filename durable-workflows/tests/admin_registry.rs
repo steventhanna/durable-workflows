@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use async_trait::async_trait;
 use durable_workflows::{
     admin::ScheduleRegistry, ActivityContext, ActivityError, ActivityHandler, ActivityRegistry,
     ActivityTopic, DurableActivity, DurableError, DurableSchedule, DurableWorkflow, MisfirePolicy,
@@ -18,7 +17,6 @@ impl DurableWorkflow for VersionOneWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for VersionOneWorkflow {
     type Context = ();
     type State = i32;
@@ -50,7 +48,6 @@ impl DurableWorkflow for VersionTwoWorkflow {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl WorkflowHandler for VersionTwoWorkflow {
     type Context = ();
     type State = String;
@@ -111,7 +108,6 @@ macro_rules! activity_version {
             }
         }
 
-        #[async_trait]
         impl ActivityHandler for $name {
             type Context = ();
             type Output = i32;
@@ -141,7 +137,6 @@ impl DurableSchedule for TestSchedule {
     const MISFIRE_GRACE: Duration = Duration::from_secs(60);
 }
 
-#[async_trait]
 impl ScheduleHandler for TestSchedule {
     type Context = ();
 

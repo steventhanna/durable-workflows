@@ -147,7 +147,6 @@ fn try_expand_flow(metadata: FlowMetadata, function: ItemFn) -> Result<TokenStre
             const VERSION: i32 = #version;
         }
 
-        #[durable_workflows::async_trait::async_trait]
         impl durable_workflows::DurableFlow for #struct_name {
             type Context = #context_type;
             type Output = #output_type;
