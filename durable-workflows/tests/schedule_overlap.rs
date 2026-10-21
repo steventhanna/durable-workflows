@@ -3,7 +3,6 @@ mod support;
 use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
@@ -26,7 +25,6 @@ impl DurableWorkflow for OverlapWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for OverlapWorkflow {
     type Context = ();
     type State = ();
@@ -59,7 +57,6 @@ macro_rules! overlap_schedule {
             const MISFIRE_GRACE: Duration = Duration::from_secs(10);
         }
 
-        #[async_trait]
         impl ScheduleHandler for $name {
             type Context = ();
 

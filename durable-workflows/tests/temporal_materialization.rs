@@ -3,7 +3,6 @@ mod support;
 use durable_workflows::DbMillis;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -23,7 +22,6 @@ impl DurableWorkflow for TemporalWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for TemporalWorkflow {
     type Context = ();
     type State = ();

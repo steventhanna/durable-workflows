@@ -1,7 +1,6 @@
 use durable_workflows::DbMillis;
 mod support;
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -52,7 +51,6 @@ struct CleanupContext {
     started: tokio::sync::Notify,
     cleaned: AtomicBool,
 }
-#[async_trait]
 impl ActivityHandler for CleanupActivity {
     type Context = CleanupContext;
     type Output = ();
@@ -101,7 +99,6 @@ impl DurableWorkflow for HostWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for HostWorkflow {
     type Context = ();
     type State = ();

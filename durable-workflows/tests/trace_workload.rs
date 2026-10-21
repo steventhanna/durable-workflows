@@ -38,7 +38,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use diesel::{
     sql_types::{BigInt, Nullable, Text},
     QueryDsl, QueryableByName, SelectableHelper,
@@ -260,7 +259,6 @@ macro_rules! workload_activity {
             }
         }
 
-        #[async_trait]
         impl ActivityHandler for $name {
             type Context = Workload;
             type Output = i32;
@@ -294,7 +292,6 @@ fn definition(error: durable_workflows::DurableError) -> WorkflowError {
     WorkflowError::new("definition", error.to_string())
 }
 
-#[async_trait]
 impl WorkflowHandler for WorkloadFlow {
     type Context = Workload;
     type State = u32;

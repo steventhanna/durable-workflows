@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use durable_workflows::{
     ActivityContext, ActivityError, ActivityHandler, ActivityResult, ActivityTopic, ChildResult,
     DurableActivity, DurableFlow, DurableWorkflow, FlowJournal, RetryPolicy, WfCtx, WfError,
@@ -50,7 +49,6 @@ impl DurableActivity for Double {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for Double {
     type Context = ();
     type Output = i64;
@@ -70,7 +68,6 @@ impl DurableWorkflow for Echo {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl DurableFlow for Echo {
     type Context = ();
     type Output = String;
@@ -105,7 +102,6 @@ impl DurableWorkflow for Script {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for Script {
     type Context = ();
     type Output = Vec<String>;

@@ -20,7 +20,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel_async::pooled_connection::{bb8::Pool, AsyncDieselConnectionManager};
 use durable_workflows::{
     durable_flow, ActivityContext, ActivityError, ActivityHandler, ActivityRegistry,
@@ -69,7 +68,6 @@ struct SendGreeting {
     name: String,
 }
 
-#[async_trait]
 impl ActivityHandler for SendGreeting {
     type Context = App;
     type Output = String;

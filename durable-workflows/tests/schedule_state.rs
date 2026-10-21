@@ -3,7 +3,6 @@ mod support;
 use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use diesel::{QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
@@ -31,7 +30,6 @@ macro_rules! schedule_definition {
             const MISFIRE_GRACE: Duration = Duration::from_secs(300);
         }
 
-        #[async_trait]
         impl ScheduleHandler for $name {
             type Context = ();
 
@@ -59,7 +57,6 @@ impl DurableWorkflow for FoldWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for FoldWorkflow {
     type Context = ();
     type State = ();
@@ -93,7 +90,6 @@ macro_rules! started_schedule {
             const MISFIRE_GRACE: Duration = Duration::from_secs(300);
         }
 
-        #[async_trait]
         impl ScheduleHandler for $name {
             type Context = ();
 

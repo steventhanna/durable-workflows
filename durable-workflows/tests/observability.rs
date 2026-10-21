@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -35,7 +34,6 @@ impl DurableWorkflow for SecretWorkflow {
     const VERSION: i32 = 7;
 }
 
-#[async_trait]
 impl WorkflowHandler for SecretWorkflow {
     type Context = ();
     type State = String;
@@ -94,7 +92,6 @@ impl DurableActivity for SecretActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for SecretActivity {
     type Context = ();
     type Output = ();

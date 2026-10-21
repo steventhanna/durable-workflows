@@ -2,7 +2,6 @@ mod support;
 
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -51,7 +50,6 @@ impl DurableActivity for DoubleActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for DoubleActivity {
     type Context = ();
     type Output = i64;
@@ -71,7 +69,6 @@ impl DurableWorkflow for ChildDouble {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for ChildDouble {
     type Context = ();
     type Output = i64;
@@ -120,7 +117,6 @@ impl DurableActivity for UnservedActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for UnservedActivity {
     type Context = ();
     type Output = ();
@@ -135,7 +131,6 @@ impl DurableWorkflow for StuckChild {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for StuckChild {
     type Context = ();
     type Output = ();
@@ -561,7 +556,6 @@ impl DurableWorkflow for ChildDoubleV2 {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl DurableFlow for ChildDoubleV2 {
     type Context = ();
     type Output = i64;

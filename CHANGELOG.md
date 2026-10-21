@@ -89,6 +89,21 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- The handler traits `WorkflowHandler`, `ActivityHandler`, `DurableFlow`
+  and `ScheduleHandler` use native `async fn` in traits instead of
+  `#[async_trait]` (breaking for implementors). Each method is declared
+  `fn ..(..) -> impl Future<Output = ..> + Send`; implement it as a plain
+  `async fn`. A handler future that is not `Send` is a compile error at the
+  impl (`activity_handler_future_not_send` compile-fail case). The registries
+  still box each call's future once, in their object-safe adapters, so
+  execution, leases, fencing, retries and tracing are unchanged. Rustc no
+  longer proves `Send` for a `Pin<Box<dyn Future + Send + 'async_trait>>` at
+  every impl, which cuts the type- and borrow-check time of crates with many
+  handlers. Migration: delete `#[async_trait]` from every impl of these
+  traits, and drop the `async-trait` dependency if nothing else uses it.
+- The `#[doc(hidden)]` re-export `durable_workflows::async_trait` is removed
+  (breaking for code that used it); `#[durable_flow]` no longer emits it.
+
 - `RetryPolicy::from_validated` is removed (breaking for code that called
   the `#[doc(hidden)]` hatch): it built a policy without checking the retry
   bounds. Every `RetryPolicy` outside the crate is now within the bounds

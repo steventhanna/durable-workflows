@@ -1,7 +1,6 @@
 use durable_workflows::DbMillis;
 mod support;
 
-use async_trait::async_trait;
 use diesel_async::AsyncConnection;
 use durable_workflows::{
     DurableWorkflow, StartOptions, WorkflowContext, WorkflowEvent, WorkflowHandler,
@@ -23,7 +22,6 @@ impl DurableWorkflow for StartWorkflowV2 {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl WorkflowHandler for StartWorkflowV2 {
     type Context = ();
     type State = i32;
@@ -57,7 +55,6 @@ impl DurableWorkflow for OtherStartWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for OtherStartWorkflow {
     type Context = ();
     type State = i32;
@@ -91,7 +88,6 @@ impl DurableWorkflow for LargeInputWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for LargeInputWorkflow {
     type Context = ();
     type State = i32;
@@ -147,7 +143,6 @@ impl DurableWorkflow for FailingSerializeWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for FailingSerializeWorkflow {
     type Context = ();
     type State = i32;
@@ -176,7 +171,6 @@ impl DurableWorkflow for SerializationFailureWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for SerializationFailureWorkflow {
     type Context = ();
     type State = ();
@@ -203,7 +197,6 @@ impl DurableWorkflow for LargeStateWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for LargeStateWorkflow {
     type Context = ();
     type State = String;
@@ -232,7 +225,6 @@ impl DurableWorkflow for StartWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for StartWorkflow {
     type Context = ();
     type State = i32;

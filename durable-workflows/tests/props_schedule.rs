@@ -3,7 +3,6 @@
 
 use std::{collections::HashSet, sync::OnceLock, time::Duration};
 
-use async_trait::async_trait;
 use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use durable_workflows::DurableConnection;
@@ -314,7 +313,6 @@ macro_rules! catch_up_schedule {
             const OVERLAP: OverlapPolicy = OverlapPolicy::Allow;
             const MISFIRE_GRACE: Duration = Duration::from_secs(60);
         }
-        #[async_trait]
         impl ScheduleHandler for $name {
             type Context = ();
             async fn start_occurrence(

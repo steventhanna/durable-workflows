@@ -79,7 +79,6 @@ struct LeasedCleanupContext {
     cleaned: AtomicBool,
 }
 
-#[async_trait]
 impl ActivityHandler for LeasedCleanupActivity {
     type Context = LeasedCleanupContext;
     type Output = ();
@@ -336,7 +335,6 @@ struct FinishDuringRenewalContext {
     release: tokio::sync::Notify,
 }
 
-#[async_trait]
 impl ActivityHandler for FinishDuringRenewalActivity {
     type Context = FinishDuringRenewalContext;
     type Output = ();
@@ -464,7 +462,6 @@ struct LockingProgressContext {
     report: tokio::sync::Notify,
 }
 
-#[async_trait]
 impl ActivityHandler for LockingProgressActivity {
     type Context = LockingProgressContext;
     type Output = ();

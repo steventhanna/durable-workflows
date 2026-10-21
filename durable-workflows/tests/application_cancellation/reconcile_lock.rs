@@ -33,7 +33,6 @@ impl DurableActivity for OtherActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for OtherActivity {
     type Context = CleanupContext;
     type Output = ();

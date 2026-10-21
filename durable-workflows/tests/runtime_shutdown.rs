@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use durable_workflows::{
@@ -78,7 +77,6 @@ impl DurableActivity for RuntimeActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for RuntimeActivity {
     type Context = RuntimeTestContext;
     type Output = i32;
@@ -189,7 +187,6 @@ impl DurableActivity for RuntimeContinuationActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for RuntimeContinuationActivity {
     type Context = RuntimeTestContext;
     type Output = i32;
@@ -219,7 +216,6 @@ impl DurableWorkflow for RuntimeWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for RuntimeWorkflow {
     type Context = RuntimeTestContext;
     type State = ();

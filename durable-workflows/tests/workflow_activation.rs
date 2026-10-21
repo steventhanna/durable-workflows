@@ -3,7 +3,6 @@ mod support;
 
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use durable_workflows::{
     ActivityCommand, ActivityContext, ActivityError, ActivityHandler, ActivityTopic,
     CoordinatorConfig, DurableActivity, DurableWorkflow, RetryPolicy, WorkflowContext,
@@ -29,7 +28,6 @@ impl DurableWorkflow for FailingWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for FailingWorkflow {
     type Context = ();
     type State = ();
@@ -62,7 +60,6 @@ impl DurableWorkflow for ManyContinuesWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ManyContinuesWorkflow {
     type Context = ();
     type State = i32;
@@ -98,7 +95,6 @@ impl DurableWorkflow for OneShotWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for OneShotWorkflow {
     type Context = ();
     type State = ();
@@ -160,7 +156,6 @@ impl DurableActivity for TestActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for TestActivity {
     type Context = ();
     type Output = i32;
@@ -184,7 +179,6 @@ impl DurableWorkflow for SleepWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for SleepWorkflow {
     type Context = ();
     type State = i32;
@@ -219,7 +213,6 @@ impl DurableWorkflow for ApprovalWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ApprovalWorkflow {
     type Context = ();
     type State = i32;
@@ -263,7 +256,6 @@ impl DurableWorkflow for WaitWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for WaitWorkflow {
     type Context = ();
     type State = i32;
@@ -297,7 +289,6 @@ impl WorkflowHandler for WaitWorkflow {
     }
 }
 
-#[async_trait]
 impl WorkflowHandler for ActivityWorkflow {
     type Context = ();
     type State = i32;
@@ -338,7 +329,6 @@ impl DurableWorkflow for ContinueWorkflowV2 {
     const VERSION: i32 = 2;
 }
 
-#[async_trait]
 impl WorkflowHandler for ContinueWorkflowV2 {
     type Context = ();
     type State = i32;
@@ -369,7 +359,6 @@ impl WorkflowHandler for ContinueWorkflowV2 {
     }
 }
 
-#[async_trait]
 impl WorkflowHandler for ContinueWorkflow {
     type Context = ();
     type State = i32;

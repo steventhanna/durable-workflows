@@ -3,7 +3,6 @@ mod support;
 use durable_workflows::DbMillis;
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use durable_workflows::DurableConnection;
@@ -24,7 +23,6 @@ impl DurableWorkflow for TemporalRuntimeWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for TemporalRuntimeWorkflow {
     type Context = ();
     type State = ();
@@ -55,7 +53,6 @@ impl DurableSchedule for HealthySchedule {
     const MISFIRE_GRACE: Duration = Duration::from_secs(30);
 }
 
-#[async_trait]
 impl ScheduleHandler for HealthySchedule {
     type Context = ();
 
@@ -87,7 +84,6 @@ impl DurableSchedule for FailingSchedule {
     const MISFIRE_GRACE: Duration = Duration::from_secs(30);
 }
 
-#[async_trait]
 impl ScheduleHandler for FailingSchedule {
     type Context = ();
 

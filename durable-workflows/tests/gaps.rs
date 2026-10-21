@@ -11,7 +11,6 @@ mod support;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel::{sql_types::BigInt, QueryableByName};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
@@ -93,7 +92,6 @@ macro_rules! gap_activity {
             }
         }
 
-        #[async_trait]
         impl ActivityHandler for $name {
             type Context = GapContext;
             type Output = ();
@@ -137,7 +135,6 @@ macro_rules! gap_flow {
             const VERSION: i32 = $version;
         }
 
-        #[async_trait]
         impl DurableFlow for $name {
             type Context = GapContext;
             type Output = ();
@@ -195,7 +192,6 @@ impl DurableWorkflow for G2RecoveringChild {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for G2RecoveringChild {
     type Context = GapContext;
     type Output = i32;
@@ -216,7 +212,6 @@ impl DurableWorkflow for G2ReattachParent {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for G2ReattachParent {
     type Context = GapContext;
     type Output = i32;
@@ -329,7 +324,6 @@ impl DurableWorkflow for G11RecoveringParent {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for G11RecoveringParent {
     type Context = GapContext;
     type Output = i32;
@@ -426,7 +420,6 @@ impl DurableActivity for G11HeldActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for G11HeldActivity {
     type Context = GapContext;
     type Output = ();
@@ -2635,7 +2628,6 @@ impl DurableActivity for N2HeldActivity {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for N2HeldActivity {
     type Context = N2Context;
     type Output = ();
@@ -2663,7 +2655,6 @@ impl DurableWorkflow for N2Flow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl DurableFlow for N2Flow {
     type Context = N2Context;
     type Output = ();

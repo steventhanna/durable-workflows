@@ -7,7 +7,6 @@ mod support;
 
 use std::{sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use diesel::{QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -54,7 +53,6 @@ impl DurableActivity for SendEmail {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for SendEmail {
     type Context = ();
     type Output = i32;
@@ -76,7 +74,6 @@ impl DurableWorkflow for TraceFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for TraceFlow {
     type Context = ();
     type State = i32;
@@ -201,7 +198,6 @@ impl DurableWorkflow for ContinueFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ContinueFlow {
     type Context = ();
     type State = i32;
@@ -235,7 +231,6 @@ impl DurableWorkflow for ParentFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for ParentFlow {
     type Context = ();
     type State = i32;
@@ -274,7 +269,6 @@ impl DurableWorkflow for FailingFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for FailingFlow {
     type Context = ();
     type State = i32;
@@ -307,7 +301,6 @@ impl DurableWorkflow for QuickFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for QuickFlow {
     type Context = ();
     type State = i32;
@@ -638,7 +631,6 @@ impl DurableActivity for Flaky {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for Flaky {
     type Context = ();
     type Output = i32;
@@ -707,7 +699,6 @@ macro_rules! hold_activity {
             }
         }
 
-        #[async_trait]
         impl ActivityHandler for $name {
             type Context = ();
             type Output = i32;
@@ -740,7 +731,6 @@ impl DurableWorkflow for FlakyFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for FlakyFlow {
     type Context = ();
     type State = i32;
@@ -791,7 +781,6 @@ impl DurableWorkflow for HoldFlow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for HoldFlow {
     type Context = ();
     type State = i32;

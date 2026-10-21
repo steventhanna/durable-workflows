@@ -1,7 +1,9 @@
-use std::{collections::HashMap, marker::PhantomData, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, marker::PhantomData, pin::Pin, str::FromStr, sync::Arc,
+    time::Duration,
+};
 
 use crate::tx::{self, Tx};
-use async_trait::async_trait;
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
@@ -65,16 +67,18 @@ pub trait DurableSchedule: Send + Sync + 'static {
 /// from a statement that may fail, run that step in `connection.transaction(..)`
 /// (a savepoint). Any error rolls back the whole materializer tick on both
 /// backends.
-#[async_trait]
+///
+/// Implement `start_occurrence` as an `async fn`; the returned future must be
+/// `Send`.
 pub trait ScheduleHandler: DurableSchedule {
     type Context: Send + Sync + 'static;
 
-    async fn start_occurrence(
+    fn start_occurrence(
         context: &Self::Context,
         connection: &mut DurableConnection,
         schedule_run_id: ScheduleRunId,
         scheduled_for: i64,
-    ) -> Result<WorkflowId, DurableError>;
+    ) -> impl Future<Output = Result<WorkflowId, DurableError>> + Send;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,33 +264,38 @@ pub enum ScheduleStateReconcileOutcome {
     NewerPersisted,
 }
 
-#[async_trait]
+/// Object-safe form of [`ScheduleHandler`], stored as `Arc<dyn ..>`. The
+/// adapter boxes the handler's future here, once per call.
 trait ErasedScheduleHandler<C>: Send + Sync {
-    async fn start_occurrence(
-        &self,
-        context: &C,
-        connection: &mut DurableConnection,
+    fn start_occurrence<'a>(
+        &'a self,
+        context: &'a C,
+        connection: &'a mut DurableConnection,
         schedule_run_id: ScheduleRunId,
         scheduled_for: i64,
-    ) -> Result<WorkflowId, DurableError>;
+    ) -> Pin<Box<dyn Future<Output = Result<WorkflowId, DurableError>> + Send + 'a>>;
 }
 
 struct ScheduleAdapter<S>(PhantomData<S>);
 
-#[async_trait]
 impl<C, S> ErasedScheduleHandler<C> for ScheduleAdapter<S>
 where
     C: Send + Sync + 'static,
     S: ScheduleHandler<Context = C>,
 {
-    async fn start_occurrence(
-        &self,
-        context: &C,
-        connection: &mut DurableConnection,
+    fn start_occurrence<'a>(
+        &'a self,
+        context: &'a C,
+        connection: &'a mut DurableConnection,
         schedule_run_id: ScheduleRunId,
         scheduled_for: i64,
-    ) -> Result<WorkflowId, DurableError> {
-        S::start_occurrence(context, connection, schedule_run_id, scheduled_for).await
+    ) -> Pin<Box<dyn Future<Output = Result<WorkflowId, DurableError>> + Send + 'a>> {
+        Box::pin(S::start_occurrence(
+            context,
+            connection,
+            schedule_run_id,
+            scheduled_for,
+        ))
     }
 }
 

@@ -1,7 +1,6 @@
 use durable_workflows::DbMillis;
 mod support;
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -28,7 +27,6 @@ impl DurableWorkflow for AdminWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for AdminWorkflow {
     type Context = ();
     type State = String;

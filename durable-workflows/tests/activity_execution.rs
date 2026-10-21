@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use durable_workflows::{
@@ -91,7 +90,6 @@ struct TestContext {
     stale_progress_fenced: AtomicBool,
 }
 
-#[async_trait]
 impl ActivityHandler for TestActivity {
     type Context = TestContext;
     type Output = serde_json::Value;
@@ -205,7 +203,6 @@ impl DurableActivity for TestActivityV2 {
     }
 }
 
-#[async_trait]
 impl ActivityHandler for TestActivityV2 {
     type Context = TestContext;
     type Output = i32;
@@ -226,7 +223,6 @@ impl DurableWorkflow for HostWorkflow {
     const VERSION: i32 = 1;
 }
 
-#[async_trait]
 impl WorkflowHandler for HostWorkflow {
     type Context = ();
     type State = ();

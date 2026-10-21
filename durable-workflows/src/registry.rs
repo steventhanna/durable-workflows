@@ -1,6 +1,5 @@
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
-use async_trait::async_trait;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use serde::{de::DeserializeOwned, Serialize};
@@ -61,16 +60,19 @@ pub enum ActivityDispatchError {
     Durable(#[from] DurableError),
 }
 
-#[async_trait]
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Object-safe form of [`WorkflowHandler`], stored as `Arc<dyn ..>`. The
+/// adapter boxes the handler's future here, once per call.
 trait ErasedWorkflowHandler<C>: Send + Sync {
-    async fn step_stored(
-        &self,
-        context: &C,
+    fn step_stored<'a>(
+        &'a self,
+        context: &'a C,
         workflow_id: Option<crate::WorkflowId>,
-        input_json: &str,
-        state_json: &str,
+        input_json: &'a str,
+        state_json: &'a str,
         event: WorkflowEvent,
-    ) -> Result<StoredTransition, WorkflowDispatchError>;
+    ) -> BoxFuture<'a, Result<StoredTransition, WorkflowDispatchError>>;
 
     fn prepare_start(&self, input_json: &str) -> Result<PreparedWorkflowStart, DurableError>;
 
@@ -79,28 +81,29 @@ trait ErasedWorkflowHandler<C>: Send + Sync {
 
 struct WorkflowAdapter<W>(PhantomData<W>);
 
-#[async_trait]
 impl<C, W> ErasedWorkflowHandler<C> for WorkflowAdapter<W>
 where
     C: Send + Sync + 'static,
     W: WorkflowHandler<Context = C>,
 {
-    async fn step_stored(
-        &self,
-        context: &C,
+    fn step_stored<'a>(
+        &'a self,
+        context: &'a C,
         workflow_id: Option<crate::WorkflowId>,
-        input_json: &str,
-        state_json: &str,
+        input_json: &'a str,
+        state_json: &'a str,
         event: WorkflowEvent,
-    ) -> Result<StoredTransition, WorkflowDispatchError> {
-        let workflow: W = deserialize(input_json)?;
-        let state: W::State = deserialize(state_json)?;
-        let mut context = WorkflowContext::new(context);
-        if let Some(workflow_id) = workflow_id {
-            context = context.with_workflow_id(workflow_id);
-        }
-        let transition = workflow.step(context, state, event).await?;
-        store_transition(transition)
+    ) -> BoxFuture<'a, Result<StoredTransition, WorkflowDispatchError>> {
+        Box::pin(async move {
+            let workflow: W = deserialize(input_json)?;
+            let state: W::State = deserialize(state_json)?;
+            let mut context = WorkflowContext::new(context);
+            if let Some(workflow_id) = workflow_id {
+                context = context.with_workflow_id(workflow_id);
+            }
+            let transition = workflow.step(context, state, event).await?;
+            store_transition(transition)
+        })
     }
 
     fn prepare_start(&self, input_json: &str) -> Result<PreparedWorkflowStart, DurableError> {
@@ -309,13 +312,14 @@ where
     }
 }
 
-#[async_trait]
+/// Object-safe form of [`ActivityHandler`], stored as `Arc<dyn ..>`. The
+/// adapter boxes the handler's future here, once per call.
 trait ErasedActivityHandler<C>: Send + Sync {
-    async fn execute_stored(
-        &self,
-        context: ActivityContext<'_, C>,
-        payload_json: &str,
-    ) -> Result<String, ActivityDispatchError>;
+    fn execute_stored<'a>(
+        &'a self,
+        context: ActivityContext<'a, C>,
+        payload_json: &'a str,
+    ) -> BoxFuture<'a, Result<String, ActivityDispatchError>>;
 
     fn prepare_command(
         &self,
@@ -326,20 +330,21 @@ trait ErasedActivityHandler<C>: Send + Sync {
 
 struct ActivityAdapter<A>(PhantomData<A>);
 
-#[async_trait]
 impl<C, A> ErasedActivityHandler<C> for ActivityAdapter<A>
 where
     C: Send + Sync + 'static,
     A: ActivityHandler<Context = C>,
 {
-    async fn execute_stored(
-        &self,
-        context: ActivityContext<'_, C>,
-        payload_json: &str,
-    ) -> Result<String, ActivityDispatchError> {
-        let activity: A = deserialize(payload_json)?;
-        let output = ActivityHandler::execute(&activity, context).await?;
-        serialize_bounded("activity output", &output, MAX_OUTPUT_BYTES).map_err(Into::into)
+    fn execute_stored<'a>(
+        &'a self,
+        context: ActivityContext<'a, C>,
+        payload_json: &'a str,
+    ) -> BoxFuture<'a, Result<String, ActivityDispatchError>> {
+        Box::pin(async move {
+            let activity: A = deserialize(payload_json)?;
+            let output = ActivityHandler::execute(&activity, context).await?;
+            serialize_bounded("activity output", &output, MAX_OUTPUT_BYTES).map_err(Into::into)
+        })
     }
 
     fn prepare_command(

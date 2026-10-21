@@ -1,6 +1,5 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
-use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
@@ -149,7 +148,7 @@ impl<'a, C> ActivityContext<'a, C> {
     }
 }
 
-#[async_trait]
+/// Implement `step` as an `async fn`; the returned future must be `Send`.
 pub trait WorkflowHandler: DurableWorkflow {
     type Context: Send + Sync + 'static;
     type State: Serialize + DeserializeOwned + Send + Sync + 'static;
@@ -158,21 +157,27 @@ pub trait WorkflowHandler: DurableWorkflow {
 
     fn initial_state(&self) -> Self::State;
 
-    async fn step(
+    #[allow(clippy::type_complexity)]
+    fn step(
         &self,
         context: WorkflowContext<'_, Self::Context>,
         state: Self::State,
         event: WorkflowEvent,
-    ) -> Result<WorkflowTransition<Self::State, Self::Approval, Self::Output>, WorkflowError>;
+    ) -> impl Future<
+        Output = Result<
+            WorkflowTransition<Self::State, Self::Approval, Self::Output>,
+            WorkflowError,
+        >,
+    > + Send;
 }
 
-#[async_trait]
+/// Implement `execute` as an `async fn`; the returned future must be `Send`.
 pub trait ActivityHandler: DurableActivity {
     type Context: Send + Sync + 'static;
     type Output: Serialize + DeserializeOwned + Send + Sync + 'static;
 
-    async fn execute(
+    fn execute(
         &self,
         context: ActivityContext<'_, Self::Context>,
-    ) -> Result<Self::Output, ActivityError>;
+    ) -> impl Future<Output = Result<Self::Output, ActivityError>> + Send;
 }
