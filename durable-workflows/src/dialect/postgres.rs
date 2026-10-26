@@ -2,6 +2,7 @@ use diesel::OptionalExtension;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 
 use super::{is_unique_violation, TransactionCallback, WorkflowInsert};
+use crate::error::Transience;
 use crate::tx::{CommandParent, Committed, Locked, Tx};
 use crate::{
     persistence::{
@@ -173,20 +174,141 @@ pub(crate) async fn insert_topic_locks_if_absent(
     Ok(())
 }
 
-/// A serialization failure (40001), deadlock (40P01) or lock timeout (55P03):
-/// the transaction was rolled back and retrying it later is safe.
-/// diesel-async maps only 40001 to a `DatabaseErrorKind` and does not expose
-/// the SQLSTATE, so the other two are matched by the server message (the
-/// server's `lc_messages` must be English, the default).
-pub(crate) fn is_transient_error(error: &DurableError) -> bool {
-    let DurableError::Database(diesel::result::Error::DatabaseError(kind, info)) = error else {
-        return false;
-    };
-    matches!(
-        kind,
-        diesel::result::DatabaseErrorKind::SerializationFailure
-    ) || {
-        let message = info.message();
-        message == "deadlock detected" || message == "canceling statement due to lock timeout"
+/// Classifies a Postgres error for [`DurableError::transience`].
+/// diesel-async maps only a few SQLSTATEs to a `DatabaseErrorKind` and does
+/// not expose the code, so the rest are matched by the server message (the
+/// server's `lc_messages` must be English, the default). An error without a
+/// SQLSTATE (I/O, a closed connection, a failed connect) arrives as
+/// `UnableToSendCommand` with the tokio-postgres `Display` text.
+///
+/// - `RolledBack`: a serialization failure (40001), deadlock (40P01) or
+///   lock timeout (55P03).
+/// - `Unavailable`: a lost or refused connection; a server that is starting,
+///   stopping or in recovery (57P01, 57P02, 57P03); a read-only former
+///   primary after a failover (25006); too many connections (53300).
+pub(crate) fn database_error_transience(
+    kind: &diesel::result::DatabaseErrorKind,
+    message: &str,
+) -> Option<Transience> {
+    use diesel::result::DatabaseErrorKind;
+
+    // tokio-postgres `Kind::Io`, `Closed`, `Connect` and `Timeout`.
+    const CLIENT_UNAVAILABLE_PREFIXES: [&str; 4] = [
+        "error communicating with the server",
+        "connection closed",
+        "error connecting to server",
+        "timeout waiting for server",
+    ];
+    const SERVER_UNAVAILABLE_PREFIXES: [&str; 5] = [
+        "terminating connection due to administrator command",
+        "terminating connection because of crash of another server process",
+        "the database system is",
+        "sorry, too many clients already",
+        "remaining connection slots are reserved",
+    ];
+    match kind {
+        DatabaseErrorKind::SerializationFailure => Some(Transience::RolledBack),
+        DatabaseErrorKind::ClosedConnection | DatabaseErrorKind::ReadOnlyTransaction => {
+            Some(Transience::Unavailable)
+        }
+        DatabaseErrorKind::UnableToSendCommand => CLIENT_UNAVAILABLE_PREFIXES
+            .iter()
+            .any(|prefix| message.starts_with(prefix))
+            .then_some(Transience::Unavailable),
+        _ if message == "deadlock detected"
+            || message == "canceling statement due to lock timeout" =>
+        {
+            Some(Transience::RolledBack)
+        }
+        _ => SERVER_UNAVAILABLE_PREFIXES
+            .iter()
+            .any(|prefix| message.starts_with(prefix))
+            .then_some(Transience::Unavailable),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use diesel::result::DatabaseErrorKind::{self, UnableToSendCommand, Unknown};
+
+    use super::*;
+
+    fn classify(kind: DatabaseErrorKind, message: &str) -> Option<Transience> {
+        database_error_transience(&kind, message)
+    }
+
+    #[test]
+    fn rolled_back_transactions_are_transient() {
+        assert_eq!(
+            classify(
+                DatabaseErrorKind::SerializationFailure,
+                "could not serialize access due to concurrent update"
+            ),
+            Some(Transience::RolledBack)
+        );
+        for message in [
+            "deadlock detected",
+            "canceling statement due to lock timeout",
+        ] {
+            assert_eq!(classify(Unknown, message), Some(Transience::RolledBack));
+        }
+    }
+
+    #[test]
+    fn an_unreachable_or_failing_over_server_is_unavailable() {
+        // tokio-postgres errors without a SQLSTATE.
+        for message in [
+            "error connecting to server: Connection refused (os error 111)",
+            "error communicating with the server: Connection reset by peer (os error 104)",
+            "connection closed",
+            "timeout waiting for server",
+        ] {
+            assert_eq!(
+                classify(UnableToSendCommand, message),
+                Some(Transience::Unavailable),
+                "{message}"
+            );
+        }
+        for message in [
+            "terminating connection due to administrator command",
+            "the database system is starting up",
+            "the database system is shutting down",
+            "the database system is in recovery mode",
+            "sorry, too many clients already",
+        ] {
+            assert_eq!(
+                classify(Unknown, message),
+                Some(Transience::Unavailable),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            classify(
+                DatabaseErrorKind::ReadOnlyTransaction,
+                "cannot execute UPDATE in a read-only transaction"
+            ),
+            Some(Transience::Unavailable)
+        );
+    }
+
+    #[test]
+    fn other_errors_are_not_transient() {
+        for message in [
+            "relation \"durable_approval\" does not exist",
+            "password authentication failed for user \"durable\"",
+        ] {
+            assert_eq!(classify(Unknown, message), None, "{message}");
+        }
+        assert_eq!(
+            classify(UnableToSendCommand, "error performing TLS handshake"),
+            None
+        );
+        assert_eq!(
+            classify(
+                DatabaseErrorKind::UniqueViolation,
+                "duplicate key value violates unique constraint"
+            ),
+            None
+        );
     }
 }

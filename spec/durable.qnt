@@ -171,6 +171,9 @@ module durable {
     revivedExpiredLease: bool, nextHb: int,
     lastIssuedWf: int -> int, lastIssuedAct: int -> int, taskErrors: int -> int,
     // Coordinator restart budget; dispatcher errors have no modeled action.
+    // Only faults spend it (LC1_NoEvent). A transient database failure
+    // (rollback or outage) commits nothing, so it is a stutter step here,
+    // and it costs no budget (supervisor.rs, INVARIANTS §2.1).
     coordErrors: int -> int
   }
 
@@ -546,7 +549,9 @@ module durable {
     }
   }
 
-  // A coordinator error beyond the restart budget stops this modeled runtime.
+  // A coordinator fault beyond the restart budget stops this modeled runtime.
+  // A transient-outage stop (max_transient_outage) is not modeled: outages
+  // are excluded by fairness F1.
   pure def stoppedRt(g: Ghost, r: int): bool =
     g.coordErrors.get(r) > MAX_TASK_RESTARTS
   pure def coordError(g: Ghost, r: int): Ghost =

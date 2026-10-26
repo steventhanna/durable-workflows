@@ -1,5 +1,6 @@
 mod activity_worker;
 mod coordinator;
+mod restart;
 mod schedule_materializer;
 mod supervisor;
 mod temporal;

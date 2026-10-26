@@ -165,7 +165,10 @@ concurrent insert falls back to `DeduplicationConflict` and a locking reload).
   and retry (T-A5, T-A6), progress events (T-W4), timers, approvals,
   schedules. The coordinator restart budget is modeled with `coordErrors`
   against `MAX_TASK_RESTARTS`; only `LC1_NoEvent` increments it, and S5
-  excludes that error on invariant-preserving paths. Dispatcher errors have
+  excludes that error on invariant-preserving paths. Transient database
+  failures of a task (a rollback or an outage) commit nothing and cost no
+  budget, so they have no action; the stop after `max_transient_outage` is
+  outside the model (F1). Dispatcher errors have
   no modeled action.
 - Pause sizing: a pause bump needs `maxAttempts + 1 <= MAX_ATTEMPTS` (the
   attempt map's domain); `step` inserts activities with `MAX_ATTEMPTS - 1` or

@@ -90,7 +90,92 @@ impl DurableError {
     /// parent before child, so it can deadlock with a child that finishes at
     /// the same moment (INVARIANTS §2.8); retry it when this holds.
     pub fn is_transient(&self) -> bool {
-        crate::dialect::is_transient_error(self)
+        self.transience() == Some(Transience::RolledBack)
+    }
+
+    /// Whether the error is expected to clear without a code or config
+    /// change, and how; `None` for every other error. The one classifier of
+    /// database errors: the coordinator and dispatcher skip `RolledBack`
+    /// (G1), the supervisor restarts a task that failed with either kind
+    /// without spending its restart budget (§2.1).
+    pub(crate) fn transience(&self) -> Option<Transience> {
+        match self {
+            Self::Database(error) => query_error_transience(error),
+            Self::Pool(error) => pool_error_transience(error),
+            Self::PoolCheckout(diesel_async::pooled_connection::bb8::RunError::TimedOut) => {
+                Some(Transience::Unavailable)
+            }
+            Self::PoolCheckout(diesel_async::pooled_connection::bb8::RunError::User(error)) => {
+                pool_error_transience(error)
+            }
+            Self::Migration(_)
+            | Self::Serialization(_)
+            | Self::InvalidPayload { .. }
+            | Self::InvalidDefinition(_)
+            | Self::MissingDefinition { .. }
+            | Self::MissingCurrentDefinition { .. }
+            | Self::MissingDefinitions { .. }
+            | Self::DuplicateDefinition { .. }
+            | Self::InvalidState(_)
+            | Self::FencedWrite
+            | Self::InvalidId(_)
+            | Self::NotFound { .. }
+            | Self::Conflict(_)
+            | Self::InvalidCursor(_)
+            | Self::PayloadTooLarge { .. }
+            | Self::DefinitionMismatch { .. } => None,
+        }
+    }
+}
+
+/// Why a database error is expected to clear by itself
+/// ([`DurableError::transience`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transience {
+    /// The database rolled the transaction back (deadlock, serialization
+    /// failure, lock wait timeout); retrying the whole transaction is safe.
+    RolledBack,
+    /// The database could not be reached or is not serving: a refused,
+    /// reset or closed connection, a pool checkout that timed out, a server
+    /// that is starting, stopping or failing over (Vitess "primary is not
+    /// serving", a read-only former primary). Whether a statement in flight
+    /// committed is unknown, so this is not a reason to retry a transaction.
+    Unavailable,
+}
+
+fn query_error_transience(error: &diesel::result::Error) -> Option<Transience> {
+    match error {
+        diesel::result::Error::DatabaseError(kind, info) => {
+            crate::dialect::database_error_transience(kind, info.message())
+        }
+        // The connection failed during COMMIT and the rollback failed with
+        // it: whether the transaction committed is unknown.
+        diesel::result::Error::RollbackErrorOnCommit { commit_error, .. } => {
+            query_error_transience(commit_error).map(|_| Transience::Unavailable)
+        }
+        _ => None,
+    }
+}
+
+fn pool_error_transience(error: &diesel_async::pooled_connection::PoolError) -> Option<Transience> {
+    use diesel::result::ConnectionError;
+    use diesel_async::pooled_connection::PoolError;
+
+    match error {
+        // A failed health check of a pooled connection.
+        PoolError::QueryError(error) => query_error_transience(error),
+        // MySQL: an I/O or driver error while connecting (refused, reset,
+        // closed during the handshake).
+        PoolError::ConnectionError(ConnectionError::BadConnection(_)) => {
+            Some(Transience::Unavailable)
+        }
+        // Postgres reports every connect failure here, MySQL a server error
+        // during the handshake: classify the underlying error, so a refused
+        // connection is transient and a rejected password is not.
+        PoolError::ConnectionError(ConnectionError::CouldntSetupConfiguration(error)) => {
+            query_error_transience(error).map(|_| Transience::Unavailable)
+        }
+        PoolError::ConnectionError(_) => None,
     }
 }
 
@@ -202,6 +287,79 @@ mod verification {
             let longer: usize = kani::any();
             kani::assume(truncated.len() < longer && longer <= max_bytes);
             assert!(!text.is_char_boundary(longer));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use diesel::result::{ConnectionError, DatabaseErrorKind, Error as QueryError};
+    use diesel_async::pooled_connection::{bb8::RunError, PoolError};
+
+    use super::*;
+
+    fn database(kind: DatabaseErrorKind, message: &str) -> QueryError {
+        QueryError::DatabaseError(kind, Box::new(message.to_string()))
+    }
+
+    #[test]
+    fn transience_separates_rollbacks_from_an_unavailable_database() {
+        let rolled_back = DurableError::Database(database(
+            DatabaseErrorKind::SerializationFailure,
+            "could not serialize access",
+        ));
+        assert_eq!(rolled_back.transience(), Some(Transience::RolledBack));
+        assert!(rolled_back.is_transient());
+
+        let unavailable = [
+            DurableError::PoolCheckout(RunError::TimedOut),
+            DurableError::Database(database(DatabaseErrorKind::ClosedConnection, "closed")),
+            DurableError::Pool(PoolError::ConnectionError(ConnectionError::BadConnection(
+                "Input/output error: Connection refused (os error 111)".to_string(),
+            ))),
+            DurableError::PoolCheckout(RunError::User(PoolError::QueryError(database(
+                DatabaseErrorKind::ClosedConnection,
+                "closed",
+            )))),
+            // A refused connect on Postgres.
+            DurableError::Pool(PoolError::ConnectionError(
+                ConnectionError::CouldntSetupConfiguration(database(
+                    DatabaseErrorKind::ClosedConnection,
+                    "closed",
+                )),
+            )),
+            DurableError::Database(QueryError::RollbackErrorOnCommit {
+                rollback_error: Box::new(database(DatabaseErrorKind::ClosedConnection, "closed")),
+                commit_error: Box::new(database(DatabaseErrorKind::ClosedConnection, "closed")),
+            }),
+        ];
+        for error in unavailable {
+            assert_eq!(error.transience(), Some(Transience::Unavailable), "{error}");
+            assert!(
+                !error.is_transient(),
+                "a lost connection is not a safe transaction retry: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_errors_have_no_transience() {
+        for error in [
+            DurableError::InvalidState("bug".to_string()),
+            DurableError::FencedWrite,
+            DurableError::Database(QueryError::NotFound),
+            DurableError::Database(database(DatabaseErrorKind::UniqueViolation, "duplicate")),
+            DurableError::Pool(PoolError::ConnectionError(
+                ConnectionError::InvalidConnectionUrl("nope".to_string()),
+            )),
+            DurableError::Pool(PoolError::ConnectionError(
+                ConnectionError::CouldntSetupConfiguration(database(
+                    DatabaseErrorKind::Unknown,
+                    "password authentication failed for user \"durable\"",
+                )),
+            )),
+        ] {
+            assert_eq!(error.transience(), None, "{error}");
         }
     }
 }

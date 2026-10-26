@@ -14,7 +14,7 @@ on:
       - durable-workflows/src/error.rs
       - durable-workflows/src/ids.rs
       - durable-workflows/src/persistence/mod.rs
-      - durable-workflows/src/runtime/supervisor.rs
+      - durable-workflows/src/runtime/restart.rs
       - durable-workflows/Cargo.toml
       - Cargo.lock
       - .github/workflows/kani.yml
