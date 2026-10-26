@@ -84,9 +84,13 @@ flowchart TB
   that this process has not registered. Then the supervisor
   (`src/runtime/supervisor.rs`) spawns its tasks: the activity-execution
   manager, the coordinator, health, timer, approval-expiry, one schedule task
-  per key, and the activity dispatcher. A failed task restarts after
-  `restart_backoff`; more than `max_task_restarts` restarts of one task within
-  `restart_window` cancel the runtime (INVARIANTS §2.1).
+  per key, and the activity dispatcher. A failed task restarts after an
+  exponential backoff (`restart_backoff` doubling to `max_restart_backoff`).
+  A transient database error (a rollback, or a database that cannot be
+  reached) costs no restart budget; more than `max_task_restarts` restarts
+  after other errors or panics of one task within `restart_window`, or
+  transient failures for longer than `max_transient_outage`, cancel the
+  runtime and log `durable runtime stopped` (INVARIANTS §2.1).
 - **Admin.** `AdminControlService` pauses, resumes, cancels and restarts
   workflows, retries dead-lettered activities, resolves approvals, and
   pauses, resumes or runs schedules (T-A2 to T-A9). `AdminQueryService` is
@@ -386,7 +390,8 @@ The `dialect` module is the only place that names a backend. It isolates:
 - `insert_workflow` (insert or find on the dedup key) and the new-row inserts
   for activities, approvals and schedule runs;
 - the insert-if-absent writes for schedule state and topic lock rows;
-- `is_transient_error`, and `is_unique_violation` in `mod.rs`.
+- `database_error_transience` (the backend's error messages behind
+  `DurableError::transience`), and `is_unique_violation` in `mod.rs`.
 
 The migrations exist once per backend. The test-only features `fake-clock`
 (overrides the database clock) and `trace-model` (records traces) must never

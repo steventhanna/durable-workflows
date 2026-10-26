@@ -14,6 +14,7 @@ use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use super::restart::{RestartDecision, RestartPolicy, StopReason, TaskFailureKind, TaskRestarts};
 use crate::{
     observability::{
         emit_readiness_alerts, emit_schedule_materialization_alert, ActivationCounters,
@@ -33,14 +34,32 @@ pub struct RuntimeConfig {
     pub coordinator: CoordinatorConfig,
     pub worker: WorkerConfig,
     pub idle_delay: Duration,
+    /// The delay before a failed task's first restart. Each further restart
+    /// doubles it, up to `max_restart_backoff`.
     pub restart_backoff: Duration,
+    /// The longest delay between restarts of one task. A value below
+    /// `restart_backoff` keeps the delay fixed at `restart_backoff`.
+    pub max_restart_backoff: Duration,
+    /// A task that runs this long before it fails counts as healthy: its
+    /// restart delay starts again at `restart_backoff`, and a transient
+    /// outage it was in ends. Keep it above the pool's connection timeout, so
+    /// a run that only waited for a connection is not healthy.
+    pub task_healthy_after: Duration,
     pub forced_shutdown_timeout: Duration,
-    /// Restarts of one task allowed within `restart_window`; one more cancels
-    /// the runtime.
+    /// Restarts of one task after an error or panic allowed within
+    /// `restart_window`; one more cancels the runtime. Restarts after a
+    /// transient database error (the database rolled back, or could not be
+    /// reached) do not count; `max_transient_outage` bounds them.
     pub max_task_restarts: u32,
     /// The window `max_task_restarts` counts over. A task's count starts again
     /// once its first counted restart is older than this.
     pub restart_window: Duration,
+    /// How long one task may keep failing on transient database errors, with
+    /// no healthy run in between, before the runtime cancels itself. Long
+    /// enough to ride out a restart or failover of the database; finite so a
+    /// database that stays unreachable stops the runtime (and fires
+    /// `RuntimeHandle::completion_token`) instead of retrying unseen forever.
+    pub max_transient_outage: Duration,
     pub max_workers_per_topic: u32,
     pub health_scan_interval: Duration,
     pub health_stale_after: Duration,
@@ -64,9 +83,12 @@ impl Default for RuntimeConfig {
             worker: WorkerConfig::default(),
             idle_delay: Duration::from_secs(2),
             restart_backoff: Duration::from_secs(1),
+            max_restart_backoff: Duration::from_secs(60),
+            task_healthy_after: Duration::from_secs(2 * 60),
             forced_shutdown_timeout: Duration::from_secs(5),
             max_task_restarts: 8,
             restart_window: Duration::from_secs(10 * 60),
+            max_transient_outage: Duration::from_secs(15 * 60),
             max_workers_per_topic: 4,
             health_scan_interval: Duration::from_secs(60),
             health_stale_after: Duration::from_secs(5 * 60),
@@ -109,6 +131,18 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub const fn with_max_restart_backoff(mut self, max_restart_backoff: Duration) -> Self {
+        self.max_restart_backoff = max_restart_backoff;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_task_healthy_after(mut self, task_healthy_after: Duration) -> Self {
+        self.task_healthy_after = task_healthy_after;
+        self
+    }
+
+    #[must_use]
     pub const fn with_forced_shutdown_timeout(mut self, forced_shutdown_timeout: Duration) -> Self {
         self.forced_shutdown_timeout = forced_shutdown_timeout;
         self
@@ -123,6 +157,12 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn with_restart_window(mut self, restart_window: Duration) -> Self {
         self.restart_window = restart_window;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_transient_outage(mut self, max_transient_outage: Duration) -> Self {
+        self.max_transient_outage = max_transient_outage;
         self
     }
 
@@ -242,6 +282,8 @@ where
         if runtime_id.is_empty()
             || config.idle_delay.is_zero()
             || config.restart_backoff.is_zero()
+            || config.task_healthy_after.is_zero()
+            || config.max_transient_outage.is_zero()
             || config.forced_shutdown_timeout.is_zero()
             || config.max_task_restarts == 0
             || config.restart_window.is_zero()
@@ -549,11 +591,9 @@ impl ActivityExecutionManager {
             .send(ActivityExecutionCommand::Spawn {
                 topic,
                 dispatcher_generation: self.dispatcher_generation.ok_or_else(|| {
-                    RuntimeTaskFailure {
-                        message: "activity execution manager is not bound to a dispatcher"
-                            .to_string(),
-                        panicked: false,
-                    }
+                    RuntimeTaskFailure::fault(
+                        "activity execution manager is not bound to a dispatcher",
+                    )
                 })?,
                 execution: Box::pin(execution),
                 response,
@@ -614,10 +654,7 @@ impl ActivityExecutionManager {
 }
 
 fn activity_execution_manager_unavailable() -> RuntimeTaskFailure {
-    RuntimeTaskFailure {
-        message: "activity execution manager is unavailable".to_string(),
-        panicked: false,
-    }
+    RuntimeTaskFailure::fault("activity execution manager is unavailable")
 }
 
 async fn collect_activity_executions(
@@ -665,10 +702,9 @@ async fn collect_activity_executions(
             }
             command = commands.recv() => {
                 let Some(command) = command else {
-                    return Err(RuntimeTaskFailure {
-                        message: "activity execution manager command channel closed".to_string(),
-                        panicked: false,
-                    });
+                    return Err(RuntimeTaskFailure::fault(
+                        "activity execution manager command channel closed",
+                    ));
                 };
                 match command {
                     ActivityExecutionCommand::Spawn {
@@ -678,10 +714,9 @@ async fn collect_activity_executions(
                         response,
                     } => {
                         if shutting_down {
-                            let _ = response.send(Err(RuntimeTaskFailure {
-                                message: "activity execution manager is shutting down".to_string(),
-                                panicked: false,
-                            }));
+                            let _ = response.send(Err(RuntimeTaskFailure::fault(
+                                "activity execution manager is shutting down",
+                            )));
                             continue;
                         }
                         let task = executions.spawn(execution);
@@ -732,7 +767,9 @@ fn take_activity_execution_failure(
     let mut failure = failures.pop_front()?;
     let additional = failures.len();
     while let Some(next) = failures.pop_front() {
-        failure.panicked |= next.panicked;
+        if next.kind.panicked() {
+            failure.kind = TaskFailureKind::Panic;
+        }
     }
     if additional > 0 {
         let suffix = if additional == 1 { "task" } else { "tasks" };
@@ -757,24 +794,21 @@ fn collect_activity_execution_result(
         Ok((task_id, _)) => *task_id,
         Err(error) => error.id(),
     };
-    let task = tasks_by_id
-        .remove(&task_id)
-        .ok_or_else(|| RuntimeTaskFailure {
-            message: format!("activity execution task {task_id} had no topic record"),
-            panicked: false,
-        })?;
+    let task = tasks_by_id.remove(&task_id).ok_or_else(|| {
+        RuntimeTaskFailure::fault(format!(
+            "activity execution task {task_id} had no topic record"
+        ))
+    })?;
     let topic = task.topic;
     snapshot.total = snapshot
         .total
         .checked_sub(1)
         .ok_or_else(activity_execution_manager_unavailable)?;
-    let active = snapshot
-        .active_by_topic
-        .get_mut(&topic)
-        .ok_or_else(|| RuntimeTaskFailure {
-            message: format!("activity execution topic {topic} had no active count"),
-            panicked: false,
-        })?;
+    let active = snapshot.active_by_topic.get_mut(&topic).ok_or_else(|| {
+        RuntimeTaskFailure::fault(format!(
+            "activity execution topic {topic} had no active count"
+        ))
+    })?;
     *active = active
         .checked_sub(1)
         .ok_or_else(activity_execution_manager_unavailable)?;
@@ -791,14 +825,14 @@ fn collect_activity_execution_result(
         Err(error) => {
             let failure = RuntimeTaskFailure {
                 message: format!("activity execution task failed: {error}"),
-                panicked: error.is_panic(),
+                kind: TaskFailureKind::of_join_error(&error),
             };
             if failed_dispatchers.insert(task.dispatcher_generation) {
                 failures.push_back(failure);
             } else {
                 tracing::error!(
                     dispatcher_generation = task.dispatcher_generation,
-                    panicked = failure.panicked,
+                    panicked = failure.kind.panicked(),
                     error = %failure.message,
                     "additional durable activity execution task failed in the same dispatcher incident"
                 );
@@ -826,7 +860,7 @@ fn finish_activity_execution_collection(
     };
     for failure in failures {
         tracing::error!(
-            panicked = failure.panicked,
+            panicked = failure.kind.panicked(),
             error = %failure.message,
             "additional durable activity execution task failed during shutdown"
         );
@@ -848,14 +882,38 @@ enum TaskSpec {
 #[derive(Debug)]
 struct RuntimeTaskFailure {
     message: String,
-    panicked: bool,
+    kind: TaskFailureKind,
 }
 
+impl RuntimeTaskFailure {
+    fn fault(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: TaskFailureKind::Fault,
+        }
+    }
+}
+
+/// The one place a task's `DurableError` is classified for the restart
+/// policy.
 impl From<DurableError> for RuntimeTaskFailure {
     fn from(error: DurableError) -> Self {
+        let kind = error
+            .transience()
+            .map_or(TaskFailureKind::Fault, TaskFailureKind::Transient);
         Self {
             message: error.to_string(),
-            panicked: false,
+            kind,
+        }
+    }
+}
+
+impl TaskFailureKind {
+    fn of_join_error(error: &JoinError) -> Self {
+        if error.is_panic() {
+            Self::Panic
+        } else {
+            Self::Fault
         }
     }
 }
@@ -882,41 +940,47 @@ where
     C: Send + Sync + 'static,
 {
     let mut tasks = JoinSet::<Result<(), RuntimeTaskFailure>>::new();
-    let mut task_specs = HashMap::<Id, TaskSpec>::new();
+    let mut task_specs = HashMap::<Id, SupervisedTask>::new();
     let collector_name = TaskSpec::ActivityExecutionManager.name();
     let collector = tasks.spawn(activity_execution_collector.instrument(tracing::info_span!(
         "durable.runtime.task",
         runtime_id = %parts.runtime_id,
         task = %collector_name,
     )));
-    task_specs.insert(collector.id(), TaskSpec::ActivityExecutionManager);
+    task_specs.insert(
+        collector.id(),
+        SupervisedTask {
+            spec: TaskSpec::ActivityExecutionManager,
+            runs_from: tokio::time::Instant::now(),
+        },
+    );
     spawn_child(
         &mut tasks,
         &mut task_specs,
         parts.clone(),
         TaskSpec::Coordinator,
-        false,
+        Duration::ZERO,
     );
     spawn_child(
         &mut tasks,
         &mut task_specs,
         parts.clone(),
         TaskSpec::Health,
-        false,
+        Duration::ZERO,
     );
     spawn_child(
         &mut tasks,
         &mut task_specs,
         parts.clone(),
         TaskSpec::Timer,
-        false,
+        Duration::ZERO,
     );
     spawn_child(
         &mut tasks,
         &mut task_specs,
         parts.clone(),
         TaskSpec::ApprovalExpiry,
-        false,
+        Duration::ZERO,
     );
     for definition in parts.schedules.definitions() {
         spawn_child(
@@ -926,7 +990,7 @@ where
             TaskSpec::Schedule {
                 key: definition.key,
             },
-            false,
+            Duration::ZERO,
         );
     }
     spawn_child(
@@ -934,20 +998,31 @@ where
         &mut task_specs,
         parts.clone(),
         TaskSpec::ActivityDispatcher,
-        false,
+        Duration::ZERO,
     );
 
     let mut errors = Vec::new();
-    let mut restarts = HashMap::<TaskSpec, RestartBudget>::new();
+    let policy = RestartPolicy::new(&parts.config);
+    let mut restarts = HashMap::<TaskSpec, TaskRestarts>::new();
     while let Some(joined) = tasks.join_next_with_id().await {
         let (task_id, result) = match joined {
             Ok((task_id, result)) => (task_id, Ok(result)),
             Err(error) => (error.id(), Err(error)),
         };
-        let Some(spec) = task_specs.remove(&task_id) else {
+        let Some(SupervisedTask { spec, runs_from }) = task_specs.remove(&task_id) else {
+            let message = format!("completed task {task_id} had no supervision record");
+            if !parts.cancellation.is_cancelled() {
+                tracing::error!(
+                    runtime_id = %parts.runtime_id,
+                    task = "supervisor",
+                    reason = "unsupervised_task",
+                    last_error = %message,
+                    "durable runtime stopped"
+                );
+            }
             errors.push(RuntimeTaskError {
                 task: "supervisor".to_string(),
-                message: format!("completed task {task_id} had no supervision record"),
+                message,
                 panicked: false,
             });
             parts.cancellation.cancel();
@@ -960,7 +1035,7 @@ where
                 errors.push(RuntimeTaskError {
                     task: spec.name(),
                     message: error.message,
-                    panicked: error.panicked,
+                    panicked: error.kind.panicked(),
                 });
             }
             if spec == TaskSpec::ActivityDispatcher {
@@ -968,170 +1043,98 @@ where
                     errors.push(RuntimeTaskError {
                         task: TaskSpec::ActivityExecutionManager.name(),
                         message: error.message,
-                        panicked: error.panicked,
+                        panicked: error.kind.panicked(),
                     });
                 }
             }
             continue;
         }
 
-        let task_error = match result {
-            Ok(Ok(())) => RuntimeTaskError {
-                task: spec.name(),
-                message: "task stopped unexpectedly".to_string(),
-                panicked: false,
-            },
-            Ok(Err(error)) => RuntimeTaskError {
-                task: spec.name(),
-                message: error.message,
-                panicked: error.panicked,
-            },
-            Err(error) => join_error(&spec.name(), error),
+        let (task_error, kind) = match result {
+            Ok(Ok(())) => (
+                RuntimeTaskError {
+                    task: spec.name(),
+                    message: "task stopped unexpectedly".to_string(),
+                    panicked: false,
+                },
+                TaskFailureKind::Fault,
+            ),
+            Ok(Err(error)) => (
+                RuntimeTaskError {
+                    task: spec.name(),
+                    message: error.message,
+                    panicked: error.kind.panicked(),
+                },
+                error.kind,
+            ),
+            Err(error) => {
+                let kind = TaskFailureKind::of_join_error(&error);
+                (join_error(&spec.name(), error), kind)
+            }
         };
-        tracing::error!(
-            task = %task_error.task,
-            panicked = task_error.panicked,
-            error = %task_error.message,
-            "durable runtime task stopped"
-        );
-        errors.push(task_error);
-        if spec == TaskSpec::ActivityExecutionManager {
-            parts.cancellation.cancel();
-            continue;
-        }
-        let within_budget = restarts
-            .entry(spec.clone())
-            .or_insert_with(|| RestartBudget::new(tokio::time::Instant::now()))
-            .record(
-                tokio::time::Instant::now(),
-                parts.config.restart_window,
-                parts.config.max_task_restarts,
-            );
-        if !within_budget {
-            parts.cancellation.cancel();
-            if spec == TaskSpec::ActivityDispatcher {
-                if let Err(error) = parts.activity_executions.shutdown().await {
-                    errors.push(RuntimeTaskError {
-                        task: TaskSpec::ActivityExecutionManager.name(),
-                        message: error.message,
-                        panicked: error.panicked,
-                    });
+        let now = tokio::time::Instant::now();
+        let decision = if spec == TaskSpec::ActivityExecutionManager {
+            RestartDecision::Stop(StopReason::Unrestartable)
+        } else {
+            restarts
+                .entry(spec.clone())
+                .or_insert_with(|| TaskRestarts::new(now, &policy))
+                .on_failure(now, now.saturating_duration_since(runs_from), kind, &policy)
+        };
+        match decision {
+            RestartDecision::Restart { delay } => {
+                tracing::error!(
+                    task = %task_error.task,
+                    panicked = task_error.panicked,
+                    failure_kind = kind.as_str(),
+                    restart_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    error = %task_error.message,
+                    "durable runtime task stopped"
+                );
+                errors.push(task_error);
+                spawn_child(&mut tasks, &mut task_specs, parts.clone(), spec, delay);
+            }
+            RestartDecision::Stop(reason) => {
+                tracing::error!(
+                    task = %task_error.task,
+                    panicked = task_error.panicked,
+                    failure_kind = kind.as_str(),
+                    error = %task_error.message,
+                    "durable runtime task stopped"
+                );
+                // The one record that the runtime as a whole gave up; the
+                // application sees it as `RuntimeHandle::completion_token`.
+                tracing::error!(
+                    runtime_id = %parts.runtime_id,
+                    task = %task_error.task,
+                    reason = reason.as_str(),
+                    cause = %reason,
+                    panicked = task_error.panicked,
+                    failure_kind = kind.as_str(),
+                    last_error = %task_error.message,
+                    "durable runtime stopped"
+                );
+                errors.push(task_error);
+                parts.cancellation.cancel();
+                if spec == TaskSpec::ActivityDispatcher {
+                    if let Err(error) = parts.activity_executions.shutdown().await {
+                        errors.push(RuntimeTaskError {
+                            task: TaskSpec::ActivityExecutionManager.name(),
+                            message: error.message,
+                            panicked: error.kind.panicked(),
+                        });
+                    }
                 }
             }
-        } else {
-            spawn_child(&mut tasks, &mut task_specs, parts.clone(), spec, true);
         }
     }
     errors
 }
 
-/// Restarts of one task counted within a window that starts at the first
-/// restart after the previous window ended.
-#[derive(Debug)]
-struct RestartBudget<I = tokio::time::Instant> {
-    count: u32,
-    window_started: I,
-}
-
-/// The clock a [`RestartBudget`] reads: `tokio::time::Instant` in the
-/// runtime. Generic only so the Kani proof can use a model clock (Kani
-/// cannot call `clock_gettime`, so it cannot build a real `Instant`).
-trait BudgetInstant: Copy {
-    fn saturating_duration_since(self, earlier: Self) -> Duration;
-}
-
-impl BudgetInstant for tokio::time::Instant {
-    fn saturating_duration_since(self, earlier: Self) -> Duration {
-        tokio::time::Instant::saturating_duration_since(&self, earlier)
-    }
-}
-
-impl<I: BudgetInstant> RestartBudget<I> {
-    fn new(now: I) -> Self {
-        Self {
-            count: 0,
-            window_started: now,
-        }
-    }
-
-    /// Counts one restart at `now`; false once the window holds more than
-    /// `max_restarts`.
-    fn record(&mut self, now: I, window: Duration, max_restarts: u32) -> bool {
-        if now.saturating_duration_since(self.window_started) > window {
-            self.count = 0;
-            self.window_started = now;
-        }
-        self.count = self.count.saturating_add(1);
-        self.count <= max_restarts
-    }
-}
-
-/// Kani proofs (`cargo kani`; CLAUDE.md, "Bounded model checking").
-#[cfg(kani)]
-mod restart_budget_verification {
-    use super::*;
-
-    /// A model clock: the time since an arbitrary origin.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct ModelInstant(Duration);
-
-    impl BudgetInstant for ModelInstant {
-        fn saturating_duration_since(self, earlier: Self) -> Duration {
-            self.0.saturating_sub(earlier.0)
-        }
-    }
-
-    /// Any `Duration`, built without the division `Duration::from_nanos`
-    /// needs (a 64-bit division makes the proof take minutes).
-    fn any_duration() -> Duration {
-        let nanos: u32 = kani::any();
-        kani::assume(nanos < 1_000_000_000);
-        Duration::new(kani::any(), nanos)
-    }
-
-    /// `later > earlier + span`, computed on (seconds, nanoseconds) pairs
-    /// with an explicit carry; no multiplication, which SAT solvers handle
-    /// badly when they must prove it equal to `Duration` arithmetic.
-    fn exceeds(later: Duration, earlier: Duration, span: Duration) -> bool {
-        let nanos = earlier.subsec_nanos() + span.subsec_nanos();
-        let carry = nanos >= 1_000_000_000;
-        let end_nanos = if carry { nanos - 1_000_000_000 } else { nanos };
-        let end_secs =
-            u128::from(earlier.as_secs()) + u128::from(span.as_secs()) + u128::from(carry);
-        let later_secs = u128::from(later.as_secs());
-        later_secs > end_secs || (later_secs == end_secs && later.subsec_nanos() > end_nanos)
-    }
-
-    /// For any budget state, restart time, window and limit: a restart
-    /// more than `window` after the window start opens a new window with a
-    /// count of 1; otherwise the count grows by one, saturating, so it
-    /// never wraps to 0; the result is `count <= max_restarts`. A restart
-    /// time before the window start (the clock is monotonic, but the model
-    /// allows it) counts in the current window.
-    #[kani::proof]
-    fn restart_budget_resets_after_the_window_and_never_wraps() {
-        let started = any_duration();
-        let now = any_duration();
-        let window = any_duration();
-        let count: u32 = kani::any();
-        let max_restarts: u32 = kani::any();
-        let mut budget = RestartBudget {
-            count,
-            window_started: ModelInstant(started),
-        };
-
-        let allowed = budget.record(ModelInstant(now), window, max_restarts);
-
-        if exceeds(now, started, window) {
-            assert!(budget.count == 1);
-            assert!(budget.window_started == ModelInstant(now));
-        } else {
-            assert!(budget.count == count.saturating_add(1));
-            assert!(budget.window_started == ModelInstant(started));
-        }
-        assert!(budget.count >= 1);
-        assert!(allowed == (budget.count <= max_restarts));
-    }
+/// A running task and when its current run began (after its restart delay).
+struct SupervisedTask {
+    spec: TaskSpec,
+    runs_from: tokio::time::Instant,
 }
 
 struct CompletionGuard(CancellationToken);
@@ -1144,10 +1147,10 @@ impl Drop for CompletionGuard {
 
 fn spawn_child<C>(
     tasks: &mut JoinSet<Result<(), RuntimeTaskFailure>>,
-    task_specs: &mut HashMap<Id, TaskSpec>,
+    task_specs: &mut HashMap<Id, SupervisedTask>,
     parts: Arc<RuntimeParts<C>>,
     spec: TaskSpec,
-    delayed: bool,
+    delay: Duration,
 ) where
     C: Send + Sync + 'static,
 {
@@ -1156,10 +1159,10 @@ fn spawn_child<C>(
     let runtime_id = parts.runtime_id.clone();
     let task = tasks.spawn(
         async move {
-            if delayed {
+            if !delay.is_zero() {
                 tokio::select! {
                     _ = parts.cancellation.cancelled() => return Ok(()),
-                    _ = tokio::time::sleep(parts.config.restart_backoff) => {}
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
             run_task(parts, spec).await
@@ -1170,7 +1173,13 @@ fn spawn_child<C>(
             task = %task_name,
         )),
     );
-    task_specs.insert(task.id(), task_spec);
+    task_specs.insert(
+        task.id(),
+        SupervisedTask {
+            spec: task_spec,
+            runs_from: tokio::time::Instant::now() + delay,
+        },
+    );
 }
 
 async fn run_task<C>(parts: Arc<RuntimeParts<C>>, spec: TaskSpec) -> Result<(), RuntimeTaskFailure>
@@ -1178,11 +1187,9 @@ where
     C: Send + Sync + 'static,
 {
     match spec {
-        TaskSpec::ActivityExecutionManager => Err(RuntimeTaskFailure {
-            message: "activity execution manager cannot be started as a restartable task"
-                .to_string(),
-            panicked: false,
-        }),
+        TaskSpec::ActivityExecutionManager => Err(RuntimeTaskFailure::fault(
+            "activity execution manager cannot be started as a restartable task",
+        )),
         TaskSpec::Coordinator => {
             let mut coordinator = WorkflowCoordinator::new(
                 parts.pool.clone(),
@@ -1374,7 +1381,7 @@ where
                     .await
                 {
                     Ok(claims) => claims,
-                    Err(error) if crate::dialect::is_transient_error(&error) => {
+                    Err(error) if error.is_transient() => {
                         tracing::warn!(
                             error = %error,
                             "activity claim rolled back on a transient database error; retrying"
@@ -1568,7 +1575,7 @@ mod tests {
         .await
         .expect("panic reported before sibling release");
 
-        assert!(failure.panicked);
+        assert!(failure.kind.panicked());
         assert!(!sibling_completed.load(Ordering::SeqCst));
         assert_eq!(manager.snapshot().await.expect("manager snapshot").total, 1);
 
@@ -1618,7 +1625,7 @@ mod tests {
             .expect("collector joined")
             .expect_err("shutdown must retain the unconsumed panic");
 
-        assert!(failure.panicked);
+        assert!(failure.kind.panicked());
     }
 
     #[tokio::test]
@@ -1646,7 +1653,7 @@ mod tests {
             .await
             .expect("failure query")
             .expect("abandoned panic was requeued");
-        assert!(failure.panicked);
+        assert!(failure.kind.panicked());
 
         manager.shutdown().await.expect("manager shutdown");
         collector
@@ -1680,7 +1687,7 @@ mod tests {
             .expect("failure query")
             .expect("panic burst reported");
 
-        assert!(failure.panicked);
+        assert!(failure.kind.panicked());
         release_late_panic.notify_one();
         wait_for_manager_idle(&mut manager).await;
         assert!(manager
@@ -1694,7 +1701,7 @@ mod tests {
             .await
             .expect("collector joined")
             .expect_err("late sibling panic is retained for shutdown");
-        assert!(late_failure.panicked);
+        assert!(late_failure.kind.panicked());
         assert!(late_failure
             .message
             .contains("late sibling activity handler panic"));
@@ -1706,26 +1713,5 @@ mod tests {
         assert_eq!(local_topic_limit("rtms", 40, 4, &limits), 24);
         assert_eq!(local_topic_limit("billing", 40, 4, &limits), 4);
         assert_eq!(local_topic_limit("rtms", 12, 4, &limits), 12);
-    }
-
-    #[test]
-    fn restart_budget_counts_within_the_window_and_resets_after_it() {
-        let window = Duration::from_secs(600);
-        let start = tokio::time::Instant::now();
-        let mut budget = RestartBudget::new(start);
-        assert!(budget.record(start, window, 2));
-        assert!(budget.record(start + Duration::from_secs(300), window, 2));
-        assert!(
-            !budget.record(start + window, window, 2),
-            "a third restart inside the window exceeds a budget of 2"
-        );
-
-        let later = start + window + Duration::from_secs(1);
-        assert!(
-            budget.record(later, window, 2),
-            "a restart after the window starts a new count"
-        );
-        assert!(budget.record(later + Duration::from_secs(1), window, 2));
-        assert!(!budget.record(later + Duration::from_secs(2), window, 2));
     }
 }

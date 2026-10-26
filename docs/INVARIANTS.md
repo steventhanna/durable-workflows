@@ -260,11 +260,31 @@ registry (`INSERT IGNORE`) and must match the registered cap
 One runtime spawns these tasks (`supervise`): activity-execution collector,
 coordinator (one sequential loop), health (read-only), timer, approval-expiry,
 one task per schedule key, and the activity dispatcher. Any task that returns
-`Err` or panics is restarted after `restart_backoff` (`spawn_child`). The restart
-counter per task kind counts restarts within `restart_window` (default 10
-minutes; the count starts again once the window since its first counted
-restart has passed); when it exceeds `max_task_restarts` (default 8, `RuntimeConfig::default`) in
-one window, the whole runtime cancels itself (`RestartBudget`). A collector failure cancels immediately (`supervise`).
+`Err` or panics is restarted after a backoff (`spawn_child`,
+`src/runtime/restart.rs` `TaskRestarts`): `restart_backoff` (1 s) first,
+doubling after each restart up to `max_restart_backoff` (60 s), and back to
+`restart_backoff` after a run of at least `task_healthy_after` (2 min). Each
+failure is classified once, where the task's `DurableError` becomes a
+`RuntimeTaskFailure` (`TaskFailureKind`, through `DurableError::transience`,
+the same classifier as G1's `BenignActivationKind::Transient`):
+- **transient**: the database rolled the transaction back, or could not be
+  reached or was not serving (refused, reset or closed connection, pool
+  checkout timeout, a restart or failover; `Transience::Unavailable`). It
+  does not spend the restart budget. When one task's transient failures
+  have lasted longer than `max_transient_outage` (15 min) with no healthy
+  run between them, the runtime cancels itself.
+- **fault** (any other error, or a task that returned) and **panic**: the
+  restart counter per task kind counts these within `restart_window`
+  (default 10 minutes; the count starts again once the window since its
+  first counted restart has passed); when it exceeds `max_task_restarts`
+  (default 8, `RuntimeConfig::default`) in one window, the whole runtime
+  cancels itself (`RestartBudget`).
+
+A collector failure cancels immediately (`supervise`). Every task failure is
+logged (`durable runtime task stopped`, with `failure_kind` and the restart
+delay); every self-cancellation logs one `durable runtime stopped` error
+naming the task, the `reason` and the last error, and fires
+`RuntimeHandle::completion_token`.
 Startup checks readiness and topic caps before any claim (`DurableRuntime::spawn`).
 
 ### 2.2 Coordinator (`run_task` Coordinator, `src/runtime/supervisor.rs`)
@@ -272,7 +292,7 @@ Startup checks readiness and topic caps before any claim (`DurableRuntime::spawn
 Per iteration: `activate_one` (`src/runtime/coordinator.rs`). If no
 claim, sleep `idle_delay` (2 s). A lost fence (`FencedWrite`) or a transient
 database error (deadlock, serialization failure, lock wait timeout;
-`dialect::is_transient_error`) from T-C2 or T-C3 is logged and the loop goes
+`DurableError::is_transient`, `Transience::RolledBack`) from T-C2 or T-C3 is logged and the loop goes
 on: an operator action or lease recovery already moved the row on, or the
 rolled-back row stays `running` until lease recovery (L2). Each skipped
 activation is counted by kind (`BenignActivationKind::FenceMiss` or
@@ -1052,7 +1072,9 @@ Global fairness assumptions used below:
 - **F2** At least one runtime stays up and has not self-cancelled. Operator
   actions, lease-recovery races (including stale commits, N4), transient
   database errors, step panics and hung steps no longer cost restart budget
-  (G1, G3, fixed); the budget counts within `restart_window`.
+  (G1, G3, fixed); the budget counts within `restart_window`. A database
+  outage costs no budget either; only one longer than
+  `max_transient_outage` stops a runtime (§2.1).
 - **F3** The runtime serving an entity has its exact `(kind, version)` and
   topic registered (claims filter on local definitions).
 - **F4** Handlers and `step` return, or yield to cancellation, in finite time.
@@ -1273,7 +1295,7 @@ dispatcher (`src/runtime/supervisor.rs` `run_task`). The test
 `pause_fences_a_workflow_transition_claimed_before_the_operator_action`
 confirms that `activate_claim` (now `WorkflowClaim::activate`) returns `Err(FencedWrite)`.
 **Fixed**: `activate_one` logs a `FencedWrite` or a transient database error
-(`dialect::is_transient_error`) from T-C2/T-C3 and returns the claimed id;
+(`DurableError::is_transient`) from T-C2/T-C3 and returns the claimed id;
 `WorkflowClaim::activate` still returns the error to a direct caller. The restart
 budget counts within `RuntimeConfig::restart_window` (default 10 minutes).
 The skipped activations stay visible: `activate_one` counts them by

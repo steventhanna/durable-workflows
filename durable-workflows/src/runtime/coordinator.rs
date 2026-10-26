@@ -1468,7 +1468,7 @@ async fn lock_fence<'tx>(
 fn benign_activation_kind(error: &DurableError) -> Option<BenignActivationKind> {
     match error {
         DurableError::FencedWrite => Some(BenignActivationKind::FenceMiss),
-        error if crate::dialect::is_transient_error(error) => Some(BenignActivationKind::Transient),
+        error if error.is_transient() => Some(BenignActivationKind::Transient),
         _ => None,
     }
 }

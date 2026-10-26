@@ -259,8 +259,10 @@ property for every input (within its unwind bound), not for samples; keep
 proptest for code Kani cannot model in reasonable time (the schedule
 `next_after` search). Today: `policy.rs` (`apply_jitter` and
 `delay_for_attempt`: no panic, the jitter bound, the millisecond range,
-capped doubling, monotonic in the attempt), `runtime/supervisor.rs`
-(`RestartBudget`: window reset, the count never wraps), `error.rs`
+capped doubling, monotonic in the attempt), `runtime/restart.rs`
+(`RestartBudget`: window reset, the count never wraps; `RestartBackoff`:
+capped doubling; `TaskRestarts`: a transient failure never spends the
+budget and stops only past the outage limit), `error.rs`
 (`truncate_utf8`: the longest char-boundary prefix that fits), `ids.rs`
 (`Id::new` accepts exactly the positive values) and `persistence/mod.rs`
 (status `as_str`/`try_from` round trip for every variant; the workflow
@@ -269,7 +271,7 @@ with the unit tests, since the unknown-status error formats its message
 and CBMC does not finish on that path).
 
 ```sh
-cargo kani -p durable-workflows                        # 18 harnesses, ~4 min
+cargo kani -p durable-workflows                        # 20 harnesses, ~4 min
 cargo kani -p durable-workflows --harness policy::     # one module
 ```
 

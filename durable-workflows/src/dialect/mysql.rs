@@ -2,6 +2,7 @@ use diesel::ExpressionMethods;
 use diesel_async::{AsyncConnection, RunQueryDsl, SimpleAsyncConnection};
 
 use super::{TransactionCallback, WorkflowInsert};
+use crate::error::Transience;
 use crate::tx::{CommandParent, Committed, Locked, Tx};
 use crate::{
     persistence::{
@@ -171,20 +172,133 @@ async fn connection_last_insert_id(
         .await?)
 }
 
-/// A deadlock (1213) or lock wait timeout (1205): the transaction was rolled
-/// back and retrying it later is safe. diesel-async maps neither code to a
-/// `DatabaseErrorKind` and keeps only the server message, so the message is
-/// matched (the server's `lc_messages` must be English, the default).
-pub(crate) fn is_transient_error(error: &DurableError) -> bool {
-    let DurableError::Database(diesel::result::Error::DatabaseError(kind, info)) = error else {
-        return false;
-    };
-    matches!(
-        kind,
-        diesel::result::DatabaseErrorKind::SerializationFailure
-    ) || {
-        let message = info.message();
-        message.starts_with("Deadlock found when trying to get lock")
-            || message.starts_with("Lock wait timeout exceeded")
+/// Classifies a MySQL error for [`DurableError::transience`]. diesel-async
+/// keeps only the server message of a server error (no error code), and the
+/// `Display` text of a client I/O or driver error, so both are matched by
+/// message (the server's `lc_messages` must be English, the default).
+///
+/// - `RolledBack`: a deadlock (1213), lock wait timeout (1205) or
+///   serialization failure.
+/// - `Unavailable`: a lost or refused connection (mysql_async I/O errors
+///   except TLS, "Connection to the server is closed"); a server that is
+///   shutting down (1053, 1077) or read-only after a failover (1290, 1792);
+///   a proxy that reports a lost server ("server has gone away", "Lost
+///   connection"); Vitess while a tablet restarts or reparents ("primary is
+///   not serving", `code = Unavailable`, "connection refused").
+pub(crate) fn database_error_transience(
+    kind: &diesel::result::DatabaseErrorKind,
+    message: &str,
+) -> Option<Transience> {
+    use diesel::result::DatabaseErrorKind;
+
+    const ROLLED_BACK_PREFIXES: [&str; 2] = [
+        "Deadlock found when trying to get lock",
+        "Lock wait timeout exceeded",
+    ];
+    // Matched case-insensitively: proxies reword the client texts.
+    const UNAVAILABLE_MARKERS: [&str; 10] = [
+        "connection to the server is closed",
+        "server shutdown in progress",
+        "normal shutdown",
+        "is running with the --read-only option",
+        "is running with the --super-read-only option",
+        "server has gone away",
+        "lost connection to mysql server",
+        "primary is not serving",
+        "code = unavailable",
+        "connection refused",
+    ];
+    match kind {
+        DatabaseErrorKind::SerializationFailure => return Some(Transience::RolledBack),
+        DatabaseErrorKind::ClosedConnection
+        | DatabaseErrorKind::UnableToSendCommand
+        | DatabaseErrorKind::ReadOnlyTransaction => return Some(Transience::Unavailable),
+        _ => {}
+    }
+    if ROLLED_BACK_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return Some(Transience::RolledBack);
+    }
+    let io_error = message.starts_with("Input/output error: ") && !message.contains("TLS error");
+    let lowercase = message.to_ascii_lowercase();
+    let unavailable = io_error
+        || UNAVAILABLE_MARKERS
+            .iter()
+            .any(|marker| lowercase.contains(marker));
+    unavailable.then_some(Transience::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use diesel::result::DatabaseErrorKind::{self, Unknown};
+
+    use super::*;
+
+    fn classify(kind: DatabaseErrorKind, message: &str) -> Option<Transience> {
+        database_error_transience(&kind, message)
+    }
+
+    #[test]
+    fn rolled_back_transactions_are_transient() {
+        for message in [
+            "Deadlock found when trying to get lock; try restarting transaction",
+            "Lock wait timeout exceeded; try restarting transaction",
+        ] {
+            assert_eq!(classify(Unknown, message), Some(Transience::RolledBack));
+        }
+    }
+
+    #[test]
+    fn an_unreachable_or_failing_over_server_is_unavailable() {
+        for message in [
+            // Issue #4: a PlanetScale tablet restart, then its reparent.
+            "target: leasing.-.primary: vttablet: rpc error: code = Unavailable desc = \
+             connection error: desc = \"transport: Error while dialing: dial tcp \
+             10.0.0.1:15991: connect: connection refused\"",
+            "primary is not serving, there may be a reparent operation in progress",
+            // mysql_async client errors, as diesel-async formats them.
+            "Input/output error: Input/output error: Connection refused (os error 111)",
+            "Input/output error: Input/output error: Connection reset by peer (os error 104)",
+            "Driver error: `Connection to the server is closed.'",
+            "MySQL server has gone away",
+            "Lost connection to MySQL server during query",
+            "Server shutdown in progress",
+            "The MySQL server is running with the --super-read-only option so it cannot \
+             execute this statement",
+        ] {
+            assert_eq!(
+                classify(Unknown, message),
+                Some(Transience::Unavailable),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            classify(
+                DatabaseErrorKind::ReadOnlyTransaction,
+                "Cannot execute statement in a READ ONLY transaction."
+            ),
+            Some(Transience::Unavailable)
+        );
+    }
+
+    #[test]
+    fn other_errors_are_not_transient() {
+        for message in [
+            "Table 'dwt_1.durable_approval' doesn't exist",
+            "Access denied for user 'durable'@'10.0.0.1' (using password: YES)",
+            "Input/output error: TLS error: `invalid peer certificate'",
+            "Unknown column 'nope' in 'field list'",
+        ] {
+            assert_eq!(classify(Unknown, message), None, "{message}");
+        }
+        assert_eq!(
+            classify(
+                DatabaseErrorKind::UniqueViolation,
+                "Duplicate entry '1' for key 'PRIMARY'"
+            ),
+            None
+        );
     }
 }

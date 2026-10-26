@@ -89,6 +89,31 @@ production on MySQL since August 2026.
 
 Compared with the production-internal version it was extracted from:
 
+- The supervisor restarts a failed task after an exponential backoff
+  instead of a fixed delay: `restart_backoff` (default 1 s) doubling after
+  each restart up to the new `RuntimeConfig::max_restart_backoff` (default
+  60 s; a value below `restart_backoff` keeps the delay fixed), and back to
+  `restart_backoff` once the task has run for the new
+  `RuntimeConfig::task_healthy_after` (default 2 minutes; must be
+  non-zero). Setters `with_max_restart_backoff`, `with_task_healthy_after`.
+- A task that fails on a transient database error no longer spends
+  `max_task_restarts` (#4). Transient means the database rolled the
+  transaction back (`DurableError::is_transient`) or could not be reached:
+  a refused, reset or closed connection, a pool checkout timeout, a server
+  that is shutting down, starting up or read-only after a failover, or
+  Vitess/PlanetScale "primary is not serving" and `code = Unavailable`
+  during a tablet restart or reparent. One classifier
+  (`DurableError::transience`, crate-private) serves the supervisor and the
+  G1 activation and claim paths. Only other errors and panics count against
+  the budget. A task whose transient failures last longer than the new
+  `RuntimeConfig::max_transient_outage` (default 15 minutes; must be
+  non-zero) with no healthy run between them still stops the runtime, so a
+  database that stays down is not retried unseen forever. Every task
+  failure is still logged, now with `failure_kind` and `restart_in_ms`.
+- When the supervisor cancels the runtime (restart budget exhausted,
+  transient outage limit, or an activity-execution manager failure), it
+  logs one `durable runtime stopped` error with the task, the `reason`
+  and the last error.
 - The handler traits `WorkflowHandler`, `ActivityHandler`, `DurableFlow`
   and `ScheduleHandler` use native `async fn` in traits instead of
   `#[async_trait]` (breaking for implementors). Each method is declared
