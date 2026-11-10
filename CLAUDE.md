@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This codebase is yours. You decide what it should look like, and you’ll be the one maintaining it going forward
+
 Guidance for Claude Code (and other agents) working in this repository.
 
 ## Project
